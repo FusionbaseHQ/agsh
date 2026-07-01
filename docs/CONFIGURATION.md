@@ -95,16 +95,21 @@ forward to `agsh --observe`, which runs the **real** shell and captures its outp
 so semantics are exact and only the observed output is compacted. Nested shells pass
 straight through (no double-observation), and raw pipes still receive exact bytes.
 
-Two flavors:
+Flavors and layers (combine with `:`):
 
 - `AGSH_INTERCEPT=compact` — **proxy** (default): runs the real shell, observes it.
   Exact semantics; recommended.
 - `AGSH_INTERCEPT=compact:native` — **interpret**: agsh runs the command in its own
   interpreter (full agsh features, but bounded by agsh's `bash` compatibility).
+- `AGSH_INTERCEPT=compact:deep` — also catch **absolute-path** shell calls
+  (`/bin/bash -c …`) and `posix_spawn` (what node/libuv use), via an injected
+  interposition library (`DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`).
 
-> **Coverage:** this catches shells resolved by name or via `$SHELL`. A program that
-> calls `/bin/bash` by absolute path bypasses it; catching that needs the exec-
-> interposition layer (planned).
+> **Coverage.** Without `:deep`, interception catches shells resolved by name or via
+> `$SHELL` (a program calling `/bin/bash` by absolute path bypasses it). `:deep`
+> closes that gap, but is best-effort: macOS **SIP / hardened-runtime** binaries
+> strip `DYLD_INSERT_LIBRARIES`, and `LD_PRELOAD` is ignored by **static** binaries
+> and across setuid execs — those fall back to the (still active) PATH shims.
 
 Set it in your `agshrc` so it applies to every session, or per-agent:
 `AGSH_INTERCEPT=compact agsh -c 'my-agent …'`.

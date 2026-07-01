@@ -62,6 +62,13 @@ name = "agsh-index"
 version = "0.1.0"
 
 [[package]]
+name = "agsh-intercept"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "agsh-output"
 version = "0.1.0"
 dependencies = [

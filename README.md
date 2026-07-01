@@ -36,7 +36,8 @@ confine ls,df -- ./monitor.sh                # kernel-confined to ls + df (macOS
 - **Modern interactive editor** — syntax highlighting, completion, history with
   reverse search and autosuggestions, themed truecolor UI, and `precmd`/`preexec`/
   `chpwd` hooks.
-- **Safe by construction** — `unsafe` is forbidden in all first-party crates, the
+- **Safe by construction** — `unsafe` is forbidden in every first-party crate (the
+  optional `agsh-intercept` preload shim is the single, isolated exception), the
   shell is fuzzed for panic-freedom, and security behavior is deterministic.
 
 ## Install

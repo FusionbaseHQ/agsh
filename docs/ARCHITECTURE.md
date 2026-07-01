@@ -45,6 +45,9 @@ crates/
 ## Safety properties
 
 - `unsafe` is **forbidden** in every first-party crate (`unsafe_code = "forbid"`).
+  The one exception is the optional `agsh-intercept` preload library (Tier 2 shell
+  interception), which needs `execve`/`posix_spawn` FFI; it is isolated, opt-in, and
+  not linked into the shell.
 - The parser/executor are fuzzed for panic-freedom; security behavior is
   deterministic.
 - `confine` is fail-closed: it never runs a payload it cannot actually restrict

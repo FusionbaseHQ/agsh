@@ -1034,3 +1034,49 @@ fn intercept_native_flavor_interprets_in_agsh() {
         "native-flavor interpret failed:\n{text}"
     );
 }
+
+// Tier 2 (exec-interposition) is platform/toolchain-sensitive: it needs the
+// interposer dylib built and a C compiler, and DYLD_INSERT_LIBRARIES only works on
+// non-hardened binaries. This test validates it where it can and skips otherwise.
+#[cfg(target_os = "macos")]
+#[test]
+fn deep_intercept_catches_absolute_path_shell() {
+    let exe = std::path::PathBuf::from(env!("CARGO_BIN_EXE_agsh"));
+    let dir = exe.parent().unwrap();
+    let lib = dir.join("libagsh_intercept.dylib");
+    if !lib.exists() {
+        eprintln!("skip: interposer dylib not built");
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("agsh_deep_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let src = tmp.join("h.c");
+    std::fs::write(
+        &src,
+        r#"#include <unistd.h>
+int main(void){char*a[]={"/bin/bash","-c","echo DEEP-TEST-HIT",0};execv("/bin/bash",a);return 1;}"#,
+    )
+    .unwrap();
+    let bin = tmp.join("h");
+    let cc = Command::new("cc").args(["-o"]).arg(&bin).arg(&src).status();
+    if !matches!(cc, Ok(s) if s.success()) {
+        eprintln!("skip: cc unavailable");
+        let _ = std::fs::remove_dir_all(&tmp);
+        return;
+    }
+    let out = Command::new(&bin)
+        .env("DYLD_INSERT_LIBRARIES", &lib)
+        .env("AGSH_SELF", &exe)
+        .env("AGSH_INTERCEPT_MODE", "compact")
+        .output()
+        .expect("run harness");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let _ = std::fs::remove_dir_all(&tmp);
+    // Routed through agsh --observe: the marker survives AND a trace ref proves the
+    // absolute-path exec was captured rather than run raw.
+    assert!(text.contains("DEEP-TEST-HIT"), "marker missing:\n{text}");
+    assert!(
+        text.contains("trace://"),
+        "absolute-path exec was not intercepted:\n{text}"
+    );
+}

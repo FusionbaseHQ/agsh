@@ -4,6 +4,19 @@ All notable changes to `agsh` are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Startup rc file** — interactive sessions source `~/.config/agsh/agshrc` (aliases,
+  functions, exports, prompt hooks, `mode:…`); `--norc` / `--rcfile` / `$AGSH_RC`.
+- **Shell interception** (opt-in via `AGSH_INTERCEPT`) — route an agent's own
+  `bash -c …` through agsh so its output is compacted/observed instead of bypassing
+  it. Proxy (default, runs the real shell), native-interpret (`:native`), and a deep
+  exec-interposition layer (`:deep`) that also catches absolute-path `/bin/bash` and
+  `posix_spawn` via `DYLD_INSERT_LIBRARIES`/`LD_PRELOAD`. The deep layer is the new,
+  isolated `agsh-intercept` crate — the single first-party `unsafe` exception.
+- **`sessions`** now shows each session's folder; namespaced `mode:<aspect>` builtin.
+
 ## [0.1.0] - 2026-06-30
 
 First production-ready release of the Aegis Shell — a from-scratch, POSIX-style

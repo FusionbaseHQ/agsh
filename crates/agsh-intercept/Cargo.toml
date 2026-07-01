@@ -1,0 +1,17 @@
+[package]
+name = "agsh-intercept"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Optional exec-interposition layer for agsh shell interception (DYLD_INSERT_LIBRARIES / LD_PRELOAD)."
+repository.workspace = true
+
+# A preloadable shared library. NOTE: this crate intentionally uses `unsafe` FFI
+# (execve/posix_spawn interposition) and therefore does NOT opt into the
+# workspace `unsafe_code = "forbid"` lint. It is the single, isolated exception;
+# all other first-party crates remain unsafe-free.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
