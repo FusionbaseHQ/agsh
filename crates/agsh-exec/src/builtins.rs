@@ -40,6 +40,7 @@ pub fn builtin_names() -> &'static [&'static str] {
         "fg",
         "bg",
         "wait",
+        "agjob",
         "kill",
         "exec",
         "ulimit",
@@ -469,6 +470,7 @@ pub fn is_builtin(name: &str) -> bool {
             | "fg"
             | "bg"
             | "wait"
+            | "agjob"
             | "kill"
             | "exec"
             | "ulimit"
@@ -561,6 +563,7 @@ pub fn run_builtin(
         "fg" => Ok(builtin_fg(args, state)),
         "bg" => Ok(builtin_bg(args, state)),
         "wait" => Ok(builtin_wait(args, state)),
+        "agjob" => Ok(builtin_agjob(args, state)),
         "kill" => builtin_kill(args, state),
         "exec" => Err(ShellError::execution(
             "exec: process replacement is handled by executor",
@@ -1612,6 +1615,100 @@ fn builtin_bg(args: &[String], state: &ShellState) -> CommandOutcome {
     let _ = signal_process_group(pgid, Signal::CONT);
     state.set_job_running(spec);
     CommandOutcome::captured(0, Vec::new(), Vec::new())
+}
+
+/// `agjob <command…>` — run a command in the BACKGROUND with its output CAPTURED to
+/// a retrievable log file, returning immediately with a job id + the log path. Solves
+/// the #1 agent-blocking failure (long `cargo build` / `npm test` / dev servers):
+/// instead of blocking the tool call or losing `&`'s terminal output, the agent gets
+/// a non-blocking handle it can poll with `jobs` and query with `agtrace grep <log>`.
+fn builtin_agjob(args: &[String], state: &ShellState) -> CommandOutcome {
+    use std::os::unix::process::CommandExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    if args.is_empty() {
+        return CommandOutcome::captured(
+            2,
+            Vec::new(),
+            b"agjob: usage: agjob <command> [args...]\n".to_vec(),
+        );
+    }
+    // Single-quote each arg so the reconstructed command line preserves quoting
+    // exactly (a bare join would mangle `agjob sh -c "a; b"`).
+    let source = args
+        .iter()
+        .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let dir = std::env::var_os("AGSH_TRACE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("agsh-jobs"));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return CommandOutcome::captured(
+            1,
+            Vec::new(),
+            b"agjob: could not create the job log directory\n".to_vec(),
+        );
+    }
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let log = dir.join(format!("job-{}-{seq}.log", std::process::id()));
+    let file = match std::fs::File::create(&log) {
+        Ok(file) => file,
+        Err(error) => {
+            return CommandOutcome::captured(
+                1,
+                Vec::new(),
+                format!("agjob: {error}\n").into_bytes(),
+            )
+        }
+    };
+    // stdout + stderr merge into one raw log (a child `agsh -c` runs raw by default,
+    // so the file holds exact bytes). Detached process group, no terminal stdin.
+    let err_handle = match file.try_clone() {
+        Ok(handle) => handle,
+        Err(error) => {
+            return CommandOutcome::captured(
+                1,
+                Vec::new(),
+                format!("agjob: {error}\n").into_bytes(),
+            )
+        }
+    };
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            return CommandOutcome::captured(
+                1,
+                Vec::new(),
+                format!("agjob: {error}\n").into_bytes(),
+            )
+        }
+    };
+    let mut command = Command::new(exe);
+    command.arg("-c").arg(&source);
+    command.current_dir(state.cwd());
+    command.env_clear();
+    command.envs(state.exported_env());
+    command.process_group(0);
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::from(file));
+    command.stderr(std::process::Stdio::from(err_handle));
+    match command.spawn() {
+        Ok(child) => {
+            let pid = child.id();
+            state.set_last_bg_pid(pid);
+            let (id, _pgid) = state.register_job(child, source);
+            CommandOutcome::captured(
+                0,
+                format!("[{id}] {pid}  output: {}\n", log.display()).into_bytes(),
+                Vec::new(),
+            )
+        }
+        Err(error) => {
+            CommandOutcome::captured(1, Vec::new(), format!("agjob: {error}\n").into_bytes())
+        }
+    }
 }
 
 fn builtin_wait(args: &[String], state: &ShellState) -> CommandOutcome {

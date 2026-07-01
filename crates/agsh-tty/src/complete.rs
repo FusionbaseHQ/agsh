@@ -302,6 +302,7 @@ fn builtin_description(name: &str) -> Option<&'static str> {
         "mode" => "show or set session default modes (e.g. mode:output compact)",
         "mode:output" => "set the session default output mode",
         "mode:intercept" => "route the agent's shells through agsh (compact:deep, off)",
+        "agjob" => "run a command in the background with captured output",
         "sessions" => "list/resume Claude & Codex sessions for this folder",
         "history" => "show command history",
         "umask" => "set the file-creation mask",

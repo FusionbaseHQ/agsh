@@ -1236,3 +1236,35 @@ fn intercept_sets_fail_fast_env_for_interactive_tools() {
     );
     assert_eq!(run(Some("compact"), Some("1")), "1", "user value respected");
 }
+
+#[test]
+fn agjob_runs_in_background_and_captures_output() {
+    let dir = std::env::temp_dir().join(format!("agsh_agjob_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["-c", "agjob sh -c 'echo JOB-ONE; echo JOB-TWO'"])
+        .env("AGSH_TRACE_DIR", &dir)
+        .output()
+        .expect("run agsh");
+    let s = String::from_utf8_lossy(&out.stdout);
+    // Returns immediately with a job id + the log path.
+    let log = s
+        .lines()
+        .find_map(|l| l.split("output: ").nth(1))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| panic!("no job log path in:\n{s}"));
+    // The detached job finishes shortly after; poll its log.
+    let mut content = String::new();
+    for _ in 0..100 {
+        content = std::fs::read_to_string(&log).unwrap_or_default();
+        if content.contains("JOB-TWO") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        content.contains("JOB-ONE") && content.contains("JOB-TWO"),
+        "job output not captured to the log:\n{content}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
