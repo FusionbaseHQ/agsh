@@ -1,0 +1,24 @@
+# RUN: %agsh %s
+declare -A h
+h[name]=alice
+h[role]=admin
+echo "${h[name]} ${h[role]}"
+echo "count=${#h[@]}"
+declare -A lit=([a]=1 [b]=2 [c]=3)
+echo "${lit[a]}${lit[b]}${lit[c]}"
+declare -A alt=(x 10 y 20)
+echo "${alt[x]}-${alt[y]}"
+declare -A k; k[one]=1; k[two]=2
+echo "keys=${!k[@]}"
+for v in "${k[@]}"; do echo "v=$v"; done
+declare -A sp; sp["a b"]=spaced; echo "${sp[a b]}"
+declare -A ov; ov[z]=1; ov[z]=2; echo "ov=${ov[z]} n=${#ov[@]}"
+# CHECK: alice admin
+# CHECK: count=2
+# CHECK: 123
+# CHECK: 10-20
+# CHECK: keys=one two
+# CHECK: v=1
+# CHECK: v=2
+# CHECK: spaced
+# CHECK: ov=2 n=1

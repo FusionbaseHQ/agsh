@@ -1,0 +1,24 @@
+# RUN: %agsh %s
+if true; then echo if-yes; fi
+if false; then echo a; else echo else-branch; fi
+if false; then echo a; elif true; then echo elif-branch; fi
+for i in 1 2 3; do echo "for $i"; done
+i=0; while [ $i -lt 2 ]; do echo "while $i"; i=$((i+1)); done
+i=0; until [ $i -ge 2 ]; do echo "until $i"; i=$((i+1)); done
+case foo in foo) echo case-match;; *) echo no;; esac
+for i in 1 2 3; do [ $i = 2 ] && break; echo "b$i"; done
+for i in 1 2 3; do [ $i = 2 ] && continue; echo "c$i"; done
+# CHECK: if-yes
+# CHECK: else-branch
+# CHECK: elif-branch
+# CHECK: for 1
+# CHECK: for 2
+# CHECK: for 3
+# CHECK: while 0
+# CHECK: while 1
+# CHECK: until 0
+# CHECK: until 1
+# CHECK: case-match
+# CHECK: b1
+# CHECK: c1
+# CHECK: c3

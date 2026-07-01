@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+
+# Internal — kept local, never published
+/docs_internal/
+/AGENTS.md
+/ap.txt
+/out.txt
+/confine_test.py
+crates/agsh-exec/out.txt

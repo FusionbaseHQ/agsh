@@ -1,0 +1,9 @@
+# RUN: %agsh %s one two three
+echo "count: $#"
+echo "first: $1"
+echo "all: $@"
+shift; echo "after shift: $1"
+# CHECK: count: 3
+# CHECK: first: one
+# CHECK: all: one two three
+# CHECK: after shift: two

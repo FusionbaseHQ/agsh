@@ -1,0 +1,96 @@
+"""PTY harness for agsh interactive tests.
+
+Spawns agsh under a pseudo-terminal in an isolated environment, feeds keystrokes,
+and reconstructs the on-screen grid via termemu so tests can assert on what a
+user would see. This is agsh's equivalent of fish's pexpect suite.
+"""
+import fcntl
+import os
+import pty
+import select
+import struct
+import termios
+import time
+
+from termemu import Term
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(os.path.dirname(_HERE))
+AGSH = os.environ.get("AGSH", os.path.join(_REPO, "target", "debug", "agsh"))
+
+
+class Session:
+    def __init__(self, rows=20, cols=80, history=None):
+        self.rows, self.cols = rows, cols
+        self.term = Term(rows, cols)
+        env = dict(os.environ)
+        home = "/tmp/agsh-pty-home"
+        os.makedirs(home, exist_ok=True)
+        env.update(
+            HOME=home,
+            XDG_CONFIG_HOME=os.path.join(home, ".config"),
+            XDG_DATA_HOME=os.path.join(home, ".local", "share"),
+            AGSH_HISTORY_FILE=history or "/tmp/agsh-pty-history.jsonl",
+            TERM="xterm",
+            LANG="C",
+        )
+        env.pop("AGSH_OUTPUT_MODE", None)
+        env.pop("NO_COLOR", None)
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.environ.clear()
+            os.environ.update(env)
+            os.execv(AGSH, [AGSH])
+        self.pid, self.fd = pid, fd
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        self.drain(0.4)
+
+    def drain(self, dt=0.35):
+        time.sleep(dt)
+        buf = b""
+        while True:
+            r, _, _ = select.select([self.fd], [], [], 0.1)
+            if not r:
+                break
+            try:
+                chunk = os.read(self.fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+        self.term.feed(buf.decode(errors="replace"))
+        return buf
+
+    def send(self, data, dt=0.35):
+        os.write(self.fd, data.encode() if isinstance(data, str) else data)
+        return self.drain(dt)
+
+    def screen(self):
+        return self.term.screen()
+
+    def close(self):
+        try:
+            os.write(self.fd, b"\x03")  # interrupt any pending line
+            os.write(self.fd, b"exit\r")
+            self.drain(0.2)
+        except OSError:
+            pass
+        try:
+            os.close(self.fd)
+            os.waitpid(self.pid, 0)
+        except OSError:
+            pass
+
+
+# Common control keys.
+ENTER = "\r"
+TAB = "\t"
+ESC = "\x1b"
+CTRL_C = "\x03"
+CTRL_D = "\x04"
+CTRL_R = "\x12"
+CTRL_U = "\x15"
+CTRL_A = "\x01"
+CTRL_E = "\x05"
+RIGHT = "\x1b[C"

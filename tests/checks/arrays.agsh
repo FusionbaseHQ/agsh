@@ -1,0 +1,31 @@
+# RUN: %agsh %s
+a=(alpha beta gamma)
+echo ${a[0]}
+echo ${a[2]}
+echo $a
+echo ${#a[@]}
+echo ${a[@]}
+for e in ${a[@]}; do echo "item:$e"; done
+a[1]=BETA
+echo ${a[@]}
+a+=(delta)
+echo ${a[@]}
+echo ${#a[@]}
+i=2; echo ${a[i]}
+declare -a nums=(10 20 30)
+echo ${nums[1]}
+echo ${!a[@]}
+# CHECK: alpha
+# CHECK: gamma
+# CHECK: alpha
+# CHECK: 3
+# CHECK: alpha beta gamma
+# CHECK: item:alpha
+# CHECK: item:beta
+# CHECK: item:gamma
+# CHECK: alpha BETA gamma
+# CHECK: alpha BETA gamma delta
+# CHECK: 4
+# CHECK: gamma
+# CHECK: 20
+# CHECK: 0 1 2 3

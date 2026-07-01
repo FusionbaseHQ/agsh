@@ -1,0 +1,19 @@
+# RUN: %agsh %s
+for ((i=0;i<3;i++)); do echo "i=$i"; done
+s=0
+for ((j=1;j<=4;j++)); do s=$((s+j)); done
+echo "sum=$s"
+for ((k=5;k>0;k-=2)); do echo "k=$k"; done
+((3 > 2)) && echo arith-true
+((0)) || echo arith-false
+((n=7)); echo "n=$n"
+# CHECK: i=0
+# CHECK: i=1
+# CHECK: i=2
+# CHECK: sum=10
+# CHECK: k=5
+# CHECK: k=3
+# CHECK: k=1
+# CHECK: arith-true
+# CHECK: arith-false
+# CHECK: n=7

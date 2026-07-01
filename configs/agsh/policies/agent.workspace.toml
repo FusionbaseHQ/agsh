@@ -1,0 +1,34 @@
+[policy]
+name = "agent.workspace"
+principal_glob = "agent.*"
+
+[capabilities]
+allow = [
+  "read:workspace",
+  "write:workspace",
+  "exec:project",
+  "git:read",
+  "git:write-branch"
+]
+deny = [
+  "home:read",
+  "home:write",
+  "system:write",
+  "secret:ambient",
+  "network:all"
+]
+
+[approvals]
+require_for = [
+  "network:any",
+  "write:outside-workspace",
+  "exec:sudo",
+  "git:push",
+  "secret:read"
+]
+
+[output]
+mode = "semantic"
+token_budget = 2000
+redact_secrets = true
+store_raw = true

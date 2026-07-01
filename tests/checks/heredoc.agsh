@@ -1,0 +1,18 @@
+# RUN: %agsh %s
+echo first
+cat <<H
+body-after-command
+H
+echo middle
+cat <<A; cat <<B
+from-a
+A
+from-b
+B
+echo $((1 << 4))
+# CHECK: first
+# CHECK: body-after-command
+# CHECK: middle
+# CHECK: from-a
+# CHECK: from-b
+# CHECK: 16

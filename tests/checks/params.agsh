@@ -1,0 +1,21 @@
+# RUN: %agsh %s
+v=hello
+echo ${v}
+echo ${#v}
+echo ${missing:-default}
+e=; echo ${e:-fallback}
+echo ${assign:=now}; echo $assign
+p=foo.bar.baz; echo ${p#*.}; echo ${p##*.}; echo ${p%.*}; echo ${p%%.*}
+r=a-b-c; echo ${r/-/_}; echo ${r//-/_}
+# CHECK: hello
+# CHECK: 5
+# CHECK: default
+# CHECK: fallback
+# CHECK: now
+# CHECK: now
+# CHECK: bar.baz
+# CHECK: baz
+# CHECK: foo.bar
+# CHECK: foo
+# CHECK: a_b-c
+# CHECK: a_b_c

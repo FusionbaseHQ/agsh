@@ -1,0 +1,11 @@
+# Example ~/.agshrc
+
+export EDITOR=nvim
+export PATH="$HOME/.local/bin:$PATH"
+
+alias ll="ls -la"
+alias gs="git status"
+
+set output.human.mode = "raw"
+set output.agent.mode = "semantic"
+set prompt.git = true

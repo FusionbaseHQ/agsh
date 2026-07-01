@@ -1,0 +1,29 @@
+# RUN: %agsh %s
+[[ abc == a* ]] && echo glob-match
+[[ abc == x* ]] || echo glob-nomatch
+[[ abc123 =~ ^[a-z]+[0-9]+$ ]] && echo regex-match
+[[ -f /etc/hosts ]] && echo is-file
+[[ -d /etc ]] && echo is-dir
+[[ -z "" ]] && echo empty
+[[ -n "x" ]] && echo nonempty
+[[ 5 -gt 3 ]] && echo int-gt
+[[ a == a && b == b ]] && echo and-ok
+[[ a == x || b == b ]] && echo or-ok
+[[ ! -f /no/such/file ]] && echo negate-ok
+[[ ( a == a ) && b == b ]] && echo parens-ok
+x="hello world"; [[ $x == "hello world" ]] && echo unsplit-ok
+[[ a < b ]] && echo str-lt
+# CHECK: glob-match
+# CHECK: glob-nomatch
+# CHECK: regex-match
+# CHECK: is-file
+# CHECK: is-dir
+# CHECK: empty
+# CHECK: nonempty
+# CHECK: int-gt
+# CHECK: and-ok
+# CHECK: or-ok
+# CHECK: negate-ok
+# CHECK: parens-ok
+# CHECK: unsplit-ok
+# CHECK: str-lt

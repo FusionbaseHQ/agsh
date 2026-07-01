@@ -1,0 +1,60 @@
+[mode]
+# Session default output mode for INTERACTIVE shells. Uncomment to make every
+# command render in that mode — e.g. `default = "compact"` turns `ls` into the
+# equivalent of `compact ls`. Per-command wrappers (`raw ls`), the `--output`
+# flag, and AGSH_OUTPUT_MODE all still override it; non-interactive `agsh -c` /
+# scripts stay raw so pipes are never silently transformed. Change it at runtime
+# with the `mode` builtin (`mode:output compact`, `mode:output off`, `mode` shows all).
+# Modes: raw | clean | compact | semantic | lossless-ref | silent | rich
+# default = "compact"
+human_default = "raw"
+agent_default = "semantic"
+ci_default = "raw"
+
+[storage]
+store_raw = true
+raw_retention = "14d"
+max_raw_per_command = "100mb"
+
+[budget]
+default_tokens = 2000
+max_tokens = 8000
+fallback = "lossless-ref"
+
+[normalization]
+strip_ansi = true
+collapse_progress = true
+dedupe_repeated_lines = true
+shorten_home = true
+shorten_workspace = true
+
+[security]
+redact_secrets = true
+redact_env_names = ["AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "OPENAI_API_KEY"]
+redact_patterns = [
+  "ghp_[A-Za-z0-9_]{20,}",
+  "sk-[A-Za-z0-9_-]{20,}"
+]
+
+[[compactor]]
+name = "generic-build"
+match.argv = ["make", "*"]
+mode = "semantic"
+priority = 10
+
+[[compactor.rule]]
+name = "keep-errors"
+match.line_regex = "^(ERROR|Error|error):"
+action = "keep"
+limit = "all"
+
+[[compactor.rule]]
+name = "collapse-progress"
+match.line_regex = "^(Building|Compiling|Downloading|Installing) "
+action = "group"
+group_name = "progress"
+
+[[compactor.rule]]
+name = "tail"
+action = "keep_tail"
+lines = 80

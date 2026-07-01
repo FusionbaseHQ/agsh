@@ -1,0 +1,14 @@
+# RUN: %agsh %s
+echo hi > out.txt; cat out.txt
+echo a > ap.txt; echo b >> ap.txt; cat ap.txt
+cat <<HEOF
+heredoc-line
+HEOF
+cat <<< "herestring"
+echo done
+# CHECK: hi
+# CHECK: a
+# CHECK: b
+# CHECK: heredoc-line
+# CHECK: herestring
+# CHECK: done

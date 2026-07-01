@@ -1,0 +1,10 @@
+[package]
+name = "agsh-index"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

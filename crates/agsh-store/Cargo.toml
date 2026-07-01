@@ -1,0 +1,14 @@
+[package]
+name = "agsh-store"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+agsh-core = { path = "../agsh-core" }
+agsh-output = { path = "../agsh-output" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+[lints]
+workspace = true

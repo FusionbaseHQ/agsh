@@ -1,0 +1,24 @@
+# RUN: %agsh %s
+work="$(mktemp -d)"
+cd "$work"
+mkdir -p a/b/c
+touch a/x.txt a/b/y.txt a/b/c/z.txt
+shopt -s globstar
+echo **/*.txt
+shopt -u globstar
+echo **/*.txt
+shopt -s nullglob
+set -- nomatch_zzz*
+echo "nullglob-count=$#"
+shopt -u nullglob
+cd "$(mktemp -d)"
+touch .hidden visible
+shopt -s dotglob
+echo *
+shopt -u dotglob
+echo *
+# CHECK: a/b/c/z.txt a/b/y.txt a/x.txt
+# CHECK: a/x.txt
+# CHECK: nullglob-count=0
+# CHECK: .hidden visible
+# CHECK: visible

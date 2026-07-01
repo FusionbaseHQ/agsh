@@ -1,0 +1,14 @@
+# RUN: %agsh %s
+readonly RO=locked
+RO=changed 2>/dev/null
+echo "ro=$RO"
+unset RO 2>/dev/null
+echo "still=$RO"
+declare -r DR=fixed
+DR=other 2>/dev/null
+echo "dr=$DR"
+MUT=1; MUT=2; echo "mut=$MUT"
+# CHECK: ro=locked
+# CHECK: still=locked
+# CHECK: dr=fixed
+# CHECK: mut=2

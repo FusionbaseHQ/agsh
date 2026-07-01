@@ -1,0 +1,13 @@
+# RUN: %agsh %s
+f() { echo "in $1"; }
+f arg
+g() { local x=5; echo $x; }
+g
+h() { return 3; }
+h; echo $?
+greet() { echo "$1-$2"; }
+greet a b
+# CHECK: in arg
+# CHECK: 5
+# CHECK: 3
+# CHECK: a-b

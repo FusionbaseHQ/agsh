@@ -1,0 +1,11 @@
+# RUN: %agsh %s
+cd "$(mktemp -d)"
+touch a.txt b.txt c.log
+echo *.txt
+echo ?.log
+echo [ab].txt
+echo nomatch_zzz*.q
+# CHECK: a.txt b.txt
+# CHECK: c.log
+# CHECK: a.txt b.txt
+# CHECK: nomatch_zzz*.q

@@ -1,0 +1,14 @@
+# RUN: %agsh %s
+set -- -a -b val -c arg
+while getopts "ab:c" opt; do echo "$opt:$OPTARG"; done
+shift $((OPTIND-1)); echo "rest=$1"
+OPTIND=1
+set -- -abc
+while getopts "abc" o; do echo "cl-$o"; done
+# CHECK: a:
+# CHECK: b:val
+# CHECK: c:
+# CHECK: rest=arg
+# CHECK: cl-a
+# CHECK: cl-b
+# CHECK: cl-c

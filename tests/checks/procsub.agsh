@@ -1,0 +1,11 @@
+# RUN: %agsh %s
+cat <(echo from-procsub)
+diff <(printf 'a\nb\n') <(printf 'a\nb\n') && echo identical
+cat <(echo one) <(echo two)
+read line < <(printf 'captured\n')
+echo "read:$line"
+# CHECK: from-procsub
+# CHECK: identical
+# CHECK: one
+# CHECK: two
+# CHECK: read:captured

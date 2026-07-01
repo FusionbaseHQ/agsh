@@ -1,0 +1,528 @@
+# Built-in command compactor presets, translated from rtk's src/filters/*.toml
+# (the "Rust Token Killer"). Merged at a low priority by
+# CompactorConfig::merge_builtin_presets, so any user/project [[compactor]]
+# overrides them. These cover the long tail of commands that agsh has no
+# dedicated family compactor for; the high-frequency families (git, test
+# runners, compilers/linters, grep/rg, package managers, docker/k8s) keep their
+# richer native SemanticSummary compactors and are intentionally not listed here.
+#
+# Regexes use TOML literal (single-quoted) strings so backslashes are verbatim.
+
+# ---- system / disk / process -------------------------------------------------
+
+[[compactor]]
+name = "df"
+match.argv = ["df", "*"]
+strip_ansi = true
+truncate_lines_at = 80
+max_lines = 20
+
+[[compactor]]
+name = "du"
+match.argv = ["du", "*"]
+strip_lines = ['^\s*$']
+truncate_lines_at = 120
+max_lines = 40
+
+[[compactor]]
+name = "ps"
+match.argv = ["ps", "*"]
+strip_ansi = true
+truncate_lines_at = 120
+max_lines = 30
+
+[[compactor]]
+name = "stat"
+match.argv = ["stat", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^\s*Device:', '^\s*Birth:']
+truncate_lines_at = 120
+max_lines = 20
+
+[[compactor]]
+name = "systemctl-status"
+match.argv = ["systemctl", "status", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$']
+max_lines = 20
+
+[[compactor]]
+name = "iptables"
+match.argv = ["iptables", "*"]
+strip_lines = ['^\s*$', '^Chain DOCKER', '^Chain BR-']
+truncate_lines_at = 120
+max_lines = 50
+
+[[compactor]]
+name = "fail2ban-client"
+match.argv = ["fail2ban-client", "*"]
+strip_lines = ['^\s*$']
+max_lines = 30
+
+# ---- network -----------------------------------------------------------------
+
+[[compactor]]
+name = "ssh"
+match.argv = ["ssh", "*"]
+strip_ansi = true
+strip_lines = [
+  '^\s*$',
+  '^Warning: Permanently added',
+  '^Connection to .+ closed',
+  '^Authenticated to',
+  '^debug1:',
+  '^OpenSSH_',
+  '^Pseudo-terminal',
+]
+truncate_lines_at = 120
+max_lines = 200
+
+[[compactor]]
+name = "ping"
+match.argv = ["ping", "*"]
+strip_ansi = true
+strip_lines = ['^PING ', '^Pinging ', '^\d+ bytes from ', '^Reply from .+: bytes=', '^\s*$']
+tail_lines = 4
+
+[[compactor]]
+name = "rsync"
+match.argv = ["rsync", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^sending incremental file list', '^sent \d']
+match_output = [{ pattern = 'total size is', message = 'ok (synced)', unless = 'error|failed|No such file' }]
+max_lines = 20
+
+[[compactor]]
+name = "curl-verbose"
+match.argv = ["curl", "-v", "*"]
+strip_ansi = true
+strip_lines = ['^\*\s', '^> ', '^< ', '^\s*%\s+Total', '^\s*$']
+max_lines = 40
+
+# ---- infrastructure as code --------------------------------------------------
+
+[[compactor]]
+name = "terraform-plan"
+match.argv = ["terraform", "plan", "*"]
+strip_ansi = true
+strip_lines = ['^Refreshing state', '^\s*#.*unchanged', '^\s*$', '^Acquiring state lock', '^Releasing state lock']
+max_lines = 80
+on_empty = "terraform plan: no changes detected"
+
+[[compactor]]
+name = "tofu-plan"
+match.argv = ["tofu", "plan", "*"]
+strip_ansi = true
+strip_lines = ['^Refreshing state', '^\s*#.*unchanged', '^\s*$', '^Acquiring state lock', '^Releasing state lock']
+max_lines = 80
+on_empty = "tofu plan: no changes detected"
+
+[[compactor]]
+name = "tofu-init"
+match.argv = ["tofu", "init", "*"]
+strip_ansi = true
+strip_lines = [
+  '^- Downloading', '^- Installing', '^- Using previously-installed', '^\s*$',
+  '^Initializing provider', '^Initializing the backend', '^Initializing modules',
+]
+max_lines = 20
+on_empty = "tofu init: ok"
+
+[[compactor]]
+name = "tofu-fmt"
+match.argv = ["tofu", "fmt", "*"]
+strip_ansi = true
+max_lines = 30
+on_empty = "tofu fmt: ok (no changes)"
+
+[[compactor]]
+name = "tofu-validate"
+match.argv = ["tofu", "validate", "*"]
+strip_ansi = true
+match_output = [{ pattern = 'Success! The configuration is valid', message = 'ok (valid)' }]
+
+[[compactor]]
+name = "pulumi-up"
+match.argv = ["pulumi", "up", "*"]
+strip_ansi = true
+strip_lines = [
+  '^\s*$', '^Updating \(', '^Previewing update', '^View in Browser', '^View Live:',
+  '^Duration:', '^Permalink:', '^\s*Type\s+Name\s+', '^Loading policy packs', '^More information at:', '^Use `pulumi ',
+]
+on_empty = "pulumi up: no changes"
+
+[[compactor]]
+name = "pulumi-preview"
+match.argv = ["pulumi", "preview", "*"]
+strip_ansi = true
+strip_lines = [
+  '^\s*$', '^Previewing update', '^View in Browser', '^View Live:', '^Duration:',
+  '^Permalink:', '^\s*Type\s+Name\s+', '^Loading policy packs', '^More information at:', '^Use `pulumi ',
+]
+on_empty = "pulumi preview: no changes"
+
+[[compactor]]
+name = "pulumi-destroy"
+match.argv = ["pulumi", "destroy", "*"]
+strip_ansi = true
+strip_lines = [
+  '^\s*$', '^Destroying \(', '^View in Browser', '^View Live:', '^Duration:',
+  '^Permalink:', '^\s*Type\s+Name\s+', '^More information at:', '^Use `pulumi ',
+]
+on_empty = "pulumi destroy: nothing to destroy"
+
+[[compactor]]
+name = "pulumi-refresh"
+match.argv = ["pulumi", "refresh", "*"]
+strip_ansi = true
+strip_lines = [
+  '^\s*$', '^Refreshing \(', '^View in Browser', '^View Live:', '^Duration:',
+  '^Permalink:', '^\s*Type\s+Name\s+', '^More information at:', '^Use `pulumi ',
+]
+on_empty = "pulumi refresh: no drift"
+
+[[compactor]]
+name = "pulumi-stack"
+match.argv = ["pulumi", "stack", "*"]
+strip_ansi = true
+match_output = [{ pattern = 'No stacks found', message = 'pulumi stack: empty' }]
+strip_lines = ['^\s*$', '^Please choose a stack', '^More information at:', '^Use `pulumi ']
+on_empty = "pulumi stack: ok"
+
+[[compactor]]
+name = "ansible-playbook"
+match.argv = ["ansible-playbook", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^ok: \[', '^skipping: \[']
+max_lines = 60
+
+# ---- cloud / containers (non-family) -----------------------------------------
+
+[[compactor]]
+name = "gcloud"
+match.argv = ["gcloud", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$']
+truncate_lines_at = 120
+max_lines = 30
+
+[[compactor]]
+name = "skopeo"
+match.argv = ["skopeo", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^Getting image source signatures', '^Copying blob', '^Copying config', '^Writing manifest', '^Storing signatures']
+truncate_lines_at = 120
+max_lines = 30
+on_empty = "skopeo: ok"
+
+# ---- database / migrations ---------------------------------------------------
+
+[[compactor]]
+name = "liquibase"
+match.argv = ["liquibase", "*"]
+strip_ansi = true
+filter_stderr = true
+strip_lines = [
+  '^\s*$', '^Starting Liquibase at', '^Liquibase (?:Community|Open Source)', '^Liquibase Home:',
+  '^Java Home', '^Libraries:', '^\s*-\s+\S+\.jar', '^INFO \[liquibase\.integration\]',
+  '^INFO \[liquibase\.core\] Reading resource', '^INFO \[liquibase\.core\] Parsing',
+  '^(?:\[?INFO\]?\s*)?#+$', '^\s*##',
+]
+max_lines = 200
+on_empty = "liquibase: ok"
+
+# ---- build tools / task runners (non-family) ---------------------------------
+
+[[compactor]]
+name = "dotnet-build"
+match.argv = ["dotnet", "build", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^Microsoft \(R\)', '^Copyright \(C\)', '^  Determining projects']
+match_output = [{ pattern = '0 Warning\(s\)\n\s+0 Error\(s\)', message = 'ok (build succeeded)' }]
+max_lines = 40
+
+[[compactor]]
+name = "swift-build"
+match.argv = ["swift", "build", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^Compiling ', '^Linking ']
+match_output = [{ pattern = 'Build complete!', message = 'ok (build complete)', unless = 'warning:|error:' }]
+max_lines = 40
+
+[[compactor]]
+name = "xcodebuild"
+match.argv = ["xcodebuild", "*"]
+strip_ansi = true
+strip_lines = [
+  '^\s*$', '^CompileC\s', '^CompileSwift\s', '^Ld\s', '^CreateBuildDirectory\s', '^MkDir\s',
+  '^ProcessInfoPlistFile\s', '^CopySwiftLibs\s', '^CodeSign\s', '^Signing Identity:', '^RegisterWithLaunchServices',
+  '^Validate\s', '^ProcessProductPackaging', '^Touch\s', '^CompileStoryboard', '^CompileAssetCatalog',
+  '^GenerateDSYMFile', '^PhaseScriptExecution', '^PBXCp\s', '^\s+cd\s+/', '^\s+export\s',
+  '^\s+/usr/bin/', '^\s+builtin-', '^note: Using new build system',
+]
+max_lines = 60
+on_empty = "xcodebuild: ok"
+
+[[compactor]]
+name = "mix-compile"
+match.argv = ["mix", "compile", "*"]
+strip_ansi = true
+strip_lines = ['^Compiling \d+ file', '^\s*$', '^Generated\s']
+max_lines = 40
+on_empty = "mix compile: ok"
+
+[[compactor]]
+name = "mix-format"
+match.argv = ["mix", "format", "*"]
+max_lines = 20
+on_empty = "mix format: ok"
+
+[[compactor]]
+name = "pio-run"
+match.argv = ["pio", "run", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^Verbose mode', '^CONFIGURATION:', '^LDF:', '^Library Manager:', '^Compiling\s', '^Linking\s', '^Building\s', '^Checking size']
+max_lines = 30
+on_empty = "pio run: ok"
+
+[[compactor]]
+name = "quarto-render"
+match.argv = ["quarto", "render", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^\s*processing file:', '^\s*\d+/\d+\s', '^\s*running', '^\s*Rendering', '^pandoc ', '^  Validating', '^  Resolving']
+match_output = [{ pattern = 'Output created:', message = 'ok (output created)' }]
+max_lines = 20
+
+[[compactor]]
+name = "trunk-build"
+match.argv = ["trunk", "build", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^\s*Compiling\s', '^\s*Downloading\s', '^\s*Fetching\s', '^\s*Fresh\s', '^\s*Checking\s']
+tail_lines = 10
+max_lines = 30
+on_empty = "trunk build: ok"
+
+[[compactor]]
+name = "nx"
+match.argv = ["nx", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^\s*>\s*NX\s+Running target', '^\s*>\s*NX\s+Nx read the output', '^\s*>\s*NX\s+View logs', '^———————', '^—————————', '^\s+Nx \(powered by']
+truncate_lines_at = 150
+max_lines = 60
+
+[[compactor]]
+name = "turbo"
+match.argv = ["turbo", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^\s*cache (hit|miss|bypass)', '^\s*\d+ packages in scope', '^\s*Tasks:\s+\d+', '^\s*Duration:\s+', '^\s*Remote caching (enabled|disabled)']
+truncate_lines_at = 150
+max_lines = 50
+on_empty = "turbo: ok"
+
+[[compactor]]
+name = "task"
+match.argv = ["task", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^task: \[.*\] ', '^task: Task .* is up to date']
+truncate_lines_at = 150
+max_lines = 50
+on_empty = "task: ok"
+
+[[compactor]]
+name = "just"
+match.argv = ["just", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^\s*Available recipes:', '^\s*just --list']
+truncate_lines_at = 150
+max_lines = 50
+
+[[compactor]]
+name = "mise"
+match.argv = ["mise", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^mise\s+(trust|install|upgrade).*✓', '^mise\s+Installing\s', '^mise\s+Downloading\s', '^mise\s+Extracting\s', '^mise\s+\w+@[\d.]+ installed']
+truncate_lines_at = 150
+max_lines = 50
+on_empty = "mise: ok"
+
+# ---- package / dependency installers (non-family) ----------------------------
+
+[[compactor]]
+name = "brew-install"
+match.argv = ["brew", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^==> Downloading', '^==> Pouring', '^Already downloaded:', '^###', '^==> Fetching']
+match_output = [{ pattern = 'already installed', message = 'ok (already installed)' }]
+max_lines = 20
+
+[[compactor]]
+name = "bundle-install"
+match.argv = ["bundle", "*"]
+strip_ansi = true
+strip_lines = ['^Using ', '^\s*$', '^Fetching gem metadata', '^Resolving dependencies']
+match_output = [
+  { pattern = 'Bundle complete!', message = 'ok bundle: complete' },
+  { pattern = 'Bundle updated!', message = 'ok bundle: updated' },
+]
+max_lines = 30
+
+[[compactor]]
+name = "composer-install"
+match.argv = ["composer", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^  - Downloading ', '^  - Installing ', '^Loading composer', '^Updating dependencies']
+match_output = [{ pattern = 'Nothing to install, update or remove', message = 'ok (up to date)' }]
+max_lines = 30
+
+[[compactor]]
+name = "poetry-install"
+match.argv = ["poetry", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^  [-•] Downloading ', '^  [-•] Installing .* \(', '^Creating virtualenv', '^Using virtualenv']
+match_output = [{ pattern = 'No dependencies to install or update|No changes\.', message = 'ok (up to date)' }]
+max_lines = 30
+
+[[compactor]]
+name = "uv-sync"
+match.argv = ["uv", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^\s+Downloading ', '^\s+Using cached ', '^\s+Preparing ']
+match_output = [{ pattern = 'Audited \d+ package', message = 'ok (up to date)' }]
+max_lines = 20
+
+# ---- linters (non-family) ----------------------------------------------------
+
+[[compactor]]
+name = "biome"
+match.argv = ["biome", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^Checked \d+ file', '^Fixed \d+ file', '^The following command', '^Run it with']
+max_lines = 50
+on_empty = "biome: ok"
+
+[[compactor]]
+name = "oxlint"
+match.argv = ["oxlint", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^Finished in \d+', '^Found \d+ warning']
+max_lines = 50
+on_empty = "oxlint: ok"
+
+[[compactor]]
+name = "hadolint"
+match.argv = ["hadolint", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$']
+truncate_lines_at = 120
+max_lines = 40
+
+[[compactor]]
+name = "shellcheck"
+match.argv = ["shellcheck", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$']
+max_lines = 50
+
+[[compactor]]
+name = "markdownlint"
+match.argv = ["markdownlint", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$']
+truncate_lines_at = 120
+max_lines = 50
+
+[[compactor]]
+name = "yamllint"
+match.argv = ["yamllint", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$']
+truncate_lines_at = 120
+max_lines = 50
+
+[[compactor]]
+name = "basedpyright"
+match.argv = ["basedpyright", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^Searching for source files', '^Found \d+ source file', '^Pyright \d+\.\d+', '^basedpyright \d+\.\d+']
+max_lines = 50
+on_empty = "basedpyright: ok"
+
+[[compactor]]
+name = "ty"
+match.argv = ["ty", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^Checking \d+ file', '^ty \d+\.\d+']
+max_lines = 50
+on_empty = "ty: ok"
+
+# ---- VCS / misc tools --------------------------------------------------------
+
+[[compactor]]
+name = "jj"
+match.argv = ["jj", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^Hint:', '^Working copy now at:']
+truncate_lines_at = 120
+max_lines = 30
+
+[[compactor]]
+name = "yadm"
+match.argv = ["yadm", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^\s*\(use "git ', '^\s*\(use "yadm ']
+truncate_lines_at = 120
+max_lines = 40
+
+[[compactor]]
+name = "jira"
+match.argv = ["jira", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^\s*--']
+truncate_lines_at = 120
+max_lines = 40
+
+[[compactor]]
+name = "shopify-theme-push"
+match.argv = ["shopify", "theme", "push", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^\s*Uploading', '^\s*Downloading']
+tail_lines = 5
+max_lines = 15
+on_empty = "shopify theme: ok"
+
+[[compactor]]
+name = "shopify-theme-pull"
+match.argv = ["shopify", "theme", "pull", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$', '^\s*Uploading', '^\s*Downloading']
+tail_lines = 5
+max_lines = 15
+on_empty = "shopify theme: ok"
+
+[[compactor]]
+name = "pre-commit"
+match.argv = ["pre-commit", "*"]
+strip_ansi = true
+strip_lines = ['^\[INFO\] Installing environment', '^\[INFO\] Once installed this environment will be reused', '^\[INFO\] This may take a few minutes', '^\s*$']
+max_lines = 40
+
+[[compactor]]
+name = "ollama-run"
+match.argv = ["ollama", "run", "*"]
+strip_ansi = true
+strip_lines = ['^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏\s]*$', '^\s*$']
+
+[[compactor]]
+name = "jq"
+match.argv = ["jq", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$']
+truncate_lines_at = 120
+max_lines = 40
+
+[[compactor]]
+name = "sops"
+match.argv = ["sops", "*"]
+strip_ansi = true
+strip_lines = ['^\s*$']
+max_lines = 40

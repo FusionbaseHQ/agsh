@@ -1,0 +1,12 @@
+# RUN: %agsh %s
+trap 'echo ERR-fired' ERR
+false
+echo after-false
+true
+echo after-true
+false || true
+echo after-operand
+# CHECK: ERR-fired
+# CHECK: after-false
+# CHECK: after-true
+# CHECK: after-operand

@@ -1,0 +1,15 @@
+[package]
+name = "agsh"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+agsh-core = { path = "../agsh-core" }
+agsh-exec = { path = "../agsh-exec" }
+agsh-output = { path = "../agsh-output" }
+agsh-policy = { path = "../agsh-policy" }
+agsh-tty = { path = "../agsh-tty" }
+
+[lints]
+workspace = true

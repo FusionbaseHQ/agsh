@@ -1,0 +1,11 @@
+# RUN: %agsh %s
+false; echo $?
+set -- a b c; echo $#
+set -- a b c; for x in "$@"; do echo $x; done
+echo $$ | grep -qE '^[0-9]+$' && echo pid-ok
+# CHECK: 1
+# CHECK: 3
+# CHECK: a
+# CHECK: b
+# CHECK: c
+# CHECK: pid-ok

@@ -1,0 +1,14 @@
+# RUN: %agsh %s
+a=("a b" c d)
+for e in "${a[@]}"; do echo "[$e]"; done
+printf '%s\n' "${a[@]}"
+echo "${a[*]}"
+n=0; for e in "${a[@]}"; do n=$((n+1)); done; echo "count=$n"
+# CHECK: [a b]
+# CHECK: [c]
+# CHECK: [d]
+# CHECK: a b
+# CHECK: c
+# CHECK: d
+# CHECK: a b c d
+# CHECK: count=3

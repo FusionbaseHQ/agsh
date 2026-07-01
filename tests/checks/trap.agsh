@@ -1,0 +1,7 @@
+# RUN: %agsh %s
+trap 'echo exit-handler' EXIT
+echo body1
+echo body2
+# CHECK: body1
+# CHECK: body2
+# CHECK: exit-handler

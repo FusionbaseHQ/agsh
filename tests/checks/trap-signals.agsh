@@ -1,0 +1,16 @@
+# RUN: %agsh %s
+trap 'echo usr1-handler' USR1
+kill -USR1 $$
+echo after-usr1
+trap 'echo term-handler' TERM
+kill -TERM $$
+echo after-term
+n=0
+trap 'n=99' USR2
+kill -USR2 $$
+echo "n=$n"
+# CHECK: usr1-handler
+# CHECK: after-usr1
+# CHECK: term-handler
+# CHECK: after-term
+# CHECK: n=99

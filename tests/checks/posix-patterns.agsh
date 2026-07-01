@@ -1,0 +1,11 @@
+# RUN: %agsh %s
+case 5 in [[:digit:]]) echo digit;; esac
+case a in [[:alpha:]]) echo alpha;; esac
+case A in [[:upper:]]) echo upper;; esac
+case x in [[:digit:]]) echo d;; *) echo notdigit;; esac
+echo ~root | grep -q / && echo root-home
+# CHECK: digit
+# CHECK: alpha
+# CHECK: upper
+# CHECK: notdigit
+# CHECK: root-home

@@ -1,0 +1,10 @@
+# RUN: %agsh %s
+complete -W "add commit push" gitlike
+complete
+complete -r gitlike
+echo "after-remove:"
+complete
+echo done
+# CHECK: complete -W 'add commit push' gitlike
+# CHECK: after-remove:
+# CHECK: done

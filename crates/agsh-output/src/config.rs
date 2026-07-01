@@ -1,0 +1,520 @@
+//! Token-economy configuration loaded from `~/.config/agsh/token.toml`.
+//!
+//! The config is auditable and deterministic: parse failures fall back to
+//! built-in defaults rather than panicking, and no value is interpreted by an
+//! LLM. It drives normalization, redaction, budgeting, and the configurable
+//! `[[compactor]]` rule engine.
+
+use std::path::PathBuf;
+
+use serde::Deserialize;
+
+use crate::budget::BudgetOptions;
+use crate::normalize::NormalizeOptions;
+use crate::redact::{compile_pattern_strings, default_patterns, RedactOptions};
+use crate::OutputMode;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CompactorConfig {
+    pub mode: ModeConfig,
+    pub storage: StorageConfig,
+    pub budget: BudgetConfig,
+    pub normalization: NormalizationConfig,
+    pub security: SecurityConfig,
+    #[serde(rename = "compactor")]
+    pub compactors: Vec<CompactorRuleSet>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ModeConfig {
+    /// An explicit session default that overrides the context-specific ones
+    /// (e.g. `default = "compact"`). Applied to interactive sessions only.
+    pub default: Option<String>,
+    pub human_default: String,
+    pub agent_default: String,
+    pub ci_default: String,
+}
+
+impl Default for ModeConfig {
+    fn default() -> Self {
+        Self {
+            default: None,
+            human_default: "raw".to_string(),
+            agent_default: "semantic".to_string(),
+            ci_default: "raw".to_string(),
+        }
+    }
+}
+
+impl ModeConfig {
+    /// The default output mode for an interactive session: the explicit `default`
+    /// if set, otherwise `human_default`. Returns `None` if the configured name
+    /// can't be parsed (callers then keep their own default, e.g. `raw`).
+    pub fn interactive_default(&self) -> Option<OutputMode> {
+        let name = self.default.as_deref().unwrap_or(&self.human_default);
+        <OutputMode as std::str::FromStr>::from_str(name).ok()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StorageConfig {
+    pub store_raw: bool,
+    pub raw_retention: String,
+    pub max_raw_per_command: String,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            store_raw: true,
+            raw_retention: "14d".to_string(),
+            max_raw_per_command: "100mb".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BudgetConfig {
+    pub default_tokens: usize,
+    pub max_tokens: usize,
+    pub fallback: String,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            default_tokens: 2000,
+            max_tokens: 8000,
+            fallback: "lossless-ref".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct NormalizationConfig {
+    pub strip_ansi: bool,
+    pub collapse_progress: bool,
+    pub dedupe_repeated_lines: bool,
+    pub shorten_home: bool,
+    pub shorten_workspace: bool,
+}
+
+impl Default for NormalizationConfig {
+    fn default() -> Self {
+        Self {
+            strip_ansi: true,
+            collapse_progress: true,
+            dedupe_repeated_lines: true,
+            shorten_home: true,
+            shorten_workspace: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    pub redact_secrets: bool,
+    pub redact_env_names: Vec<String>,
+    pub redact_patterns: Vec<String>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            redact_secrets: true,
+            redact_env_names: vec![
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "AWS_SESSION_TOKEN".to_string(),
+                "GITHUB_TOKEN".to_string(),
+                "GH_TOKEN".to_string(),
+                "OPENAI_API_KEY".to_string(),
+                "ANTHROPIC_API_KEY".to_string(),
+            ],
+            redact_patterns: Vec::new(),
+        }
+    }
+}
+
+/// A configurable `[[compactor]]` matching a command family with ordered rules.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CompactorRuleSet {
+    pub name: String,
+    #[serde(rename = "match")]
+    pub match_spec: MatchSpec,
+    pub mode: Option<String>,
+    pub priority: i64,
+    pub rule: Vec<RuleSpec>,
+    // Declarative line-reduction (ported from rtk's TOML filter DSL). When any
+    // of these is set, a reduced `body` is produced from the command output.
+    /// Strip ANSI escapes before filtering (default true when reducing).
+    pub strip_ansi: Option<bool>,
+    /// Regex substitutions applied to each line, in order.
+    pub replace: Vec<ReplaceRule>,
+    /// Drop lines matching any of these regexes.
+    pub strip_lines: Vec<String>,
+    /// Keep ONLY lines matching any of these regexes (applied after strip).
+    pub keep_lines: Vec<String>,
+    /// Clip each line to at most N characters.
+    pub truncate_lines_at: Option<usize>,
+    /// Keep the first N lines.
+    pub head_lines: Option<usize>,
+    /// Keep the last N lines.
+    pub tail_lines: Option<usize>,
+    /// Absolute cap on body lines.
+    pub max_lines: Option<usize>,
+    /// Headline to use when the reduced body is empty (e.g. "make: ok").
+    pub on_empty: Option<String>,
+    /// Short-circuit rules: collapse the whole output to a message when matched.
+    pub match_output: Vec<MatchOutputRule>,
+    /// Also feed stderr (merged after stdout) into the reducer.
+    pub filter_stderr: bool,
+}
+
+impl CompactorRuleSet {
+    /// Whether this ruleset declares any line-reduction operations.
+    pub fn has_reduce(&self) -> bool {
+        self.strip_ansi.is_some()
+            || !self.replace.is_empty()
+            || !self.strip_lines.is_empty()
+            || !self.keep_lines.is_empty()
+            || self.truncate_lines_at.is_some()
+            || self.head_lines.is_some()
+            || self.tail_lines.is_some()
+            || self.max_lines.is_some()
+            || self.on_empty.is_some()
+            || !self.match_output.is_empty()
+            || self.filter_stderr
+    }
+}
+
+/// A regex substitution applied to each line (rtk `replace` rule).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ReplaceRule {
+    pub pattern: String,
+    pub replacement: String,
+}
+
+/// Short-circuit the whole output to `message` when `pattern` matches — unless
+/// the optional `unless` pattern also matches (so errors are never swallowed).
+/// Ported from rtk's `match_output`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MatchOutputRule {
+    pub pattern: String,
+    pub message: String,
+    pub unless: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MatchSpec {
+    pub argv: Vec<String>,
+    pub line_regex: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RuleSpec {
+    pub name: String,
+    #[serde(rename = "match")]
+    pub match_spec: MatchSpec,
+    pub action: String,
+    pub limit: Option<String>,
+    pub group_name: Option<String>,
+    pub lines: Option<usize>,
+}
+
+impl CompactorConfig {
+    /// Load config from `$AGSH_TOKEN_CONFIG` or `$HOME/.config/agsh/token.toml`,
+    /// then merge the built-in command presets (low priority, so user/project
+    /// compactors always win). Any error (missing file, bad TOML) yields defaults.
+    pub fn load() -> Self {
+        let mut cfg = Self::from_path_opt(Self::config_path());
+        cfg.merge_builtin_presets();
+        cfg
+    }
+
+    /// Append the bundled command presets at a very low priority, so any
+    /// user-defined `[[compactor]]` (default priority 0) overrides them.
+    pub fn merge_builtin_presets(&mut self) {
+        const BUILTIN: &str = include_str!("presets.toml");
+        if let Ok(parsed) = toml::from_str::<CompactorConfig>(BUILTIN) {
+            for mut preset in parsed.compactors {
+                preset.priority = -1_000;
+                self.compactors.push(preset);
+            }
+        }
+    }
+
+    pub fn config_path() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os("AGSH_TOKEN_CONFIG") {
+            return Some(PathBuf::from(path));
+        }
+        let home = std::env::var_os("HOME")?;
+        Some(PathBuf::from(home).join(".config/agsh/token.toml"))
+    }
+
+    fn from_path_opt(path: Option<PathBuf>) -> Self {
+        let Some(path) = path else {
+            return Self::default();
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Self::from_toml(&text),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Parse a TOML string, falling back to defaults on error.
+    pub fn from_toml(text: &str) -> Self {
+        toml::from_str(text).unwrap_or_default()
+    }
+
+    pub fn budget_options(&self) -> BudgetOptions {
+        BudgetOptions {
+            default_tokens: self.budget.default_tokens,
+            max_tokens: self.budget.max_tokens,
+            fallback: self
+                .budget
+                .fallback
+                .parse()
+                .unwrap_or(OutputMode::LosslessRef),
+        }
+    }
+
+    pub fn normalize_options(
+        &self,
+        home: Option<String>,
+        workspace: Option<String>,
+    ) -> NormalizeOptions {
+        NormalizeOptions {
+            strip_ansi: self.normalization.strip_ansi,
+            collapse_progress: self.normalization.collapse_progress,
+            dedupe_repeated_lines: self.normalization.dedupe_repeated_lines,
+            shorten_home: self.normalization.shorten_home,
+            shorten_workspace: self.normalization.shorten_workspace,
+            home,
+            workspace,
+        }
+    }
+
+    pub fn redact_options(&self, literal_secrets: Vec<String>) -> RedactOptions {
+        let mut patterns = default_patterns();
+        patterns.extend(compile_pattern_strings(&self.security.redact_patterns));
+        RedactOptions {
+            enabled: self.security.redact_secrets,
+            literal_secrets,
+            patterns,
+        }
+    }
+
+    /// The highest-priority compactor whose argv matcher matches the command.
+    pub fn matching_compactor(&self, argv: &[String]) -> Option<&CompactorRuleSet> {
+        self.compactors
+            .iter()
+            .filter(|c| argv_matches(&c.match_spec.argv, argv))
+            .max_by_key(|c| c.priority)
+    }
+}
+
+/// Match a command's argv against a `match.argv` pattern list. Each pattern
+/// element is glob-matched (`*` wildcard) against the corresponding argv element
+/// (the first against the program basename). A trailing `*` matches any
+/// remaining args.
+pub fn argv_matches(pattern: &[String], argv: &[String]) -> bool {
+    if pattern.is_empty() || argv.is_empty() {
+        return false;
+    }
+    // Compare the program by basename for the first element.
+    let prog = argv[0].rsplit(['/', '\\']).next().unwrap_or(&argv[0]);
+    if !glob_match(&pattern[0], prog) {
+        return false;
+    }
+    for (i, pat) in pattern.iter().enumerate().skip(1) {
+        if pat == "*" {
+            // A trailing `*` matches the rest; a middle `*` matches one token.
+            if i + 1 == pattern.len() {
+                return true;
+            }
+            continue;
+        }
+        match argv.get(i) {
+            Some(arg) if glob_match(pat, arg) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Minimal glob: `*` matches any run of characters. No other metacharacters.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == text;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut pos = 0usize;
+    for (idx, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if idx == 0 {
+            if !text[pos..].starts_with(part) {
+                return false;
+            }
+            pos += part.len();
+        } else if let Some(found) = text[pos..].find(part) {
+            pos += found + part.len();
+        } else {
+            return false;
+        }
+    }
+    // A trailing non-empty part must match the end.
+    if let Some(last) = parts.last() {
+        if !last.is_empty() && !text.ends_with(last) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_when_empty() {
+        let cfg = CompactorConfig::from_toml("");
+        assert_eq!(cfg.budget.default_tokens, 2000);
+        assert_eq!(cfg.mode.agent_default, "semantic");
+        assert!(cfg.security.redact_secrets);
+    }
+
+    #[test]
+    fn interactive_default_from_mode_config() {
+        // Empty config → human_default ("raw").
+        assert_eq!(
+            CompactorConfig::from_toml("").mode.interactive_default(),
+            Some(OutputMode::Raw)
+        );
+        // Explicit [mode] default overrides human_default.
+        let cfg = CompactorConfig::from_toml("[mode]\ndefault = \"compact\"\n");
+        assert_eq!(cfg.mode.interactive_default(), Some(OutputMode::Compact));
+        // human_default applies when no explicit default.
+        let cfg = CompactorConfig::from_toml("[mode]\nhuman_default = \"semantic\"\n");
+        assert_eq!(cfg.mode.interactive_default(), Some(OutputMode::Semantic));
+        // Garbage → None (caller keeps its own default).
+        let cfg = CompactorConfig::from_toml("[mode]\ndefault = \"bogus\"\n");
+        assert_eq!(cfg.mode.interactive_default(), None);
+    }
+
+    #[test]
+    fn builtin_presets_parse_and_match() {
+        let mut cfg = CompactorConfig::default();
+        cfg.merge_builtin_presets();
+        // The bundle is non-trivial and parsed cleanly.
+        assert!(
+            cfg.compactors.len() >= 50,
+            "presets didn't load: {}",
+            cfg.compactors.len()
+        );
+        // A long-tail command resolves to a preset (matches bare and with args).
+        assert!(cfg.matching_compactor(&["df".into()]).is_some());
+        assert!(cfg
+            .matching_compactor(&["df".into(), "-h".into()])
+            .is_some());
+        assert!(cfg
+            .matching_compactor(&["systemctl".into(), "status".into(), "nginx".into()])
+            .is_some());
+        // Presets carry reduction ops (not just keep/group/tail).
+        assert!(cfg
+            .matching_compactor(&["rsync".into(), "-a".into()])
+            .unwrap()
+            .has_reduce());
+    }
+
+    #[test]
+    fn user_compactor_overrides_builtin_preset() {
+        let mut cfg = CompactorConfig::from_toml(
+            r#"
+[[compactor]]
+name = "my-df"
+match.argv = ["df", "*"]
+max_lines = 3
+"#,
+        );
+        cfg.merge_builtin_presets();
+        // User compactor (priority 0) beats the preset (priority -1000).
+        let chosen = cfg.matching_compactor(&["df".into(), "-h".into()]).unwrap();
+        assert_eq!(chosen.name, "my-df");
+    }
+
+    #[test]
+    fn parses_compactor_rules() {
+        let toml = r#"
+[budget]
+default_tokens = 500
+
+[[compactor]]
+name = "mybuild"
+match.argv = ["mybuild", "*"]
+mode = "semantic"
+priority = 100
+
+[[compactor.rule]]
+name = "keep-errors"
+match.line_regex = "^ERROR"
+action = "keep"
+limit = "all"
+
+[[compactor.rule]]
+name = "tail"
+action = "keep_tail"
+lines = 80
+"#;
+        let cfg = CompactorConfig::from_toml(toml);
+        assert_eq!(cfg.budget.default_tokens, 500);
+        assert_eq!(cfg.compactors.len(), 1);
+        let c = &cfg.compactors[0];
+        assert_eq!(c.name, "mybuild");
+        assert_eq!(c.priority, 100);
+        assert_eq!(c.rule.len(), 2);
+        assert_eq!(c.rule[1].lines, Some(80));
+    }
+
+    #[test]
+    fn matches_argv_globs() {
+        assert!(argv_matches(
+            &["make".to_string(), "*".to_string()],
+            &["/usr/bin/make".to_string(), "all".to_string()]
+        ));
+        assert!(!argv_matches(&["make".to_string()], &["cmake".to_string()]));
+        assert!(glob_match("cargo*", "cargo-nextest"));
+        assert!(!glob_match("cargo", "cargo-nextest"));
+    }
+
+    #[test]
+    fn picks_highest_priority() {
+        let toml = r#"
+[[compactor]]
+name = "low"
+match.argv = ["make", "*"]
+priority = 1
+[[compactor]]
+name = "high"
+match.argv = ["make", "*"]
+priority = 50
+"#;
+        let cfg = CompactorConfig::from_toml(toml);
+        let m = cfg
+            .matching_compactor(&["make".to_string(), "build".to_string()])
+            .unwrap();
+        assert_eq!(m.name, "high");
+    }
+}

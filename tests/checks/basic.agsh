@@ -1,0 +1,14 @@
+# RUN: %agsh %s
+echo hello
+echo a b c
+printf '%s-%s\n' x y
+true && echo yes
+false || echo no
+echo done; echo end
+# CHECK: hello
+# CHECK: a b c
+# CHECK: x-y
+# CHECK: yes
+# CHECK: no
+# CHECK: done
+# CHECK: end

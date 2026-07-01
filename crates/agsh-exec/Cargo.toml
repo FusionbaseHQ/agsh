@@ -1,0 +1,22 @@
+[package]
+name = "agsh-exec"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+agsh-compat = { path = "../agsh-compat" }
+agsh-core = { path = "../agsh-core" }
+agsh-index = { path = "../agsh-index" }
+agsh-output = { path = "../agsh-output" }
+agsh-policy = { version = "0.1.0", path = "../agsh-policy" }
+agsh-render = { version = "0.1.0", path = "../agsh-render" }
+agsh-store = { version = "0.1.0", path = "../agsh-store" }
+agsh-style = { version = "0.1.0", path = "../agsh-style" }
+regex = "1.12.4"
+rustix = { version = "1.1.4", features = ["process", "termios", "pty", "time"] }
+serde_json = "1.0.150"
+signal-hook = "0.4.4"
+
+[lints]
+workspace = true

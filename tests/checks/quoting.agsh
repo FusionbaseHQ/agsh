@@ -1,0 +1,14 @@
+# RUN: %agsh %s
+x=5
+echo '$x'
+echo "val=$x"
+echo "${x}bar"
+echo "a'b"
+echo "\$HOME"
+echo a"b"'c'
+# CHECK: $x
+# CHECK: val=5
+# CHECK: 5bar
+# CHECK: a'b
+# CHECK: $HOME
+# CHECK: abc

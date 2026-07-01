@@ -1,0 +1,22 @@
+# RUN: %agsh %s
+case foo in @(foo|bar)) echo at-match;; esac
+case baz in @(foo|bar)) echo no;; *) echo at-nomatch;; esac
+[[ abcabc == +(abc) ]] && echo plus
+[[ color == colo?(u)r ]] && echo opt-absent
+[[ colour == colo?(u)r ]] && echo opt-present
+[[ foo.c == !(*.o) ]] && echo not-o
+[[ foo.o == !(*.o) ]] || echo excludes-o
+v=foobar; echo "${v##@(foo)}"
+cd "$(mktemp -d)"; touch a.txt b.md c.log
+echo @(*.txt|*.md)
+echo !(*.log)
+# CHECK: at-match
+# CHECK: at-nomatch
+# CHECK: plus
+# CHECK: opt-absent
+# CHECK: opt-present
+# CHECK: not-o
+# CHECK: excludes-o
+# CHECK: bar
+# CHECK: a.txt b.md
+# CHECK: a.txt b.md

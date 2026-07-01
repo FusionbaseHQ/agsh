@@ -1,0 +1,7 @@
+# RUN: %agsh %s
+true | false
+echo "${PIPESTATUS[0]}-${PIPESTATUS[1]}"
+false | true | true
+echo "${PIPESTATUS[@]}"
+# CHECK: 0-1
+# CHECK: 1 0 0

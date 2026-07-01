@@ -1,0 +1,21 @@
+# RUN: %agsh %s
+# Security contract: under `confine`, only allowlisted externals run. Every
+# bypass below must be denied — proven by stdout being EXACTLY the allowed lines
+# (any leaked `uname` output would appear here and break the 1:1 stdout match).
+confine echo,true
+echo allowed-line
+true && echo true-ran
+uname
+eval uname
+(uname)
+uname | cat
+command uname
+/bin/uname
+$(uname)
+f() { uname; }; f
+exec uname
+echo final-line
+# CHECK: allowed-line
+# CHECK: true-ran
+# CHECK: final-line
+# CHECKERR: {{.*}}not permitted in this confined session{{.*}}

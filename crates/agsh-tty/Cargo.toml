@@ -1,0 +1,15 @@
+[package]
+name = "agsh-tty"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+agsh-core = { path = "../agsh-core" }
+agsh-exec = { path = "../agsh-exec" }
+agsh-index = { path = "../agsh-index" }
+agsh-style = { version = "0.1.0", path = "../agsh-style" }
+rustix = { version = "1.1.4", features = ["termios", "event"] }
+
+[lints]
+workspace = true

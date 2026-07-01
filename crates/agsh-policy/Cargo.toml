@@ -1,0 +1,11 @@
+[package]
+name = "agsh-policy"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+agsh-core = { path = "../agsh-core" }
+
+[lints]
+workspace = true

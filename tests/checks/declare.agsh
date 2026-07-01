@@ -1,0 +1,16 @@
+# RUN: %agsh %s
+declare -i n=3+4
+echo $n
+typeset -i m=10*2
+echo $m
+declare greeting=hello
+echo $greeting
+FOO=bar
+declare -p FOO
+export BAZ=qux
+export -p | grep -q 'BAZ="qux"' && echo exported
+# CHECK: 7
+# CHECK: 20
+# CHECK: hello
+# CHECK: declare -- FOO="bar"
+# CHECK: exported

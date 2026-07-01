@@ -1,0 +1,21 @@
+# RUN: %agsh %s
+v=hello
+echo ${v^^}
+echo ${v^}
+u=HELLO
+echo ${u,,}
+echo ${u,}
+a=(x y z)
+echo ${a[-1]}
+echo ${a[-2]}
+b=(aa bbb c)
+echo ${#b[-1]}
+echo "[${a[-9]}]"
+# CHECK: HELLO
+# CHECK: Hello
+# CHECK: hello
+# CHECK: hELLO
+# CHECK: z
+# CHECK: y
+# CHECK: 1
+# CHECK: []

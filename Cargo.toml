@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/agsh",
+  "crates/agsh-core",
+  "crates/agsh-exec",
+  "crates/agsh-policy",
+  "crates/agsh-output",
+  "crates/agsh-agent",
+  "crates/agsh-tty",
+  "crates/agsh-store",
+  "crates/agsh-index",
+  "crates/agsh-compat",
+  "crates/agsh-style",
+  "crates/agsh-render",
+]
+
+[workspace.package]
+edition = "2021"
+license = "AGPL-3.0-only"
+version = "0.1.0"
+authors = ["Fusionbase and the agsh contributors"]
+description = "A modern, from-scratch POSIX-style shell in Rust — for humans and AI coding agents."
+repository = "https://github.com/FusionbaseHQ/agsh"
+homepage = "https://github.com/FusionbaseHQ/agsh"
+keywords = ["shell", "posix", "terminal", "agent", "sandbox"]
+categories = ["command-line-utilities", "development-tools"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+

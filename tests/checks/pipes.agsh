@@ -1,0 +1,11 @@
+# RUN: %agsh %s
+echo hello | tr a-z A-Z
+printf 'c\nb\na\n' | sort | head -1
+printf 'a\nb\nc\n' | wc -l | tr -d ' '
+echo "x y" | { read a b; echo "$b $a"; }
+false | true; echo $?
+# CHECK: HELLO
+# CHECK: a
+# CHECK: 3
+# CHECK: y x
+# CHECK: 0

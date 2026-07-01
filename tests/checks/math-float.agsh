@@ -1,0 +1,24 @@
+# RUN: %agsh %s
+agmath "3.14 * 2"
+agmath "sqrt(2)"
+agmath "2 ** 10"
+agmath -p 3 "10 / 3"
+agmath "max(3, 7, 1)"
+agmath "floor(3.7) + ceil(2.1)"
+r=5
+agmath "pi * r * r"
+echo $((3.0 / 2))
+echo $((1.5 + 2.5))
+echo $((3 / 2))
+echo $((2 ** 10))
+# CHECK: 6.28
+# CHECK: 1.4142135624
+# CHECK: 1024
+# CHECK: 3.333
+# CHECK: 7
+# CHECK: 6
+# CHECK: 78.5398163397
+# CHECK: 1.5
+# CHECK: 4
+# CHECK: 1
+# CHECK: 1024

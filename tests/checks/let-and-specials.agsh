@@ -1,0 +1,15 @@
+# RUN: %agsh %s
+let x=3+4
+echo $x
+let "y = 5 * 6"
+echo $y
+n=10; let n+=5; echo $n
+echo $RANDOM | grep -qE '^[0-9]+$' && echo random-ok
+a=$RANDOM; b=$RANDOM; [ "$a" != "$b" ] && echo random-varies
+echo $SECONDS | grep -qE '^[0-9]+$' && echo seconds-ok
+# CHECK: 7
+# CHECK: 30
+# CHECK: 15
+# CHECK: random-ok
+# CHECK: random-varies
+# CHECK: seconds-ok
