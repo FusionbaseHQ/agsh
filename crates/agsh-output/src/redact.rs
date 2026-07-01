@@ -7,11 +7,32 @@ pub const REDACTED: &str = "[REDACTED]";
 
 /// Redaction options: literal secret values (e.g. the value of `$GITHUB_TOKEN`)
 /// and compiled token-shaped patterns.
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` is hand-written to NEVER print the cleartext `literal_secrets` — a
+/// derived `Debug` would leak every live secret through any stray `{:?}` in a
+/// panic message, `log::debug!`, or serde dump, which is exactly the material this
+/// type concentrates.
+#[derive(Clone, Default)]
 pub struct RedactOptions {
     pub enabled: bool,
     pub literal_secrets: Vec<String>,
     pub patterns: Vec<Regex>,
+}
+
+impl std::fmt::Debug for RedactOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedactOptions")
+            .field("enabled", &self.enabled)
+            .field(
+                "literal_secrets",
+                &format_args!("<{} hidden>", self.literal_secrets.len()),
+            )
+            .field(
+                "patterns",
+                &format_args!("<{} patterns>", self.patterns.len()),
+            )
+            .finish()
+    }
 }
 
 impl RedactOptions {
@@ -69,6 +90,27 @@ pub fn redact(input: &str, options: &RedactOptions) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_never_prints_literal_secrets() {
+        let options = RedactOptions::with_defaults(vec![
+            "supersecretvalue".to_string(),
+            "ghp_realtokenmaterial12345".to_string(),
+        ]);
+        let shown = format!("{options:?}");
+        assert!(
+            !shown.contains("supersecretvalue"),
+            "Debug leaked a secret: {shown}"
+        );
+        assert!(
+            !shown.contains("ghp_realtokenmaterial"),
+            "Debug leaked a secret: {shown}"
+        );
+        assert!(
+            shown.contains("<2 hidden>"),
+            "expected a hidden-count: {shown}"
+        );
+    }
 
     #[test]
     fn redacts_token_patterns() {
