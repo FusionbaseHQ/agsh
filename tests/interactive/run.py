@@ -331,6 +331,18 @@ def scenario_programmable_completion():
         s.close()
 
 
+def scenario_clear_passes_through_in_compact_mode():
+    s = Session()
+    try:
+        s.send("mode:output compact" + ENTER, 0.3)
+        raw = s.send("clear" + ENTER, 0.4).decode("latin-1")
+        esc = ("\x1b[2J" in raw) or ("\x1b[3J" in raw) or ("\x1b[H" in raw)
+        check("clear emits the real screen-clear escape in compact mode", esc, raw[:120])
+        check("clear is not swallowed into a compact summary", "clear [ok]" not in raw, raw[:120])
+    finally:
+        s.close()
+
+
 def scenario_mode_intercept_toggle():
     # Runtime toggle of shell interception via the mode: namespace.
     s = Session()
@@ -362,6 +374,7 @@ def scenario_rc_autoload():
 
 
 SCENARIOS = [
+    scenario_clear_passes_through_in_compact_mode,
     scenario_mode_intercept_toggle,
     scenario_rc_autoload,
     scenario_mode_builtin_session_default,

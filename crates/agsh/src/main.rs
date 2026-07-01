@@ -577,7 +577,7 @@ fn run_one_inner(
             let (mode, rest) = peel_output_mode(line);
             (mode, rest.to_string())
         };
-    let effective_options = match mode_override {
+    let mut effective_options = match mode_override {
         // A per-command wrapper (`compact ls`, `raw npm test`) wins outright.
         Some(output_mode) => ExecutionOptions {
             output_mode,
@@ -591,6 +591,17 @@ fn run_one_inner(
         },
     };
 
+    // `clear`/`reset` exist only to emit terminal-control escapes to the TTY. A
+    // capturing mode (compact/semantic) would swallow those escapes — leaving the
+    // screen untouched and printing a useless "clear [ok]" summary — so on a
+    // terminal, run a standalone terminal-control command raw so it actually works.
+    if effective_options.output_mode.should_capture()
+        && std::io::stdout().is_terminal()
+        && is_terminal_control_line(&effective_line)
+    {
+        effective_options.output_mode = OutputMode::Raw;
+    }
+
     let graph = parse_line(&effective_line)?;
     let findings = analyze_graph(&graph);
     for finding in findings
@@ -602,6 +613,31 @@ fn run_one_inner(
     let outcome = executor.run_graph(&graph, state, &effective_options)?;
     print_captured_if_needed(&outcome, &effective_options)?;
     Ok(outcome.exit_code)
+}
+
+/// Whether `line` is a standalone terminal-control command whose output is escape
+/// sequences meant for the TTY (`clear`, `reset`, `cls`, `tput clear|reset|…`).
+/// Only a bare command qualifies — a pipeline/list/redirect is left to normal mode.
+fn is_terminal_control_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.contains(['|', ';', '&', '<', '>', '\n', '`', '$']) {
+        return false;
+    }
+    let mut words = trimmed.split_whitespace();
+    match words.next() {
+        Some("clear") | Some("reset") | Some("cls") => true,
+        Some("tput") => matches!(
+            words.next(),
+            Some("clear")
+                | Some("reset")
+                | Some("init")
+                | Some("civis")
+                | Some("cnorm")
+                | Some("smcup")
+                | Some("rmcup")
+        ),
+        _ => false,
+    }
 }
 
 /// If `line` is an `agview` command, return the file arguments (possibly empty).
@@ -710,4 +746,24 @@ fn print_help() {
     println!(
         "agsh - Aegis Shell\n\nUSAGE:\n  agsh [--output MODE] [--allow LIST] [--run COMMAND] [--rcfile FILE] [--norc] [-c COMMAND]\n\nSTARTUP:\n  interactive sessions source ~/.config/agsh/agshrc (or ~/.agshrc); --norc skips,\n  --rcfile FILE / $AGSH_RC picks another, $AGSH_NORC=1 disables\n\nINTERCEPTION (route the agent's own shell through agsh; off by default):\n  AGSH_INTERCEPT=compact agsh …   shim bash/sh/… to `agsh --observe` (real shell,\n                                  captured+rendered); nested shells pass through\n    :native  agsh interprets the command    :deep  also catch absolute-path\n    (instead of running the real shell)     /bin/bash + posix_spawn (preload)\n  toggle at runtime: `mode:intercept compact:deep` / `mode:intercept off`\n\nMODES:\n  raw | clean | compact | semantic | lossless-ref | silent | rich\n\nCONFINE (kernel-enforced capability sandbox for a leaf payload):\n  confine read-only -- python x.py  read+run; no writes/network/secret-reads\n  confine workspace -- ./build.sh   writes only within $PWD (+ a scratch dir)\n  confine offline -- npm test       network off; filesystem unchanged\n  confine convert -- ./batch.sh     exec-allowlist: may only exec `convert`\n  confine ls,df                     confine the current agsh session (sticky)\n    --rw PATH  add a writable root    --net/--no-net  toggle network\n    --explain  show capabilities      --dry-run  print profile, don't run\n    --force    run a refused agent    --best-effort  shim layer if no sandbox\n  enforced via sandbox-exec (macOS); Linux Landlock planned, fails closed\n  elsewhere. Self-managing agents (claude, …) are refused — use --allowedTools.\n\nAGSH TOOLS (ag-prefixed where a common CLI shares the name; bare otherwise):\n  agview FILE…   rich render (markdown, code, images)   agz DIR    frecent jump\n  agpatch        structured patch        agtrace/agtrust/agcontext/agmath/agjump\n  confine, peek, risk, snapshot, pty     stay bare (no common CLI conflict)\n  sessions       list/resume Claude & Codex sessions for this folder (sessions N)\n  mode:output M  set the session default output mode\n\nMODE SELECTION (highest priority first):\n  per-command wrapper   semantic git diff\n  --output flag         agsh --output compact -c 'pytest -q'\n  mode builtin          mode:output compact   (session default; `mode` shows all)\n  AGSH_OUTPUT_MODE env  AGSH_OUTPUT_MODE=semantic agsh -c 'cargo test'\n  ~/.config/agsh/token.toml  [mode] default = \"compact\"  (interactive sessions)\n  default               raw\n  (the config/`mode` default makes plain `ls` render like `compact ls`; it applies\n   to interactive sessions only — piped `agsh -c`/scripts stay raw)\n\nRICH RENDERING (human display, TTY only; raw bytes still pipe/redirect):\n  agview FILE...        render by type (markdown, JSON, CSV/TSV, diff, binary)\n  agview main.py        syntax-highlight source code (py, rs, js, ts, go, c, …)\n  agview image.png      show images inline (any terminal; crisp in iTerm2/Kitty)\n  AGSH_OUTPUT_MODE=rich  auto-render recognized command output\n\nTRACE:\n  raw output is captured in capturing modes and addressable via trace://<id>/...\n  trace                 list recent captured commands\n  trace <id>            print a command's raw stdout\n\nEXAMPLES:\n  agsh -c 'echo hello'\n  agsh --output semantic -c 'git status'\n  view README.md\n  semantic git diff"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_terminal_control_line;
+
+    #[test]
+    fn terminal_control_lines_are_recognized() {
+        assert!(is_terminal_control_line("clear"));
+        assert!(is_terminal_control_line("  reset  "));
+        assert!(is_terminal_control_line("cls"));
+        assert!(is_terminal_control_line("tput clear"));
+        assert!(is_terminal_control_line("tput reset"));
+        // Not standalone control commands.
+        assert!(!is_terminal_control_line("ls"));
+        assert!(!is_terminal_control_line("tput cols")); // queries, not a screen op
+        assert!(!is_terminal_control_line("clear && ls")); // list: leave to normal mode
+        assert!(!is_terminal_control_line("clear | tee x"));
+        assert!(!is_terminal_control_line("echo clear"));
+    }
 }
