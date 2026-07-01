@@ -252,6 +252,9 @@ pub struct ShellState {
     jobs: Arc<Mutex<JobTable>>,
     interrupt: Arc<AtomicBool>,
     traces: Arc<Mutex<TraceStore>>,
+    /// First-use hashes for advisories, so a repeated advisory (loop / agent retry)
+    /// is shown once instead of flooding the context. Advisory channel only.
+    advisories: Arc<Mutex<std::collections::HashSet<u64>>>,
     config: Arc<CompactorConfig>,
     /// Session default output mode (set by config/env/flag at startup and the
     /// runtime `mode` builtin); `None` means use the executor's mode.
@@ -376,6 +379,7 @@ impl ShellState {
             jobs: Arc::new(Mutex::new(JobTable::default())),
             interrupt: Arc::new(AtomicBool::new(false)),
             traces: Arc::new(Mutex::new(TraceStore::default())),
+            advisories: Arc::new(Mutex::new(std::collections::HashSet::new())),
             config: Arc::new(CompactorConfig::load()),
             default_output_mode: None,
             git_cache: Arc::new(Mutex::new(None)),
@@ -987,6 +991,21 @@ impl ShellState {
         // `raw:` file-path references resolvable across processes (an agent can
         // `grep`/`cat` them from plain bash).
         persist_trace_to_disk(cmd_id, stdout, stderr);
+    }
+
+    /// Record a first-use advisory key: returns `true` the FIRST time this key is
+    /// seen in the session and `false` thereafter, so a repeated advisory (in a shell
+    /// loop or an agent retry) is emitted once instead of flooding the context.
+    /// Advisory channel only — never gate a real error or an exit code on this.
+    pub fn advise_once(&self, key: &str) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        match self.advisories.lock() {
+            Ok(mut set) => set.insert(hash),
+            Err(_) => true,
+        }
     }
 
     /// Resolve a `trace://<id>/stdout|stderr` (or bare id) reference to bytes.

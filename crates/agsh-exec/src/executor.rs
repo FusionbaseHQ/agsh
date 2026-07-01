@@ -2549,30 +2549,34 @@ fn command_not_found_outcome(name: &str, state: &ShellState) -> CommandOutcome {
     ));
     message.push('\n');
 
-    // Deterministic "did you mean" over builtins, aliases, functions, and PATH.
-    let mut candidates: Vec<String> = crate::builtins::builtin_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    candidates.extend(state.aliases().keys().cloned());
-    candidates.extend(state.functions().keys().cloned());
-    if let Some(path) = state.lookup("PATH") {
-        candidates.extend(crate::suggest::path_executables(path));
-    }
-    let suggestions = crate::suggest::did_you_mean(name, candidates.into_iter());
-    if !suggestions.is_empty() {
-        message.push_str(&theme.paint(agsh_style::Role::Muted, "Did you mean:"));
-        message.push('\n');
-        for suggestion in &suggestions {
-            message.push_str(&format!(
-                "  {}\n",
-                theme.paint(agsh_style::Role::Command, suggestion)
-            ));
+    // The "did you mean" + install advisory repeats verbatim if the same typo recurs
+    // in a loop or an agent retry, flooding the context — so emit it only on the
+    // first occurrence of this name per session. The error line + exit 127 always emit.
+    if state.advise_once(&format!("cmd-not-found:{name}")) {
+        let mut candidates: Vec<String> = crate::builtins::builtin_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        candidates.extend(state.aliases().keys().cloned());
+        candidates.extend(state.functions().keys().cloned());
+        if let Some(path) = state.lookup("PATH") {
+            candidates.extend(crate::suggest::path_executables(path));
         }
-    }
-    if let Some(hint) = crate::suggest::install_hint(name) {
-        message.push_str(&theme.paint(agsh_style::Role::Muted, &format!("Install: {hint}")));
-        message.push('\n');
+        let suggestions = crate::suggest::did_you_mean(name, candidates.into_iter());
+        if !suggestions.is_empty() {
+            message.push_str(&theme.paint(agsh_style::Role::Muted, "Did you mean:"));
+            message.push('\n');
+            for suggestion in &suggestions {
+                message.push_str(&format!(
+                    "  {}\n",
+                    theme.paint(agsh_style::Role::Command, suggestion)
+                ));
+            }
+        }
+        if let Some(hint) = crate::suggest::install_hint(name) {
+            message.push_str(&theme.paint(agsh_style::Role::Muted, &format!("Install: {hint}")));
+            message.push('\n');
+        }
     }
 
     CommandOutcome::captured(127, Vec::new(), message.into_bytes())

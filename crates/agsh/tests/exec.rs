@@ -1172,3 +1172,32 @@ fn agtrace_grep_searches_a_trace_file() {
     assert_eq!(out.status.code(), Some(1));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn repeated_command_not_found_advisory_shown_once() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agsh");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"ech a\nech b\nech c\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    // The error line + exit still happen every time; the advisory is shown once.
+    assert_eq!(
+        err.matches("command not found").count(),
+        3,
+        "errors:\n{err}"
+    );
+    assert_eq!(
+        err.matches("Did you mean").count(),
+        1,
+        "advisory once:\n{err}"
+    );
+}
