@@ -982,6 +982,11 @@ impl ShellState {
                 stderr.to_vec(),
             ));
         }
+        // In the interception/observe path the in-memory store dies with this
+        // one-shot process, so persist to `$AGSH_TRACE_DIR` too — that makes the
+        // `raw:` file-path references resolvable across processes (an agent can
+        // `grep`/`cat` them from plain bash).
+        persist_trace_to_disk(cmd_id, stdout, stderr);
     }
 
     /// Resolve a `trace://<id>/stdout|stderr` (or bare id) reference to bytes.
@@ -1587,4 +1592,47 @@ impl ShellState {
 
 fn is_positional_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|ch| ch.is_ascii_digit())
+}
+
+/// Keep at most this many trace files in `$AGSH_TRACE_DIR` (2 per command).
+const TRACE_DIR_FILE_CAP: usize = 512;
+
+/// Persist a command's raw stdout/stderr to `$AGSH_TRACE_DIR` as
+/// `<pid>_<cmd_id>.out` / `.err`, so `raw:` file-path references survive the
+/// process that produced them. No-op unless `$AGSH_TRACE_DIR` is set.
+fn persist_trace_to_disk(cmd_id: &CommandId, stdout: &[u8], stderr: &[u8]) {
+    let Some(dir) = std::env::var_os("AGSH_TRACE_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let pid = std::process::id();
+    let _ = std::fs::write(dir.join(format!("{pid}_{cmd_id}.out")), stdout);
+    let _ = std::fs::write(dir.join(format!("{pid}_{cmd_id}.err")), stderr);
+    prune_trace_dir(&dir);
+}
+
+/// Bound the trace dir: when it exceeds the cap, drop the oldest files.
+fn prune_trace_dir(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let mtime = e.metadata().and_then(|m| m.modified()).ok()?;
+            Some((mtime, path))
+        })
+        .collect();
+    if files.len() <= TRACE_DIR_FILE_CAP {
+        return;
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0)); // oldest first
+    let drop = files.len() - TRACE_DIR_FILE_CAP;
+    for (_, path) in files.into_iter().take(drop) {
+        let _ = std::fs::remove_file(path);
+    }
 }

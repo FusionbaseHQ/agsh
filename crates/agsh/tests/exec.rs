@@ -1072,12 +1072,12 @@ int main(void){char*a[]={"/bin/bash","-c","echo DEEP-TEST-HIT",0};execv("/bin/ba
         .expect("run harness");
     let text = String::from_utf8_lossy(&out.stdout);
     let _ = std::fs::remove_dir_all(&tmp);
-    // Routed through agsh --observe: the marker survives AND a trace ref proves the
-    // absolute-path exec was captured rather than run raw.
+    // Routed through agsh --observe: the marker survives AND the compact-summary
+    // framing (`[ok]`) proves the absolute-path exec was captured, not run raw.
     assert!(text.contains("DEEP-TEST-HIT"), "marker missing:\n{text}");
     assert!(
-        text.contains("trace://"),
-        "absolute-path exec was not intercepted:\n{text}"
+        text.contains("[ok]"),
+        "absolute-path exec was not intercepted (no compact framing):\n{text}"
     );
 }
 
@@ -1104,4 +1104,44 @@ fn mode_intercept_runtime_toggle() {
         !path_line.contains("agsh-intercept"),
         "off must clean PATH:\n{path_line}"
     );
+}
+
+#[test]
+fn compact_raw_ref_suppressed_when_shown_and_persisted_when_elided() {
+    let bin = env!("CARGO_BIN_EXE_agsh");
+    // Small output is fully shown → no redundant raw pointer.
+    let out = Command::new(bin)
+        .args(["--output", "compact", "-c", "echo small-output"])
+        .output()
+        .expect("run agsh");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("small-output"));
+    assert!(
+        !s.contains("raw:"),
+        "fully-shown output must not carry a raw ref:\n{s}"
+    );
+
+    // Large output with $AGSH_TRACE_DIR → the ref is a catable file path that holds
+    // the full raw output (resolvable across processes).
+    let dir = std::env::temp_dir().join(format!("agsh_trace_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = Command::new(bin)
+        .args(["--output", "compact", "-c", "seq 1 600"])
+        .env("AGSH_TRACE_DIR", &dir)
+        .output()
+        .expect("run agsh");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let path = s
+        .lines()
+        .find_map(|l| l.strip_prefix("raw: "))
+        .and_then(|r| r.split_whitespace().next())
+        .unwrap_or_else(|| panic!("expected a raw file ref for elided output:\n{s}"));
+    let raw = std::fs::read_to_string(path).expect("trace file should exist on disk");
+    assert_eq!(
+        raw.lines().count(),
+        600,
+        "trace file must hold the full raw output"
+    );
+    assert!(raw.contains("600"));
+    let _ = std::fs::remove_dir_all(&dir);
 }

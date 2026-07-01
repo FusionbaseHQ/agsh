@@ -105,6 +105,17 @@ Flavors and layers (combine with `:`):
   (`/bin/bash -c …`) and `posix_spawn` (what node/libuv use), via an injected
   interposition library (`DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`).
 
+**Recovering raw output.** Compacted results only carry a `raw:` reference when they
+actually elide output. Under interception those references are **catable file paths**
+(agsh persists each observed command's raw stdout/stderr to `$AGSH_TRACE_DIR`), so an
+agent can pull back exactly what it needs from plain bash:
+
+```sh
+# a compacted result ends with, e.g.:
+#   raw: /…/agsh-traces/1234_cmd_….out /…/agsh-traces/1234_cmd_….err
+grep -n "error" /…/agsh-traces/1234_cmd_….out     # query the full raw output
+```
+
 > **Coverage.** Without `:deep`, interception catches shells resolved by name or via
 > `$SHELL` (a program calling `/bin/bash` by absolute path bypasses it). `:deep`
 > closes that gap, but is best-effort: macOS **SIP / hardened-runtime** binaries

@@ -2968,6 +2968,12 @@ pub fn install_intercept_shims(
     if shimmed {
         state.export_var("PATH", format!("{}:{path_str}", dir.display()));
         state.export_var("SHELL", dir.join("bash").display().to_string());
+        // Persist observed commands' raw output here so `raw:` file-path references
+        // resolve across the ephemeral one-shot `agsh --observe` processes.
+        if state.lookup("AGSH_TRACE_DIR").is_none() {
+            let trace_dir = std::env::temp_dir().join("agsh-traces");
+            state.export_var("AGSH_TRACE_DIR", trace_dir.display().to_string());
+        }
     }
     Ok(dir)
 }

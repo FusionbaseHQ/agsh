@@ -46,8 +46,12 @@ pub struct SemanticSummary {
     /// structured summary). Rendered verbatim, not as a bulleted section.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub body: Vec<String>,
-    pub raw_stdout: String,
-    pub raw_stderr: String,
+    /// Reference to the full raw stdout — set only when the compact view actually
+    /// elides output (otherwise the raw is already shown, so no pointer is useful).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_stdout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_stderr: Option<String>,
 }
 
 impl SemanticSummary {
@@ -64,9 +68,17 @@ impl SemanticSummary {
             paths: Vec::new(),
             notes: Vec::new(),
             body: Vec::new(),
-            raw_stdout: format!("trace://{}/stdout", cx.cmd_id),
-            raw_stderr: format!("trace://{}/stderr", cx.cmd_id),
+            // Populated by the render layer only when output is actually elided.
+            raw_stdout: None,
+            raw_stderr: None,
         }
+    }
+
+    /// Attach raw-output references (shown as a `raw:` line). Called by the render
+    /// layer when the compact view dropped content the caller might want back.
+    pub fn set_raw_refs(&mut self, stdout: impl Into<String>, stderr: impl Into<String>) {
+        self.raw_stdout = Some(stdout.into());
+        self.raw_stderr = Some(stderr.into());
     }
 
     pub fn set_headline(&mut self, headline: impl Into<String>) -> &mut Self {
@@ -145,7 +157,9 @@ impl SemanticSummary {
             out.push_str(line);
             out.push('\n');
         }
-        out.push_str(&format!("raw: {} {}\n", self.raw_stdout, self.raw_stderr));
+        if let (Some(stdout), Some(stderr)) = (&self.raw_stdout, &self.raw_stderr) {
+            out.push_str(&format!("raw: {stdout} {stderr}\n"));
+        }
         out
     }
 
@@ -202,6 +216,9 @@ mod tests {
         s.set_headline("1 failed")
             .set_count("failed", 1)
             .add_failure("test_a");
+        // Refs are attached by the render layer only when output is elided.
+        assert!(!s.to_json().contains("trace://"), "no ref until attached");
+        s.set_raw_refs("trace://cmd_1/stdout", "trace://cmd_1/stderr");
         let json = s.to_json();
         assert!(json.contains("\"status\": \"failed\""));
         assert!(json.contains("trace://cmd_1/stdout"));

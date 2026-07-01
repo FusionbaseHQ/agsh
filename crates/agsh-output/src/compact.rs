@@ -81,7 +81,7 @@ pub fn render_observation_with(
                 Some(ruleset) => crate::rules::apply_compactor(ruleset, &cx),
                 None => compactors::summarize(&cx),
             };
-            budgeted_summary(ctx, mode, cmd_id, argv, exit_code, summary)
+            budgeted_summary(ctx, mode, cmd_id, argv, exit_code, summary, (&out, &err))
         }
         OutputMode::LosslessRef => lossless_ref(cmd_id, argv, exit_code),
         OutputMode::Silent => OutputObservation {
@@ -102,7 +102,9 @@ fn budgeted_summary(
     argv: &[String],
     exit_code: i32,
     mut summary: SemanticSummary,
+    raw_output: (&str, &str),
 ) -> OutputObservation {
+    let (stdout, stderr) = raw_output;
     let render = |s: &SemanticSummary| {
         if mode == OutputMode::Semantic {
             s.to_json()
@@ -124,6 +126,14 @@ fn budgeted_summary(
         return lossless_ref(cmd_id, argv, exit_code);
     }
 
+    // Attach a raw-output pointer ONLY when the compact view actually dropped
+    // content — otherwise the raw is already shown above and a ref is just noise.
+    if !output_fully_shown(&text, stdout, stderr) {
+        let (out_ref, err_ref) = raw_ref_strings(cmd_id);
+        summary.set_raw_refs(out_ref, err_ref);
+        text = render(&summary);
+    }
+
     OutputObservation {
         token_estimate: estimate_tokens(&text),
         display: text,
@@ -132,17 +142,52 @@ fn budgeted_summary(
 }
 
 fn lossless_ref(cmd_id: &CommandId, argv: &[String], exit_code: i32) -> OutputObservation {
+    let (out_ref, err_ref) = raw_ref_strings(cmd_id);
     let display = format!(
-        "command: {}\nexit: {}\nraw_stdout: trace://{}/stdout\nraw_stderr: trace://{}/stderr\n",
+        "command: {}\nexit: {}\nraw_stdout: {}\nraw_stderr: {}\n",
         shell_join(argv),
         exit_code,
-        cmd_id,
-        cmd_id
+        out_ref,
+        err_ref,
     );
     OutputObservation {
         token_estimate: estimate_tokens(&display),
         display,
         raw: raw_ref(cmd_id),
+    }
+}
+
+/// Whether the rendered `display` already contains all of the raw output, so a
+/// pointer back to it would be redundant. Empty output counts as fully shown.
+fn output_fully_shown(display: &str, stdout: &str, stderr: &str) -> bool {
+    stdout.lines().chain(stderr.lines()).all(|line| {
+        let trimmed = line.trim();
+        trimmed.is_empty() || display.contains(trimmed)
+    })
+}
+
+/// The two strings for a `raw:` reference. When `$AGSH_TRACE_DIR` is set — the
+/// interception/observe path persists each command's raw bytes there — these are
+/// catable file paths that resolve from any process (`<dir>/<pid>_<id>.out`).
+/// Otherwise they're in-session `trace://` references (resolved by the `trace`
+/// builtin within the same live shell).
+fn raw_ref_strings(cmd_id: &CommandId) -> (String, String) {
+    if let Some(dir) = std::env::var_os("AGSH_TRACE_DIR") {
+        let dir = std::path::Path::new(&dir);
+        let pid = std::process::id();
+        (
+            dir.join(format!("{pid}_{cmd_id}.out"))
+                .display()
+                .to_string(),
+            dir.join(format!("{pid}_{cmd_id}.err"))
+                .display()
+                .to_string(),
+        )
+    } else {
+        (
+            format!("trace://{cmd_id}/stdout"),
+            format!("trace://{cmd_id}/stderr"),
+        )
     }
 }
 
@@ -159,18 +204,43 @@ mod tests {
     use agsh_core::CommandId;
 
     #[test]
-    fn compact_keeps_raw_refs_and_failures() {
+    fn compact_omits_ref_when_output_fully_shown() {
+        // A generic command's short output is shown verbatim in the body, so a
+        // pointer back to the raw would be redundant noise.
         let id = CommandId::new();
         let obs = render_observation(
             OutputMode::Compact,
             &id,
-            &["pytest".to_string(), "-q".to_string()],
-            1,
-            b"failed test_a\n",
-            b"AssertionError\n",
+            &["mycmd".to_string()],
+            0,
+            b"only line one\nonly line two\n",
+            b"",
         );
-        assert!(obs.display.contains("trace://"));
-        assert!(obs.display.to_lowercase().contains("fail"));
+        assert!(obs.display.contains("only line one"));
+        assert!(
+            !obs.display.contains("raw:"),
+            "fully-shown output must omit the raw ref:\n{}",
+            obs.display
+        );
+    }
+
+    #[test]
+    fn compact_emits_ref_only_when_output_is_elided() {
+        let id = CommandId::new();
+        let big: String = (0..600).map(|n| format!("line {n}\n")).collect();
+        let obs = render_observation(
+            OutputMode::Compact,
+            &id,
+            &["seq".to_string()],
+            0,
+            big.as_bytes(),
+            b"",
+        );
+        assert!(
+            obs.display.contains("raw:"),
+            "elided output should carry a raw ref:\n{}",
+            obs.display
+        );
     }
 
     #[test]

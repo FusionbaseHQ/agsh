@@ -17,6 +17,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   isolated `agsh-intercept` crate — the single first-party `unsafe` exception.
 - **`sessions`** now shows each session's folder; namespaced `mode:<aspect>` builtin.
 
+### Changed
+- **`raw:` references are now useful.** They are emitted only when the compact view
+  actually elides output (no more redundant pointer under fully-shown results), and
+  under interception (`$AGSH_TRACE_DIR`) they are **catable file paths** backed by
+  on-disk persistence — so an agent can `grep`/`cat` the full raw output from plain
+  bash, instead of a dangling in-memory `trace://` id that died with the one-shot
+  process.
+
 ## [0.1.0] - 2026-06-30
 
 First production-ready release of the Aegis Shell — a from-scratch, POSIX-style
