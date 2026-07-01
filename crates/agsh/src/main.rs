@@ -131,8 +131,8 @@ fn main() {
     // compacted/observed. Opt-in via `AGSH_INTERCEPT=<mode>`. Skipped inside an
     // already-observed subtree to avoid re-installing / re-entrancy.
     if std::env::var_os("AGSH_INTERCEPT_ACTIVE").is_none() {
-        if let Some(mode) = intercept_mode() {
-            let _ = agsh_exec::install_intercept_shims(&mut state, mode);
+        if let Some((mode, native)) = intercept_mode() {
+            let _ = agsh_exec::install_intercept_shims(&mut state, mode, native);
         }
     }
 
@@ -424,17 +424,25 @@ fn single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The output mode for opt-in shell interception, or `None` when disabled.
-/// Controlled by `$AGSH_INTERCEPT`: a mode name (`compact`, `semantic`, …), or
-/// `1`/`on`/`true` (⇒ `compact`); unset or `0`/`off` disables it. Since the value
-/// is read from the environment it can be set in your `agshrc`.
-fn intercept_mode() -> Option<OutputMode> {
+/// The opt-in shell-interception setting from `$AGSH_INTERCEPT`, as
+/// `(output mode, native)`, or `None` when disabled. The value is `<mode>[:native]`:
+/// the mode is a mode name (or `1`/`on`/`true` ⇒ `compact`; unset/`0`/`off`
+/// disables). The `:native` suffix selects flavor A (agsh *interprets* the command)
+/// instead of the default proxy (agsh runs the real shell and observes it). Read
+/// from the environment, so it can be set in your `agshrc`.
+fn intercept_mode() -> Option<(OutputMode, bool)> {
     let raw = std::env::var("AGSH_INTERCEPT").ok()?;
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "0" | "off" | "false" | "no" => None,
-        "1" | "on" | "true" | "yes" => Some(OutputMode::Compact),
-        other => OutputMode::from_str(other).ok(),
-    }
+    let raw = raw.trim().to_ascii_lowercase();
+    let (mode_part, native) = match raw.split_once(':') {
+        Some((m, flavor)) => (m, matches!(flavor, "native" | "interpret")),
+        None => (raw.as_str(), false),
+    };
+    let mode = match mode_part {
+        "" | "0" | "off" | "false" | "no" => return None,
+        "1" | "on" | "true" | "yes" => OutputMode::Compact,
+        other => OutputMode::from_str(other).ok()?,
+    };
+    Some((mode, native))
 }
 
 /// Set up command confinement before running anything:

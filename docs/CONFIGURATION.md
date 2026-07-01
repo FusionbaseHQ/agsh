@@ -95,6 +95,13 @@ forward to `agsh --observe`, which runs the **real** shell and captures its outp
 so semantics are exact and only the observed output is compacted. Nested shells pass
 straight through (no double-observation), and raw pipes still receive exact bytes.
 
+Two flavors:
+
+- `AGSH_INTERCEPT=compact` — **proxy** (default): runs the real shell, observes it.
+  Exact semantics; recommended.
+- `AGSH_INTERCEPT=compact:native` — **interpret**: agsh runs the command in its own
+  interpreter (full agsh features, but bounded by agsh's `bash` compatibility).
+
 > **Coverage:** this catches shells resolved by name or via `$SHELL`. A program that
 > calls `/bin/bash` by absolute path bypasses it; catching that needs the exec-
 > interposition layer (planned).

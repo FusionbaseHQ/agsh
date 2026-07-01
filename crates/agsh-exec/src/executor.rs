@@ -2899,6 +2899,29 @@ if [ -n "$AGSH_INTERCEPT_ACTIVE" ]; then exec __REAL__ "$@"; fi
 exec __AGSH__ --output __MODE__ --observe __REAL__ "$@"
 "#;
 
+/// Flavor-A (native-interpret) interception shim: agsh *interprets* the `-c`
+/// command itself rather than running the real shell. `AGSH_INTERCEPT_ACTIVE=1` is
+/// set for the agsh child so any nested shells run as the real shell (no recursion);
+/// non-`-c` invocations fall through to the real shell unchanged.
+const INTERCEPT_SHIM_TEMPLATE_NATIVE: &str = r#"#!/bin/sh
+# agsh interception shim (native) — interpret the agent's command in agsh.
+if [ -n "$AGSH_INTERCEPT_ACTIVE" ]; then exec __REAL__ "$@"; fi
+c=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c) c=$2; shift 2; break;;
+    --) shift; break;;
+    --rcfile|--init-file|-o|-O) shift 2;;
+    --*) shift;;
+    -*c*) c=$2; shift 2; break;;
+    -*) shift;;
+    *) break;;
+  esac
+done
+if [ -n "$c" ]; then AGSH_INTERCEPT_ACTIVE=1 exec __AGSH__ --output __MODE__ -c "$c"; fi
+exec __REAL__ "$@"
+"#;
+
 /// Install shell-*interception* shims (opt-in via `AGSH_INTERCEPT`): route the
 /// session's `bash`/`sh`/`zsh`/… — resolved by name or via `$SHELL` — through
 /// `agsh --observe`, so an agent's own `bash -c …` output is captured and rendered
@@ -2913,12 +2936,18 @@ exec __AGSH__ --output __MODE__ --observe __REAL__ "$@"
 pub fn install_intercept_shims(
     state: &mut ShellState,
     mode: agsh_output::OutputMode,
+    native: bool,
 ) -> std::io::Result<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let exe = std::env::current_exe()?;
     let dir = std::env::temp_dir().join(format!("agsh-intercept-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let agsh = shell_quote(&exe.display().to_string());
+    let template = if native {
+        INTERCEPT_SHIM_TEMPLATE_NATIVE
+    } else {
+        INTERCEPT_SHIM_TEMPLATE
+    };
     let path_str = state.lookup("PATH").unwrap_or_default().to_string();
     let mut shimmed = false;
     for name in ["bash", "sh", "zsh", "dash", "ksh"] {
@@ -2927,7 +2956,7 @@ pub fn install_intercept_shims(
         let Some(real) = resolve_on_path(name, &path_str) else {
             continue;
         };
-        let shim = INTERCEPT_SHIM_TEMPLATE
+        let shim = template
             .replace("__REAL__", &shell_quote(&real.display().to_string()))
             .replace("__AGSH__", &agsh)
             .replace("__MODE__", mode.as_str());

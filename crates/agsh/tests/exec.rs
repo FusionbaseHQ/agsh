@@ -1019,3 +1019,18 @@ fn intercept_is_off_by_default_and_opt_in_routes_shells() {
         "routed bash output must survive:\n{text}"
     );
 }
+
+#[test]
+fn intercept_native_flavor_interprets_in_agsh() {
+    // `<mode>:native` routes a shell `-c` command into agsh's own interpreter.
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["-c", "bash -c 'echo NATIVE-A | tr a-z A-Z'"])
+        .env("AGSH_INTERCEPT", "compact:native")
+        .output()
+        .expect("run agsh");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("NATIVE-A"),
+        "native-flavor interpret failed:\n{text}"
+    );
+}
