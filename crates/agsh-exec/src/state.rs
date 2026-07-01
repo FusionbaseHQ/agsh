@@ -1595,11 +1595,22 @@ fn is_positional_name(name: &str) -> bool {
 }
 
 /// Keep at most this many trace files in `$AGSH_TRACE_DIR` (2 per command).
+/// Default cap on files in `$AGSH_TRACE_DIR` (2 per command ⇒ ~256 commands).
+/// Override with `$AGSH_TRACE_DIR_CAP`. Keeps the newest, drops the oldest.
 const TRACE_DIR_FILE_CAP: usize = 512;
+
+fn trace_dir_cap() -> usize {
+    std::env::var("AGSH_TRACE_DIR_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(TRACE_DIR_FILE_CAP)
+        .max(2)
+}
 
 /// Persist a command's raw stdout/stderr to `$AGSH_TRACE_DIR` as
 /// `<pid>_<cmd_id>.out` / `.err`, so `raw:` file-path references survive the
-/// process that produced them. No-op unless `$AGSH_TRACE_DIR` is set.
+/// process that produced them. No-op unless `$AGSH_TRACE_DIR` is set. The dir is
+/// bounded (oldest files reaped) on every write, so it never grows without bound.
 fn persist_trace_to_disk(cmd_id: &CommandId, stdout: &[u8], stderr: &[u8]) {
     let Some(dir) = std::env::var_os("AGSH_TRACE_DIR") else {
         return;
@@ -1611,11 +1622,11 @@ fn persist_trace_to_disk(cmd_id: &CommandId, stdout: &[u8], stderr: &[u8]) {
     let pid = std::process::id();
     let _ = std::fs::write(dir.join(format!("{pid}_{cmd_id}.out")), stdout);
     let _ = std::fs::write(dir.join(format!("{pid}_{cmd_id}.err")), stderr);
-    prune_trace_dir(&dir);
+    prune_trace_dir(&dir, trace_dir_cap());
 }
 
-/// Bound the trace dir: when it exceeds the cap, drop the oldest files.
-fn prune_trace_dir(dir: &Path) {
+/// Bound the trace dir to `cap` files: when it exceeds the cap, drop the oldest.
+fn prune_trace_dir(dir: &Path, cap: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1627,12 +1638,53 @@ fn prune_trace_dir(dir: &Path) {
             Some((mtime, path))
         })
         .collect();
-    if files.len() <= TRACE_DIR_FILE_CAP {
+    if files.len() <= cap {
         return;
     }
     files.sort_by(|a, b| a.0.cmp(&b.0)); // oldest first
-    let drop = files.len() - TRACE_DIR_FILE_CAP;
+    let drop = files.len() - cap;
     for (_, path) in files.into_iter().take(drop) {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod trace_dir_tests {
+    use super::prune_trace_dir;
+
+    #[test]
+    fn prune_keeps_newest_and_bounds_the_dir() {
+        let dir = std::env::temp_dir().join(format!("agsh_prune_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write 50 files with increasing mtimes (name order == age order here).
+        for i in 0..50u32 {
+            let path = dir.join(format!("{i:04}.out"));
+            std::fs::write(&path, b"x").unwrap();
+            // Bump mtime deterministically so "oldest" is well-defined.
+            let t =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000 + i as u64);
+            let _ = filetime_set(&path, t);
+        }
+        prune_trace_dir(&dir, 10);
+        let remaining: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(remaining.len(), 10, "dir must be bounded to the cap");
+        // The 10 kept must be the newest (0040..0049).
+        assert!(
+            remaining.iter().all(|n| n.as_str() >= "0040"),
+            "kept the newest: {remaining:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Set mtime explicitly so "oldest" is deterministic regardless of write speed.
+    fn filetime_set(path: &std::path::Path, t: std::time::SystemTime) -> std::io::Result<()> {
+        let f = std::fs::OpenOptions::new().write(true).open(path)?;
+        let times = std::fs::FileTimes::new().set_accessed(t).set_modified(t);
+        f.set_times(times)
     }
 }

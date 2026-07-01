@@ -116,6 +116,10 @@ agent can pull back exactly what it needs from plain bash:
 grep -n "error" /…/agsh-traces/1234_cmd_….out     # query the full raw output
 ```
 
+The trace directory is **bounded** — on every write the oldest files are reaped so
+it never grows without limit (default 512 files ≈ 256 commands; override with
+`AGSH_TRACE_DIR_CAP`).
+
 > **Coverage.** Without `:deep`, interception catches shells resolved by name or via
 > `$SHELL` (a program calling `/bin/bash` by absolute path bypasses it). `:deep`
 > closes that gap, but is best-effort: macOS **SIP / hardened-runtime** binaries
