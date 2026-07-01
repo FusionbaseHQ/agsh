@@ -1145,3 +1145,30 @@ fn compact_raw_ref_suppressed_when_shown_and_persisted_when_elided() {
     assert!(raw.contains("600"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn agtrace_grep_searches_a_trace_file() {
+    let dir = std::env::temp_dir().join(format!("agsh_agtg_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("t.out");
+    std::fs::write(&f, "alpha ok\nbeta error 1\ngamma ok\ndelta error 2\n").unwrap();
+    // Matches → structured count + numbered lines, exit 0.
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["-c", &format!("agtrace grep error {}", f.display())])
+        .output()
+        .expect("run agsh");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("[2 matches]"), "count header missing:\n{s}");
+    assert!(
+        s.contains("2: beta error 1") && s.contains("4: delta error 2"),
+        "{s}"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    // No match → exit 1 (grep-style).
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["-c", &format!("agtrace grep zzz {}", f.display())])
+        .output()
+        .expect("run agsh");
+    assert_eq!(out.status.code(), Some(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}

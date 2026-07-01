@@ -805,6 +805,11 @@ fn builtin_z(args: &[String], state: &mut ShellState) -> Result<CommandOutcome, 
 }
 
 fn builtin_trace(args: &[String], state: &ShellState) -> CommandOutcome {
+    // `agtrace grep <pattern> <ref>` — search a captured trace for a bounded,
+    // structured result instead of re-running the command or dumping the whole raw.
+    if args.first().map(String::as_str) == Some("grep") {
+        return trace_grep(&args[1..], state);
+    }
     let (opts, positional, flags) = match crate::agent::parse_slice_flags(args) {
         Ok(parts) => parts,
         Err(e) => {
@@ -841,6 +846,72 @@ fn builtin_trace(args: &[String], state: &ShellState) -> CommandOutcome {
             format!("trace: {reference}: not found\n").into_bytes(),
         ),
     }
+}
+
+/// `agtrace grep <pattern> <ref> [--stderr]` — search a captured trace (a
+/// `trace://<id>` reference resolved in-session, or a disk-backed `raw:` file path)
+/// and return a bounded, structured result: total match count plus the first N
+/// numbered matching lines. Lets an agent query a large output without re-running
+/// the command or reading back the whole raw stream. grep-style exit: 0 = matches,
+/// 1 = none, 2 = usage/not-found.
+fn trace_grep(args: &[String], state: &ShellState) -> CommandOutcome {
+    let want_stderr = args.iter().any(|a| a == "--stderr");
+    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let (Some(pattern), Some(reference)) = (positional.first(), positional.get(1)) else {
+        return CommandOutcome::captured(
+            2,
+            Vec::new(),
+            b"trace: usage: agtrace grep <pattern> <ref> [--stderr]\n".to_vec(),
+        );
+    };
+    // Resolve the bytes: a disk-backed file path, else a `trace://<id>` reference.
+    let bytes = if std::path::Path::new(reference.as_str()).is_file() {
+        std::fs::read(reference.as_str()).ok()
+    } else {
+        let base = reference
+            .trim_end_matches("/stdout")
+            .trim_end_matches("/stderr");
+        let resolved = format!("{base}/{}", if want_stderr { "stderr" } else { "stdout" });
+        state.resolve_trace(&resolved)
+    };
+    let Some(bytes) = bytes else {
+        return CommandOutcome::captured(
+            2,
+            Vec::new(),
+            format!("trace: {reference}: not found\n").into_bytes(),
+        );
+    };
+    // Bounded regex (guards against pathological patterns); literal fallback.
+    let re = regex::RegexBuilder::new(pattern)
+        .size_limit(1 << 20)
+        .dfa_size_limit(1 << 20)
+        .build()
+        .ok();
+    const MAX_SHOWN: usize = 100;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut total = 0usize;
+    let mut shown = String::new();
+    for (i, line) in text.lines().enumerate() {
+        let hit = match &re {
+            Some(r) => r.is_match(line),
+            None => line.contains(pattern.as_str()),
+        };
+        if !hit {
+            continue;
+        }
+        total += 1;
+        if total <= MAX_SHOWN {
+            let clipped: String = line.chars().take(300).collect();
+            shown.push_str(&format!("{}: {clipped}\n", i + 1));
+        }
+    }
+    let header = if total > MAX_SHOWN {
+        format!("[{total} matches, showing first {MAX_SHOWN}]\n")
+    } else {
+        format!("[{total} match{}]\n", if total == 1 { "" } else { "es" })
+    };
+    let exit = i32::from(total == 0);
+    CommandOutcome::captured(exit, format!("{header}{shown}").into_bytes(), Vec::new())
 }
 
 fn builtin_shift(args: &[String], state: &mut ShellState) -> CommandOutcome {
