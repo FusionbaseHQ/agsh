@@ -235,9 +235,21 @@ pub struct RuleSpec {
 impl CompactorConfig {
     /// Load config from `$AGSH_TOKEN_CONFIG` or `$HOME/.config/agsh/token.toml`,
     /// then merge the built-in command presets (low priority, so user/project
-    /// compactors always win). Any error (missing file, bad TOML) yields defaults.
+    /// compactors always win). A missing file yields defaults silently; a malformed
+    /// file is salvaged per-section (a bad `[[compactor]]` rule or `[budget]` is
+    /// dropped with a named warning while the rest still loads) so one typo can't
+    /// silently revert the whole token economy.
     pub fn load() -> Self {
-        let mut cfg = Self::from_path_opt(Self::config_path());
+        let (mut cfg, warnings) = match Self::config_path() {
+            Some(path) => match std::fs::read_to_string(&path) {
+                Ok(text) => Self::parse_resilient(&text),
+                Err(_) => (Self::default(), Vec::new()),
+            },
+            None => (Self::default(), Vec::new()),
+        };
+        for warning in warnings {
+            eprintln!("agsh: token.toml: {warning}");
+        }
         cfg.merge_builtin_presets();
         cfg
     }
@@ -262,19 +274,73 @@ impl CompactorConfig {
         Some(PathBuf::from(home).join(".config/agsh/token.toml"))
     }
 
-    fn from_path_opt(path: Option<PathBuf>) -> Self {
-        let Some(path) = path else {
-            return Self::default();
-        };
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Self::from_toml(&text),
-            Err(_) => Self::default(),
-        }
-    }
-
     /// Parse a TOML string, falling back to defaults on error.
     pub fn from_toml(text: &str) -> Self {
-        toml::from_str(text).unwrap_or_default()
+        Self::parse_resilient(text).0
+    }
+
+    /// Parse resiliently: if the whole document is valid, use it; otherwise salvage
+    /// each recognized section (`[mode]`, `[storage]`, `[budget]`, `[normalization]`,
+    /// `[security]`) and each `[[compactor]]` entry independently, dropping only the
+    /// malformed ones and returning a named warning for each. Preserves compactor
+    /// order (and thus the user-rules-beat-presets precedence).
+    pub fn parse_resilient(text: &str) -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
+        // Fast path: a fully valid document.
+        if let Ok(cfg) = toml::from_str::<Self>(text) {
+            return (cfg, warnings);
+        }
+        // Otherwise parse to a generic table and rebuild section by section.
+        let table: toml::Table = match toml::from_str(text) {
+            Ok(table) => table,
+            Err(error) => {
+                warnings.push(format!("not valid TOML, using defaults ({error})"));
+                return (Self::default(), warnings);
+            }
+        };
+
+        fn section<T: for<'de> Deserialize<'de>>(
+            table: &toml::Table,
+            key: &str,
+            warnings: &mut Vec<String>,
+        ) -> Option<T> {
+            let value = table.get(key)?;
+            match value.clone().try_into::<T>() {
+                Ok(parsed) => Some(parsed),
+                Err(error) => {
+                    warnings.push(format!("[{key}] ignored, using defaults for it ({error})"));
+                    None
+                }
+            }
+        }
+
+        let mut cfg = Self::default();
+        if let Some(v) = section(&table, "mode", &mut warnings) {
+            cfg.mode = v;
+        }
+        if let Some(v) = section(&table, "storage", &mut warnings) {
+            cfg.storage = v;
+        }
+        if let Some(v) = section(&table, "budget", &mut warnings) {
+            cfg.budget = v;
+        }
+        if let Some(v) = section(&table, "normalization", &mut warnings) {
+            cfg.normalization = v;
+        }
+        if let Some(v) = section(&table, "security", &mut warnings) {
+            cfg.security = v;
+        }
+        if let Some(array) = table.get("compactor").and_then(|v| v.as_array()) {
+            for (i, entry) in array.iter().enumerate() {
+                match entry.clone().try_into::<CompactorRuleSet>() {
+                    Ok(rule) => cfg.compactors.push(rule),
+                    Err(error) => {
+                        warnings.push(format!("[[compactor]] #{} ignored ({error})", i + 1));
+                    }
+                }
+            }
+        }
+        (cfg, warnings)
     }
 
     pub fn budget_options(&self) -> BudgetOptions {
@@ -394,6 +460,71 @@ mod tests {
         assert_eq!(cfg.budget.default_tokens, 2000);
         assert_eq!(cfg.mode.agent_default, "semantic");
         assert!(cfg.security.redact_secrets);
+    }
+
+    #[test]
+    fn bad_compactor_rule_is_dropped_but_the_rest_survives() {
+        // A valid [budget]/[mode] plus one good and one malformed [[compactor]].
+        let text = r#"
+[budget]
+default_tokens = 1234
+
+[mode]
+default = "compact"
+
+[[compactor]]
+name = "cargo-rule"
+match.argv = ["cargo", "*"]
+mode = "semantic"
+
+[[compactor]]
+name = "bad-rule"
+match.argv = "not-an-array"
+"#;
+        let (cfg, warnings) = CompactorConfig::parse_resilient(text);
+        // The good sections still load (no silent full revert).
+        assert_eq!(
+            cfg.budget.default_tokens, 1234,
+            "good [budget] must survive"
+        );
+        assert_eq!(cfg.mode.default.as_deref(), Some("compact"));
+        // The good rule loads; the malformed one is dropped with a named warning.
+        assert_eq!(cfg.compactors.len(), 1, "only the good rule survives");
+        assert!(
+            warnings.iter().any(|w| w.contains("[[compactor]] #2")),
+            "expected a named warning for the bad rule: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_bad_section_falls_back_only_for_that_section() {
+        let text = r#"
+[budget]
+default_tokens = "not-a-number"
+
+[mode]
+default = "compact"
+"#;
+        let (cfg, warnings) = CompactorConfig::parse_resilient(text);
+        assert_eq!(
+            cfg.budget.default_tokens, 2000,
+            "bad [budget] → its defaults"
+        );
+        assert_eq!(
+            cfg.mode.default.as_deref(),
+            Some("compact"),
+            "[mode] still loads"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("[budget]")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn valid_config_produces_no_warnings() {
+        let (_, warnings) = CompactorConfig::parse_resilient("[budget]\ndefault_tokens = 500\n");
+        assert!(warnings.is_empty());
     }
 
     #[test]
