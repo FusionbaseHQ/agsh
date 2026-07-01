@@ -359,12 +359,7 @@ fn command_candidates(state: &ShellState, _word: &str) -> Vec<Candidate> {
 
 fn git_candidates(state: &ShellState, prev_tokens: &[String]) -> Option<Vec<Candidate>> {
     // prev_tokens[0] == "git". Completing the subcommand (only "git" precedes)?
-    let non_git: Vec<&String> = prev_tokens
-        .iter()
-        .skip(1)
-        .filter(|t| !t.starts_with('-'))
-        .collect();
-    if non_git.is_empty() {
+    let Some(sub_index) = git_subcommand_index(prev_tokens) else {
         const SUBS: &[&str] = &[
             "add",
             "branch",
@@ -394,8 +389,8 @@ fn git_candidates(state: &ShellState, prev_tokens: &[String]) -> Option<Vec<Cand
                 .map(|s| Candidate::new(*s, CandidateKind::Command))
                 .collect(),
         );
-    }
-    let sub = non_git[0].as_str();
+    };
+    let sub = prev_tokens[sub_index].as_str();
     if matches!(
         sub,
         "checkout" | "switch" | "merge" | "rebase" | "branch" | "log" | "diff" | "reset"
@@ -408,6 +403,44 @@ fn git_candidates(state: &ShellState, prev_tokens: &[String]) -> Option<Vec<Cand
                     .map(|b| Candidate::new(b, CandidateKind::Branch))
                     .collect(),
             );
+        }
+    }
+    None
+}
+
+/// Find the git subcommand token in `tokens` (`tokens[0] == "git"`), skipping global
+/// options AND the arguments they consume. Returns `None` when the subcommand hasn't
+/// been typed yet. Fixes the `git -C /path status` case where `-C`'s path argument
+/// (not `-`-prefixed) was previously misread as the subcommand.
+fn git_subcommand_index(tokens: &[String]) -> Option<usize> {
+    // Global git options that take a SEPARATE argument (the next token).
+    const TAKES_ARG: &[&str] = &[
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--exec-path",
+        "--config-env",
+    ];
+    let mut i = 1;
+    while i < tokens.len() {
+        let token = tokens[i].as_str();
+        if let Some(rest) = token.strip_prefix('-') {
+            if rest.is_empty() {
+                // A bare "-" is not an option; treat as the (unusual) subcommand.
+                return Some(i);
+            }
+            // `--opt=value` / `-cname=val` carry their argument inline: skip one.
+            // A flag that takes a separate argument skips this token AND the next.
+            if !token.contains('=') && TAKES_ARG.contains(&token) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else {
+            return Some(i);
         }
     }
     None
@@ -480,6 +513,32 @@ fn path_candidates(state: &ShellState, dir_prefix: &str, dirs_only: bool) -> Vec
 mod tests {
     use super::*;
     use agsh_exec::ShellState;
+
+    fn toks(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn git_subcommand_index_skips_flag_arguments() {
+        // Still completing the subcommand.
+        assert_eq!(git_subcommand_index(&toks(&["git"])), None);
+        assert_eq!(git_subcommand_index(&toks(&["git", "-C", "/path"])), None);
+        assert_eq!(git_subcommand_index(&toks(&["git", "-p"])), None);
+        // Subcommand present — the fix: `-C /path` no longer misreads /path.
+        assert_eq!(git_subcommand_index(&toks(&["git", "status"])), Some(1));
+        assert_eq!(
+            git_subcommand_index(&toks(&["git", "-C", "/path", "status"])),
+            Some(3)
+        );
+        assert_eq!(
+            git_subcommand_index(&toks(&["git", "--git-dir=/foo", "log"])),
+            Some(2)
+        );
+        assert_eq!(
+            git_subcommand_index(&toks(&["git", "-p", "-C", "/x", "commit"])),
+            Some(4)
+        );
+    }
 
     #[test]
     fn filter_ranks_prefix_first() {
