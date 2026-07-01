@@ -2978,8 +2978,27 @@ pub fn install_intercept_shims(
             let trace_dir = std::env::temp_dir().join("agsh-traces");
             state.export_var("AGSH_TRACE_DIR", trace_dir.display().to_string());
         }
+        set_agent_fail_fast_env(state);
     }
     Ok(dir)
+}
+
+/// Make interactive tools FAIL FAST instead of blocking an agent forever on a
+/// terminal password prompt (a hang `confine` can't see — it gates capabilities,
+/// not a `/dev/tty` read). Only well-known non-interactive toggles, and only if the
+/// user hasn't set them — no `unsafe`, no `setsid` (macOS ships no such binary),
+/// portable. The dominant real case is git-over-HTTPS credential prompts.
+fn set_agent_fail_fast_env(state: &mut ShellState) {
+    const FAIL_FAST: &[(&str, &str)] = &[
+        ("GIT_TERMINAL_PROMPT", "0"), // git: error instead of prompting for creds
+        ("GCM_INTERACTIVE", "never"), // git-credential-manager: no interactive UI
+        ("SSH_ASKPASS_REQUIRE", "never"), // ssh: don't pop an askpass helper
+    ];
+    for (key, value) in FAIL_FAST {
+        if state.lookup(key).is_none() {
+            state.export_var(*key, *value);
+        }
+    }
 }
 
 /// Find the first executable file named `name` in a colon-separated `PATH`.

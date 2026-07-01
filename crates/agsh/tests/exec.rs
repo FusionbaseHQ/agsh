@@ -1201,3 +1201,38 @@ fn repeated_command_not_found_advisory_shown_once() {
         "advisory once:\n{err}"
     );
 }
+
+#[test]
+fn intercept_sets_fail_fast_env_for_interactive_tools() {
+    let bin = env!("CARGO_BIN_EXE_agsh");
+    let run = |intercept: Option<&str>, git: Option<&str>| -> String {
+        let mut c = Command::new(bin);
+        c.args(["-c", "echo ${GIT_TERMINAL_PROMPT:-unset}"]);
+        match intercept {
+            Some(v) => {
+                c.env("AGSH_INTERCEPT", v);
+            }
+            None => {
+                c.env_remove("AGSH_INTERCEPT");
+            }
+        }
+        match git {
+            Some(v) => {
+                c.env("GIT_TERMINAL_PROMPT", v);
+            }
+            None => {
+                c.env_remove("GIT_TERMINAL_PROMPT");
+            }
+        }
+        String::from_utf8_lossy(&c.output().unwrap().stdout)
+            .trim()
+            .to_string()
+    };
+    assert_eq!(run(None, None), "unset", "off by default");
+    assert_eq!(
+        run(Some("compact"), None),
+        "0",
+        "fail-fast under interception"
+    );
+    assert_eq!(run(Some("compact"), Some("1")), "1", "user value respected");
+}
