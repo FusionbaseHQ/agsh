@@ -958,3 +958,64 @@ fn sessions_lists_planted_claude_session_for_cwd() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn observe_forwards_output_and_exit_code() {
+    // `--observe CMD` runs CMD as a captured external command, forwarding its
+    // output (raw = exact bytes) and exit code.
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["--observe", "printf", "a\nb\n"])
+        .output()
+        .expect("run agsh");
+    assert_eq!(out.stdout, b"a\nb\n", "raw --observe must be exact bytes");
+    assert!(out.status.success());
+
+    let code = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["--observe", "sh", "-c", "exit 7"])
+        .status()
+        .expect("run agsh")
+        .code();
+    assert_eq!(
+        code,
+        Some(7),
+        "--observe must forward the child's exit code"
+    );
+
+    // A leading `--` separator is tolerated.
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["--observe", "--", "echo", "sep-ok"])
+        .output()
+        .expect("run agsh");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "sep-ok");
+}
+
+#[test]
+fn intercept_is_off_by_default_and_opt_in_routes_shells() {
+    // Off by default: no shim dir on PATH.
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["-c", "echo $PATH"])
+        .env_remove("AGSH_INTERCEPT")
+        .output()
+        .expect("run agsh");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("agsh-intercept"),
+        "interception must be off by default"
+    );
+
+    // Opt-in: the shim dir is prepended, and a `bash -c` routes through agsh back
+    // to the real shell (output preserved).
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["-c", "echo $PATH; bash -c 'echo ROUTED42'"])
+        .env("AGSH_INTERCEPT", "compact")
+        .output()
+        .expect("run agsh");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("agsh-intercept"),
+        "opt-in must install a shim dir:\n{text}"
+    );
+    assert!(
+        text.contains("ROUTED42"),
+        "routed bash output must survive:\n{text}"
+    );
+}

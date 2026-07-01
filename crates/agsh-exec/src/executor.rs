@@ -2889,6 +2889,74 @@ pub fn install_confine_shims(state: &mut ShellState) -> std::io::Result<std::pat
     Ok(dir)
 }
 
+/// Interception shim body (the compacting-proxy / flavor B): route the agent's
+/// shell through `agsh --observe`, which runs the REAL shell and captures+renders
+/// its output. Passes straight through to the real shell once already inside an
+/// observed subtree, so nested shells run normally and there is no re-entrancy.
+const INTERCEPT_SHIM_TEMPLATE: &str = r#"#!/bin/sh
+# agsh interception shim — observe the agent's shell through agsh.
+if [ -n "$AGSH_INTERCEPT_ACTIVE" ]; then exec __REAL__ "$@"; fi
+exec __AGSH__ --output __MODE__ --observe __REAL__ "$@"
+"#;
+
+/// Install shell-*interception* shims (opt-in via `AGSH_INTERCEPT`): route the
+/// session's `bash`/`sh`/`zsh`/… — resolved by name or via `$SHELL` — through
+/// `agsh --observe`, so an agent's own `bash -c …` output is captured and rendered
+/// in `mode`. The real shells are located on the current `PATH`; only installed
+/// shells are shimmed, and each shim execs the real shell by absolute path (so it
+/// never bounces back through the shim). Unlike [`install_confine_shims`], this
+/// runs the real shell (exact semantics) instead of re-interpreting in agsh.
+///
+/// Coverage caveat: this catches shells resolved via `PATH`/`$SHELL`; a program
+/// calling `/bin/bash` by absolute path bypasses it (that needs the exec-
+/// interposition layer).
+pub fn install_intercept_shims(
+    state: &mut ShellState,
+    mode: agsh_output::OutputMode,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = std::env::current_exe()?;
+    let dir = std::env::temp_dir().join(format!("agsh-intercept-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let agsh = shell_quote(&exe.display().to_string());
+    let path_str = state.lookup("PATH").unwrap_or_default().to_string();
+    let mut shimmed = false;
+    for name in ["bash", "sh", "zsh", "dash", "ksh"] {
+        // Resolve against the ORIGINAL PATH (our shim dir isn't prepended yet), so
+        // we never point a shim at itself.
+        let Some(real) = resolve_on_path(name, &path_str) else {
+            continue;
+        };
+        let shim = INTERCEPT_SHIM_TEMPLATE
+            .replace("__REAL__", &shell_quote(&real.display().to_string()))
+            .replace("__AGSH__", &agsh)
+            .replace("__MODE__", mode.as_str());
+        let path = dir.join(name);
+        std::fs::write(&path, &shim)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        shimmed = true;
+    }
+    if shimmed {
+        state.export_var("PATH", format!("{}:{path_str}", dir.display()));
+        state.export_var("SHELL", dir.join("bash").display().to_string());
+    }
+    Ok(dir)
+}
+
+/// Find the first executable file named `name` in a colon-separated `PATH`.
+fn resolve_on_path(name: &str, path: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
+        let candidate = std::path::Path::new(dir).join(name);
+        if let Ok(meta) = std::fs::metadata(&candidate) {
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// `confine LIST [-- COMMAND…]` — restrict which external commands may run.
 ///
 /// * Sticky (no COMMAND): confine the current session (and its children, via the

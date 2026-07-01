@@ -79,11 +79,35 @@ mode                  # show all aspects
 mode:output off       # reset to the startup default
 ```
 
+## Shell interception (for agents)
+
+Coding agents often run commands as their own `bash -c '…'` subprocess, which
+executes *outside* agsh and so bypasses its output modes. Opt in to **interception**
+to route those shell calls back through agsh, which runs the real shell and renders
+its output in the chosen mode:
+
+```sh
+export AGSH_INTERCEPT=compact    # off by default; also accepts semantic, etc.
+```
+
+When enabled, agsh installs `bash`/`sh`/`zsh`/… shims (on `PATH` + `$SHELL`) that
+forward to `agsh --observe`, which runs the **real** shell and captures its output —
+so semantics are exact and only the observed output is compacted. Nested shells pass
+straight through (no double-observation), and raw pipes still receive exact bytes.
+
+> **Coverage:** this catches shells resolved by name or via `$SHELL`. A program that
+> calls `/bin/bash` by absolute path bypasses it; catching that needs the exec-
+> interposition layer (planned).
+
+Set it in your `agshrc` so it applies to every session, or per-agent:
+`AGSH_INTERCEPT=compact agsh -c 'my-agent …'`.
+
 ## Environment variables
 
 | Variable            | Effect                                                    |
 | ------------------- | -------------------------------------------------------- |
 | `AGSH_OUTPUT_MODE`  | default output mode for the session                       |
+| `AGSH_INTERCEPT`    | route the agent's `bash`/`sh`/… through agsh (mode name; off by default) |
 | `AGSH_ICONS=1`      | enable Nerd Font glyphs in the UI                         |
 | `NO_COLOR`          | disable color (honored)                                   |
 
