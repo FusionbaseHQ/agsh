@@ -56,11 +56,14 @@ pub fn highlight(line: &str, theme: &Theme, valid: &dyn Fn(&str) -> bool) -> Str
             _ => {
                 let (word, next) = read_word(&chars, i);
                 if command_position && is_mode_keyword(&word) {
-                    // agsh output-mode wrappers (`compact git …`): paint orange and
-                    // keep command position so the wrapped command still highlights.
+                    // agsh mode vocabulary: paint orange. The output-mode WRAPPERS
+                    // (`compact git …`) wrap a following command, so keep command
+                    // position. `agview`/`mode`/`mode:*` take FILE/value args, not a
+                    // command — keeping command position would miscolor their file
+                    // argument as an invalid command (red).
                     out.push_str(&theme.paint(Role::ModeKeyword, &word));
                     i = next;
-                    command_position = true;
+                    command_position = is_output_mode_wrapper(&word);
                     continue;
                 }
                 if command_position {
@@ -90,6 +93,23 @@ pub fn highlight(line: &str, theme: &Theme, valid: &dyn Fn(&str) -> bool) -> Str
         }
     }
     out
+}
+
+/// The output-mode WRAPPERS that precede a command (`compact git …`, `raw npm …`).
+/// These keep command position so the wrapped command highlights; the rest of the
+/// mode vocabulary (`agview`, `mode`, `mode:*`) takes file/value args instead.
+fn is_output_mode_wrapper(word: &str) -> bool {
+    matches!(
+        word,
+        "raw"
+            | "clean"
+            | "compact"
+            | "semantic"
+            | "lossless-ref"
+            | "lossless_ref"
+            | "silent"
+            | "rich"
+    )
 }
 
 /// The agsh output-mode vocabulary: the per-command wrappers (mirrors
@@ -232,6 +252,25 @@ mod tests {
         // A non-mode word in command position is NOT painted as a keyword.
         let out = highlight("echo hi", &t, &known);
         assert!(!out.contains(&t.paint(Role::ModeKeyword, "echo")));
+    }
+
+    #[test]
+    fn agview_file_argument_is_not_colored_as_invalid_command() {
+        let t = theme();
+        let out = highlight("agview rust-toolchain.toml", &t, &known);
+        // agview is still orange, but its FILE argument must not be error-colored.
+        assert!(out.contains(&t.paint(Role::ModeKeyword, "agview")), "{out}");
+        assert!(
+            !out.contains(&t.paint(Role::CommandInvalid, "rust-toolchain.toml")),
+            "agview's existing file arg was colored as an invalid command:\n{out}"
+        );
+        // Sanity: a genuine unknown command in command position IS colored invalid,
+        // so the assertion above is meaningful.
+        let cmd = highlight("definitelynotacmd", &t, &known);
+        assert!(cmd.contains(&t.paint(Role::CommandInvalid, "definitelynotacmd")));
+        // An output-mode wrapper still keeps command position (regression guard).
+        let wrapped = highlight("compact git status", &t, &known);
+        assert!(wrapped.contains(&t.paint(Role::Command, "git")));
     }
 
     #[test]
