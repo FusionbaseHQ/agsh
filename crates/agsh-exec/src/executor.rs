@@ -2986,6 +2986,109 @@ fn resolve_on_path(name: &str, path: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Marker present in a PATH entry / `$SHELL` when interception is installed.
+const INTERCEPT_DIR_MARKER: &str = "agsh-intercept-";
+
+/// Parse an interception spec `<mode>[:native][:deep]` into `(mode, native, deep)`.
+/// Returns `None` when disabled (`off`/empty) or the mode name is invalid.
+pub fn parse_intercept_spec(spec: &str) -> Option<(agsh_output::OutputMode, bool, bool)> {
+    let spec = spec.trim().to_ascii_lowercase();
+    let mut parts = spec.split(':');
+    let mode_part = parts.next().unwrap_or("");
+    let flags: Vec<&str> = parts.collect();
+    let native = flags.iter().any(|f| matches!(*f, "native" | "interpret"));
+    let deep = flags.contains(&"deep");
+    let mode = match mode_part {
+        "" | "0" | "off" | "false" | "no" => return None,
+        "1" | "on" | "true" | "yes" => agsh_output::OutputMode::Compact,
+        other => <agsh_output::OutputMode as std::str::FromStr>::from_str(other).ok()?,
+    };
+    Some((mode, native, deep))
+}
+
+/// Whether shell interception is currently installed in `state` (a shim dir is on
+/// `PATH`).
+pub fn intercept_active(state: &ShellState) -> bool {
+    state
+        .lookup("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .any(|d| d.contains(INTERCEPT_DIR_MARKER))
+}
+
+/// Enable the exec-interposition (deep) layer for the session's children by
+/// preloading the `agsh-intercept` library. Returns `false` if the library can't be
+/// located (caller should fall back to the PATH shims).
+pub fn install_deep_intercept(state: &mut ShellState, mode: agsh_output::OutputMode) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let dir = exe
+        .parent()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let (var, ext) = if cfg!(target_os = "macos") {
+        ("DYLD_INSERT_LIBRARIES", "dylib")
+    } else {
+        ("LD_PRELOAD", "so")
+    };
+    let name = format!("libagsh_intercept.{ext}");
+    // Next to the binary, or an installed `../lib` layout.
+    let candidates = [dir.join(&name), dir.join("..").join("lib").join(&name)];
+    let Some(lib) = candidates.iter().find(|p| p.exists()) else {
+        return false;
+    };
+    let prev = state.lookup(var).unwrap_or_default().to_string();
+    let value = if prev.is_empty() {
+        lib.display().to_string()
+    } else {
+        format!("{}:{prev}", lib.display())
+    };
+    state.export_var(var, value);
+    state.export_var("AGSH_SELF", exe.display().to_string());
+    state.export_var("AGSH_INTERCEPT_MODE", mode.as_str());
+    true
+}
+
+/// Remove any shell-interception install from `state` (the shim dir on `PATH`, the
+/// preload env, `$SHELL`). Newly launched children are no longer intercepted;
+/// already-running children keep their environment.
+pub fn uninstall_intercept(state: &mut ShellState) {
+    let path = state.lookup("PATH").unwrap_or_default().to_string();
+    let cleaned = path
+        .split(':')
+        .filter(|d| !d.contains(INTERCEPT_DIR_MARKER))
+        .collect::<Vec<_>>()
+        .join(":");
+    // Drop our entry from the preload var (and unset it if it becomes empty).
+    for var in ["DYLD_INSERT_LIBRARIES", "LD_PRELOAD"] {
+        if let Some(current) = state.lookup(var) {
+            let kept = current
+                .split(':')
+                .filter(|e| !e.contains("libagsh_intercept"))
+                .collect::<Vec<_>>()
+                .join(":");
+            if kept.is_empty() {
+                state.unset(var);
+            } else {
+                state.export_var(var, kept);
+            }
+        }
+    }
+    state.unset("AGSH_SELF");
+    state.unset("AGSH_INTERCEPT_MODE");
+    // If `$SHELL` pointed at a shim, restore it to the real shell.
+    if state
+        .lookup("SHELL")
+        .is_some_and(|s| s.contains(INTERCEPT_DIR_MARKER))
+    {
+        if let Some(real) = resolve_on_path("bash", &cleaned) {
+            state.export_var("SHELL", real.display().to_string());
+        }
+    }
+    state.export_var("PATH", cleaned);
+}
+
 /// `confine LIST [-- COMMAND…]` — restrict which external commands may run.
 ///
 /// * Sticky (no COMMAND): confine the current session (and its children, via the

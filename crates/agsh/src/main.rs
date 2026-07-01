@@ -137,8 +137,10 @@ fn main() {
     if std::env::var_os("AGSH_INTERCEPT_ACTIVE").is_none() {
         if let Some((mode, native, deep)) = intercept_mode() {
             let _ = agsh_exec::install_intercept_shims(&mut state, mode, native);
-            if deep {
-                install_deep_intercept(&mut state, mode);
+            if deep && !agsh_exec::install_deep_intercept(&mut state, mode) {
+                eprintln!(
+                    "agsh: deep interception unavailable (interposer not found); PATH shims only"
+                );
             }
         }
     }
@@ -438,50 +440,7 @@ fn single_quote(s: &str) -> String {
 /// instead of the default proxy (agsh runs the real shell and observes it). Read
 /// from the environment, so it can be set in your `agshrc`.
 fn intercept_mode() -> Option<(OutputMode, bool, bool)> {
-    let raw = std::env::var("AGSH_INTERCEPT").ok()?;
-    let raw = raw.trim().to_ascii_lowercase();
-    let mut parts = raw.split(':');
-    let mode_part = parts.next().unwrap_or("");
-    let flags: Vec<&str> = parts.collect();
-    let native = flags.iter().any(|f| matches!(*f, "native" | "interpret"));
-    let deep = flags.contains(&"deep");
-    let mode = match mode_part {
-        "" | "0" | "off" | "false" | "no" => return None,
-        "1" | "on" | "true" | "yes" => OutputMode::Compact,
-        other => OutputMode::from_str(other).ok()?,
-    };
-    Some((mode, native, deep))
-}
-
-/// Enable the exec-interposition layer (Tier 2): preload `agsh-intercept` for the
-/// session's children so absolute-path shell execs (`/bin/bash`) are caught too.
-/// Falls back silently to the PATH shims if the interposer library isn't found.
-fn install_deep_intercept(state: &mut ShellState, mode: OutputMode) {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let dir = exe.parent().map(PathBuf::from).unwrap_or_default();
-    let (var, ext) = if cfg!(target_os = "macos") {
-        ("DYLD_INSERT_LIBRARIES", "dylib")
-    } else {
-        ("LD_PRELOAD", "so")
-    };
-    let name = format!("libagsh_intercept.{ext}");
-    // Next to the binary, or an installed `../lib` layout.
-    let candidates = [dir.join(&name), dir.join("..").join("lib").join(&name)];
-    let Some(lib) = candidates.iter().find(|p| p.exists()) else {
-        eprintln!("agsh: deep interception unavailable ({name} not found); using PATH shims only");
-        return;
-    };
-    let prev = state.lookup(var).unwrap_or_default().to_string();
-    let value = if prev.is_empty() {
-        lib.display().to_string()
-    } else {
-        format!("{}:{prev}", lib.display())
-    };
-    state.export_var(var, value);
-    state.export_var("AGSH_SELF", exe.display().to_string());
-    state.export_var("AGSH_INTERCEPT_MODE", mode.as_str());
+    agsh_exec::parse_intercept_spec(&std::env::var("AGSH_INTERCEPT").ok()?)
 }
 
 /// Set up command confinement before running anything:
@@ -749,6 +708,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CliOptions, String> 
 
 fn print_help() {
     println!(
-        "agsh - Aegis Shell\n\nUSAGE:\n  agsh [--output MODE] [--allow LIST] [--run COMMAND] [--rcfile FILE] [--norc] [-c COMMAND]\n\nSTARTUP:\n  interactive sessions source ~/.config/agsh/agshrc (or ~/.agshrc); --norc skips,\n  --rcfile FILE / $AGSH_RC picks another, $AGSH_NORC=1 disables\n\nINTERCEPTION (route the agent's own shell through agsh; off by default):\n  AGSH_INTERCEPT=compact agsh …   shim bash/sh/… to `agsh --observe` (real shell,\n                                  captured+rendered); nested shells pass through\n    :native  agsh interprets the command    :deep  also catch absolute-path\n    (instead of running the real shell)     /bin/bash + posix_spawn (preload)\n\nMODES:\n  raw | clean | compact | semantic | lossless-ref | silent | rich\n\nCONFINE (kernel-enforced capability sandbox for a leaf payload):\n  confine read-only -- python x.py  read+run; no writes/network/secret-reads\n  confine workspace -- ./build.sh   writes only within $PWD (+ a scratch dir)\n  confine offline -- npm test       network off; filesystem unchanged\n  confine convert -- ./batch.sh     exec-allowlist: may only exec `convert`\n  confine ls,df                     confine the current agsh session (sticky)\n    --rw PATH  add a writable root    --net/--no-net  toggle network\n    --explain  show capabilities      --dry-run  print profile, don't run\n    --force    run a refused agent    --best-effort  shim layer if no sandbox\n  enforced via sandbox-exec (macOS); Linux Landlock planned, fails closed\n  elsewhere. Self-managing agents (claude, …) are refused — use --allowedTools.\n\nAGSH TOOLS (ag-prefixed where a common CLI shares the name; bare otherwise):\n  agview FILE…   rich render (markdown, code, images)   agz DIR    frecent jump\n  agpatch        structured patch        agtrace/agtrust/agcontext/agmath/agjump\n  confine, peek, risk, snapshot, pty     stay bare (no common CLI conflict)\n  sessions       list/resume Claude & Codex sessions for this folder (sessions N)\n  mode:output M  set the session default output mode\n\nMODE SELECTION (highest priority first):\n  per-command wrapper   semantic git diff\n  --output flag         agsh --output compact -c 'pytest -q'\n  mode builtin          mode:output compact   (session default; `mode` shows all)\n  AGSH_OUTPUT_MODE env  AGSH_OUTPUT_MODE=semantic agsh -c 'cargo test'\n  ~/.config/agsh/token.toml  [mode] default = \"compact\"  (interactive sessions)\n  default               raw\n  (the config/`mode` default makes plain `ls` render like `compact ls`; it applies\n   to interactive sessions only — piped `agsh -c`/scripts stay raw)\n\nRICH RENDERING (human display, TTY only; raw bytes still pipe/redirect):\n  agview FILE...        render by type (markdown, JSON, CSV/TSV, diff, binary)\n  agview main.py        syntax-highlight source code (py, rs, js, ts, go, c, …)\n  agview image.png      show images inline (any terminal; crisp in iTerm2/Kitty)\n  AGSH_OUTPUT_MODE=rich  auto-render recognized command output\n\nTRACE:\n  raw output is captured in capturing modes and addressable via trace://<id>/...\n  trace                 list recent captured commands\n  trace <id>            print a command's raw stdout\n\nEXAMPLES:\n  agsh -c 'echo hello'\n  agsh --output semantic -c 'git status'\n  view README.md\n  semantic git diff"
+        "agsh - Aegis Shell\n\nUSAGE:\n  agsh [--output MODE] [--allow LIST] [--run COMMAND] [--rcfile FILE] [--norc] [-c COMMAND]\n\nSTARTUP:\n  interactive sessions source ~/.config/agsh/agshrc (or ~/.agshrc); --norc skips,\n  --rcfile FILE / $AGSH_RC picks another, $AGSH_NORC=1 disables\n\nINTERCEPTION (route the agent's own shell through agsh; off by default):\n  AGSH_INTERCEPT=compact agsh …   shim bash/sh/… to `agsh --observe` (real shell,\n                                  captured+rendered); nested shells pass through\n    :native  agsh interprets the command    :deep  also catch absolute-path\n    (instead of running the real shell)     /bin/bash + posix_spawn (preload)\n  toggle at runtime: `mode:intercept compact:deep` / `mode:intercept off`\n\nMODES:\n  raw | clean | compact | semantic | lossless-ref | silent | rich\n\nCONFINE (kernel-enforced capability sandbox for a leaf payload):\n  confine read-only -- python x.py  read+run; no writes/network/secret-reads\n  confine workspace -- ./build.sh   writes only within $PWD (+ a scratch dir)\n  confine offline -- npm test       network off; filesystem unchanged\n  confine convert -- ./batch.sh     exec-allowlist: may only exec `convert`\n  confine ls,df                     confine the current agsh session (sticky)\n    --rw PATH  add a writable root    --net/--no-net  toggle network\n    --explain  show capabilities      --dry-run  print profile, don't run\n    --force    run a refused agent    --best-effort  shim layer if no sandbox\n  enforced via sandbox-exec (macOS); Linux Landlock planned, fails closed\n  elsewhere. Self-managing agents (claude, …) are refused — use --allowedTools.\n\nAGSH TOOLS (ag-prefixed where a common CLI shares the name; bare otherwise):\n  agview FILE…   rich render (markdown, code, images)   agz DIR    frecent jump\n  agpatch        structured patch        agtrace/agtrust/agcontext/agmath/agjump\n  confine, peek, risk, snapshot, pty     stay bare (no common CLI conflict)\n  sessions       list/resume Claude & Codex sessions for this folder (sessions N)\n  mode:output M  set the session default output mode\n\nMODE SELECTION (highest priority first):\n  per-command wrapper   semantic git diff\n  --output flag         agsh --output compact -c 'pytest -q'\n  mode builtin          mode:output compact   (session default; `mode` shows all)\n  AGSH_OUTPUT_MODE env  AGSH_OUTPUT_MODE=semantic agsh -c 'cargo test'\n  ~/.config/agsh/token.toml  [mode] default = \"compact\"  (interactive sessions)\n  default               raw\n  (the config/`mode` default makes plain `ls` render like `compact ls`; it applies\n   to interactive sessions only — piped `agsh -c`/scripts stay raw)\n\nRICH RENDERING (human display, TTY only; raw bytes still pipe/redirect):\n  agview FILE...        render by type (markdown, JSON, CSV/TSV, diff, binary)\n  agview main.py        syntax-highlight source code (py, rs, js, ts, go, c, …)\n  agview image.png      show images inline (any terminal; crisp in iTerm2/Kitty)\n  AGSH_OUTPUT_MODE=rich  auto-render recognized command output\n\nTRACE:\n  raw output is captured in capturing modes and addressable via trace://<id>/...\n  trace                 list recent captured commands\n  trace <id>            print a command's raw stdout\n\nEXAMPLES:\n  agsh -c 'echo hello'\n  agsh --output semantic -c 'git status'\n  view README.md\n  semantic git diff"
     );
 }

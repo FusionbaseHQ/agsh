@@ -11,7 +11,8 @@ pub use confine::{
     parse_spec as confine_parse_spec, plan as confine_plan, ConfineOpts, ConfinePlan, Preset,
 };
 pub use executor::{
-    install_confine_shims, install_intercept_shims, print_captured_if_needed, CommandOutcome,
+    install_confine_shims, install_deep_intercept, install_intercept_shims, intercept_active,
+    parse_intercept_spec, print_captured_if_needed, uninstall_intercept, CommandOutcome,
     ExecutionOptions, Executor,
 };
 pub use state::{ShellFunction, ShellState};

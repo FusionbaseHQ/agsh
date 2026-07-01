@@ -331,6 +331,20 @@ def scenario_programmable_completion():
         s.close()
 
 
+def scenario_mode_intercept_toggle():
+    # Runtime toggle of shell interception via the mode: namespace.
+    s = Session()
+    try:
+        s.send("mode:intercept" + ENTER, 0.3)
+        check("intercept off by default", "off" in s.screen(), s.screen())
+        s.send("mode:intercept compact" + ENTER, 0.3)
+        check("toggle on confirms", "interception on" in s.screen(), s.screen())
+        s.send("mode:intercept off" + ENTER, 0.3)
+        check("toggle off confirms", "interception off" in s.screen(), s.screen())
+    finally:
+        s.close()
+
+
 def scenario_rc_autoload():
     # An interactive session sources its rc file: aliases + exports must persist.
     rc = "/tmp/agsh-pty-rc.agshrc"
@@ -348,6 +362,7 @@ def scenario_rc_autoload():
 
 
 SCENARIOS = [
+    scenario_mode_intercept_toggle,
     scenario_rc_autoload,
     scenario_mode_builtin_session_default,
     scenario_view_image_inline_and_fallback,

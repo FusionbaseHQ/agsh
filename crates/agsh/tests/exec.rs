@@ -1080,3 +1080,28 @@ int main(void){char*a[]={"/bin/bash","-c","echo DEEP-TEST-HIT",0};execv("/bin/ba
         "absolute-path exec was not intercepted:\n{text}"
     );
 }
+
+#[test]
+fn mode_intercept_runtime_toggle() {
+    let run = |script: &str| -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+            .args(["-c", script])
+            .env_remove("AGSH_INTERCEPT")
+            .output()
+            .expect("run agsh");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    // Off by default; turning it on/off is reflected and mutates PATH for children.
+    assert_eq!(run("mode:intercept").trim(), "off");
+    assert!(run("mode:intercept compact; mode:intercept")
+        .lines()
+        .any(|l| l == "on"));
+    assert!(run("mode:intercept compact; echo $PATH").contains("agsh-intercept"));
+    let seq = run("mode:intercept compact; mode:intercept off; mode:intercept; echo P=$PATH");
+    assert!(seq.lines().any(|l| l == "off"), "off not shown:\n{seq}");
+    let path_line = seq.lines().find(|l| l.starts_with("P=")).unwrap();
+    assert!(
+        !path_line.contains("agsh-intercept"),
+        "off must clean PATH:\n{path_line}"
+    );
+}

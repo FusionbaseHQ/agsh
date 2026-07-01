@@ -79,6 +79,7 @@ pub fn builtin_names() -> &'static [&'static str] {
         "confine",
         "mode",
         "mode:output",
+        "mode:intercept",
         "sessions",
     ]
 }
@@ -111,26 +112,86 @@ fn builtin_times(_args: &[String], _state: &mut ShellState) -> CommandOutcome {
 /// * value `off`/`reset`    — clear that aspect back to the startup default
 ///
 /// Per-command wrappers (`raw ls`) and `--output` still override per command.
-/// Only the `output` aspect exists today; new aspects slot into the match below.
+/// Aspects: `output` (session default mode) and `intercept` (route the agent's
+/// child shells through agsh at runtime, e.g. `mode:intercept compact:deep`).
 fn builtin_mode(name: &str, args: &[String], state: &mut ShellState) -> CommandOutcome {
     let value = args.first().map(String::as_str);
     match name.strip_prefix("mode:") {
         // `mode:<aspect> [value]`
         Some("output") => mode_output(value, state),
+        Some("intercept") => mode_intercept(value, state),
         Some(other) => CommandOutcome::captured(
             2,
             Vec::new(),
-            format!("mode: unknown aspect '{other}' (known: output)\n").into_bytes(),
+            format!("mode: unknown aspect '{other}' (known: output, intercept)\n").into_bytes(),
         ),
         // bare `mode`
         None => match value {
             // `mode` → show every aspect's current value.
             None => {
-                let out = format!("output: {}\n", current_output(state));
+                let out = format!(
+                    "output: {}\nintercept: {}\n",
+                    current_output(state),
+                    if crate::executor::intercept_active(state) {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                );
                 CommandOutcome::captured(0, out.into_bytes(), Vec::new())
             }
             // `mode compact` → shorthand for the output aspect.
             Some(_) => mode_output(value, state),
+        },
+    }
+}
+
+/// Show or set the `intercept` aspect at runtime — route the session's future child
+/// shells (`bash -c …`) through agsh. `mode:intercept compact[:native][:deep]` turns
+/// it on; `mode:intercept off` turns it off. Takes effect for newly launched
+/// commands (already-running processes keep their environment).
+fn mode_intercept(value: Option<&str>, state: &mut ShellState) -> CommandOutcome {
+    match value {
+        None => {
+            let cur = if crate::executor::intercept_active(state) {
+                "on"
+            } else {
+                "off"
+            };
+            CommandOutcome::captured(0, format!("{cur}\n").into_bytes(), Vec::new())
+        }
+        Some("off" | "reset" | "default") => {
+            crate::executor::uninstall_intercept(state);
+            CommandOutcome::captured(0, b"shell interception off\n".to_vec(), Vec::new())
+        }
+        Some(spec) => match crate::executor::parse_intercept_spec(spec) {
+            Some((mode, native, deep)) => {
+                // Re-install from a clean slate so a re-toggle can't stack shim dirs.
+                crate::executor::uninstall_intercept(state);
+                let _ = crate::executor::install_intercept_shims(state, mode, native);
+                let mut msg = format!("shell interception on: {}", mode.as_str());
+                if native {
+                    msg.push_str(":native");
+                }
+                if deep {
+                    if crate::executor::install_deep_intercept(state, mode) {
+                        msg.push_str(":deep");
+                    } else {
+                        msg.push_str(" (deep unavailable: interposer library not found)");
+                    }
+                }
+                msg.push_str(" — applies to newly launched commands\n");
+                CommandOutcome::captured(0, msg.into_bytes(), Vec::new())
+            }
+            None => CommandOutcome::captured(
+                2,
+                Vec::new(),
+                format!(
+                    "mode: unknown interception spec '{spec}' \
+                     (e.g. compact, compact:deep, compact:native, off)\n"
+                )
+                .into_bytes(),
+            ),
         },
     }
 }

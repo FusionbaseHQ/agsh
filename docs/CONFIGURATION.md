@@ -114,6 +114,15 @@ Flavors and layers (combine with `:`):
 Set it in your `agshrc` so it applies to every session, or per-agent:
 `AGSH_INTERCEPT=compact agsh -c 'my-agent …'`.
 
+`AGSH_INTERCEPT` is read once at startup. To toggle interception **within** a running
+interactive session (affects newly launched commands), use the `mode` builtin:
+
+```sh
+mode:intercept compact:deep   # turn on now
+mode:intercept                # show on/off
+mode:intercept off            # turn off
+```
+
 ## Environment variables
 
 | Variable            | Effect                                                    |

@@ -301,6 +301,7 @@ fn builtin_description(name: &str) -> Option<&'static str> {
         "confine" => "restrict a command to an allowlist (agent guardrail)",
         "mode" => "show or set session default modes (e.g. mode:output compact)",
         "mode:output" => "set the session default output mode",
+        "mode:intercept" => "route the agent's shells through agsh (compact:deep, off)",
         "sessions" => "list/resume Claude & Codex sessions for this folder",
         "history" => "show command history",
         "umask" => "set the file-creation mask",
