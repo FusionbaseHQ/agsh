@@ -75,6 +75,24 @@ pub fn render_observation_with(
                 stdout: &out,
                 stderr: &err,
             };
+            // Homogeneous JSON array-of-objects → emit the column keys ONCE plus a
+            // one-line `table<col:type,…> (N rows)` shape signature, instead of
+            // repeating every key on every row. A big lossless token cut on the most
+            // agent-read surface, and the signature lets an agent learn schema +
+            // row-count without fetching the raw. A user [[compactor]] still wins.
+            if ctx.compactor.is_none() {
+                if let Some(summary) = json_table_summary(&cx, &out) {
+                    return budgeted_summary(
+                        ctx,
+                        mode,
+                        cmd_id,
+                        argv,
+                        exit_code,
+                        summary,
+                        (&out, &err),
+                    );
+                }
+            }
             // A configured [[compactor]] takes precedence over the built-in
             // family parsers for matching commands.
             let summary = match &ctx.compactor {
@@ -89,6 +107,66 @@ pub fn render_observation_with(
             token_estimate: 0,
             raw: raw_ref(cmd_id),
         },
+    }
+}
+
+/// Detect a homogeneous JSON array-of-objects and summarize it as a header-once
+/// table with a `table<col:type,…> (N rows)` shape signature. Returns `None` when
+/// the output isn't such a table, so the generic path handles everything else.
+/// Strict gate: every row must share the identical key set (never null-fill ragged
+/// rows) so the encoding stays lossless.
+fn json_table_summary(cx: &CommandContext, stdout: &str) -> Option<SemanticSummary> {
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    let array = value.as_array()?;
+    if array.len() < 2 {
+        return None;
+    }
+    let first = array.first()?.as_object()?;
+    if first.is_empty() {
+        return None;
+    }
+    let columns: Vec<String> = first.keys().cloned().collect();
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(array.len());
+    for element in array {
+        let obj = element.as_object()?;
+        if obj.len() != columns.len() || !columns.iter().all(|c| obj.contains_key(c)) {
+            return None;
+        }
+        rows.push(columns.iter().map(|c| json_scalar(&obj[c])).collect());
+    }
+    let signature = columns
+        .iter()
+        .map(|c| format!("{c}:{}", json_type(&first[c])))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut summary = SemanticSummary::new(cx, "json-table");
+    summary.set_headline(format!("table<{signature}> ({} rows)", rows.len()));
+    let mut body = Vec::with_capacity(rows.len() + 1);
+    body.push(columns.join("\t"));
+    for row in rows {
+        body.push(row.join("\t"));
+    }
+    summary.set_body(body);
+    Some(summary)
+}
+
+/// A JSON scalar as a bare string (strings unquoted); nested values as compact JSON.
+fn json_scalar(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn json_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Null => "null",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
@@ -202,6 +280,55 @@ fn raw_ref(cmd_id: &CommandId) -> Option<RawStreamRef> {
 mod tests {
     use super::*;
     use agsh_core::CommandId;
+
+    #[test]
+    fn json_array_of_objects_becomes_a_header_once_table() {
+        let id = CommandId::new();
+        let json = r#"[{"name":"a","size":10},{"name":"b","size":20}]"#;
+        let obs = render_observation(
+            OutputMode::Compact,
+            &id,
+            &["cmd".to_string()],
+            0,
+            json.as_bytes(),
+            b"",
+        );
+        assert!(
+            obs.display
+                .contains("table<name:string, size:number> (2 rows)"),
+            "shape signature missing:\n{}",
+            obs.display
+        );
+        assert!(
+            obs.display.contains("name\tsize"),
+            "header row missing:\n{}",
+            obs.display
+        );
+        assert!(obs.display.contains("a\t10") && obs.display.contains("b\t20"));
+    }
+
+    #[test]
+    fn ragged_or_scalar_json_uses_the_generic_path() {
+        let id = CommandId::new();
+        // Array of scalars: not a table.
+        let a = render_observation(OutputMode::Compact, &id, &["c".into()], 0, b"[1,2,3]", b"");
+        assert!(!a.display.contains("table<"));
+        // Ragged objects (different key sets): not lossless → generic path.
+        let ragged = r#"[{"a":1},{"b":2}]"#;
+        let b = render_observation(
+            OutputMode::Compact,
+            &id,
+            &["c".into()],
+            0,
+            ragged.as_bytes(),
+            b"",
+        );
+        assert!(
+            !b.display.contains("table<"),
+            "ragged must not be a table:\n{}",
+            b.display
+        );
+    }
 
     #[test]
     fn compact_omits_ref_when_output_fully_shown() {
