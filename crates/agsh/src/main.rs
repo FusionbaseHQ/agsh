@@ -1,4 +1,5 @@
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use agsh_core::parse_line;
@@ -23,6 +24,10 @@ struct CliOptions {
     force: bool,
     /// `--best-effort`: fall back to the shim layer when no OS sandbox exists.
     best_effort: bool,
+    /// `--norc`: skip sourcing the interactive startup rc file.
+    norc: bool,
+    /// `--rcfile PATH`: source PATH at startup instead of the default rc file.
+    rcfile: Option<String>,
     show_help: bool,
     show_version: bool,
 }
@@ -190,6 +195,14 @@ fn main() {
         };
         run_exit_trap(&mut executor, &mut state, &exec_options);
         std::process::exit(code);
+    }
+
+    // Interactive startup: source the rc file (aliases, functions, exports, prompt
+    // hooks, `mode:…`) into the live session. Gated on stdin being a TTY — `-c`,
+    // script files, and piped input returned or are excluded above, so scripts and
+    // the differential tests are never affected.
+    if std::io::stdin().is_terminal() {
+        source_rc(&mut executor, &mut state, &options, &exec_options);
     }
 
     let integrate = std::io::stdout().is_terminal();
@@ -414,6 +427,60 @@ fn apply_confinement(state: &mut ShellState, options: &CliOptions) {
     }
 }
 
+/// Source the interactive startup rc file into the live session, if one exists.
+/// Runs like commands typed at startup — but without a history entry — so it can
+/// define aliases, functions, exports, prompt hooks, and set `mode:…`. Errors are
+/// non-fatal: a broken rc warns and still drops the user at a prompt.
+fn source_rc(
+    executor: &mut Executor,
+    state: &mut ShellState,
+    options: &CliOptions,
+    exec_options: &ExecutionOptions,
+) {
+    let Some((path, explicit)) = resolve_rc(options) else {
+        return;
+    };
+    let source = match std::fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) => {
+            // Only complain when the user explicitly named the file.
+            if explicit {
+                eprintln!("agsh: cannot read rc file {}: {error}", path.display());
+            }
+            return;
+        }
+    };
+    if let Err(error) = run_one_inner(&source, executor, state, exec_options) {
+        eprintln!("agsh: {}: {error}", path.display());
+    }
+}
+
+/// Resolve the rc file to source, as `(path, explicit)` — `explicit` is true when
+/// the user named it (so a missing file warrants a warning). Precedence:
+/// `--norc`/`AGSH_NORC` disables; else `--rcfile`/`$AGSH_RC`; else the first of
+/// `~/.config/agsh/agshrc` (XDG) or `~/.agshrc` (dotfile) that exists.
+fn resolve_rc(options: &CliOptions) -> Option<(PathBuf, bool)> {
+    if options.norc || std::env::var_os("AGSH_NORC").is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    if let Some(path) = &options.rcfile {
+        return Some((PathBuf::from(path), true));
+    }
+    if let Some(path) = std::env::var_os("AGSH_RC").filter(|v| !v.is_empty()) {
+        return Some((PathBuf::from(path), true));
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let xdg = home.join(".config/agsh/agshrc");
+    if xdg.exists() {
+        return Some((xdg, false));
+    }
+    let dot = home.join(".agshrc");
+    if dot.exists() {
+        return Some((dot, false));
+    }
+    None
+}
+
 fn run_one(
     line: &str,
     executor: &mut Executor,
@@ -541,6 +608,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CliOptions, String> 
             }
             "--force" => options.force = true,
             "--best-effort" => options.best_effort = true,
+            "--norc" => options.norc = true,
+            "--rcfile" => {
+                let Some(value) = args.next() else {
+                    return Err("missing path after --rcfile".to_string());
+                };
+                options.rcfile = Some(value);
+            }
             "-h" | "--help" => options.show_help = true,
             "--version" => options.show_version = true,
             "--" => {
@@ -567,6 +641,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CliOptions, String> 
 
 fn print_help() {
     println!(
-        "agsh - Aegis Shell\n\nUSAGE:\n  agsh [--output MODE] [--allow LIST] [--run COMMAND] [-c COMMAND]\n\nMODES:\n  raw | clean | compact | semantic | lossless-ref | silent | rich\n\nCONFINE (kernel-enforced capability sandbox for a leaf payload):\n  confine read-only -- python x.py  read+run; no writes/network/secret-reads\n  confine workspace -- ./build.sh   writes only within $PWD (+ a scratch dir)\n  confine offline -- npm test       network off; filesystem unchanged\n  confine convert -- ./batch.sh     exec-allowlist: may only exec `convert`\n  confine ls,df                     confine the current agsh session (sticky)\n    --rw PATH  add a writable root    --net/--no-net  toggle network\n    --explain  show capabilities      --dry-run  print profile, don't run\n    --force    run a refused agent    --best-effort  shim layer if no sandbox\n  enforced via sandbox-exec (macOS); Linux Landlock planned, fails closed\n  elsewhere. Self-managing agents (claude, …) are refused — use --allowedTools.\n\nAGSH TOOLS (ag-prefixed where a common CLI shares the name; bare otherwise):\n  agview FILE…   rich render (markdown, code, images)   agz DIR    frecent jump\n  agpatch        structured patch        agtrace/agtrust/agcontext/agmath/agjump\n  confine, peek, risk, snapshot, pty     stay bare (no common CLI conflict)\n  sessions       list/resume Claude & Codex sessions for this folder (sessions N)\n  mode:output M  set the session default output mode\n\nMODE SELECTION (highest priority first):\n  per-command wrapper   semantic git diff\n  --output flag         agsh --output compact -c 'pytest -q'\n  mode builtin          mode:output compact   (session default; `mode` shows all)\n  AGSH_OUTPUT_MODE env  AGSH_OUTPUT_MODE=semantic agsh -c 'cargo test'\n  ~/.config/agsh/token.toml  [mode] default = \"compact\"  (interactive sessions)\n  default               raw\n  (the config/`mode` default makes plain `ls` render like `compact ls`; it applies\n   to interactive sessions only — piped `agsh -c`/scripts stay raw)\n\nRICH RENDERING (human display, TTY only; raw bytes still pipe/redirect):\n  agview FILE...        render by type (markdown, JSON, CSV/TSV, diff, binary)\n  agview main.py        syntax-highlight source code (py, rs, js, ts, go, c, …)\n  agview image.png      show images inline (any terminal; crisp in iTerm2/Kitty)\n  AGSH_OUTPUT_MODE=rich  auto-render recognized command output\n\nTRACE:\n  raw output is captured in capturing modes and addressable via trace://<id>/...\n  trace                 list recent captured commands\n  trace <id>            print a command's raw stdout\n\nEXAMPLES:\n  agsh -c 'echo hello'\n  agsh --output semantic -c 'git status'\n  view README.md\n  semantic git diff"
+        "agsh - Aegis Shell\n\nUSAGE:\n  agsh [--output MODE] [--allow LIST] [--run COMMAND] [--rcfile FILE] [--norc] [-c COMMAND]\n\nSTARTUP:\n  interactive sessions source ~/.config/agsh/agshrc (or ~/.agshrc); --norc skips,\n  --rcfile FILE / $AGSH_RC picks another, $AGSH_NORC=1 disables\n\nMODES:\n  raw | clean | compact | semantic | lossless-ref | silent | rich\n\nCONFINE (kernel-enforced capability sandbox for a leaf payload):\n  confine read-only -- python x.py  read+run; no writes/network/secret-reads\n  confine workspace -- ./build.sh   writes only within $PWD (+ a scratch dir)\n  confine offline -- npm test       network off; filesystem unchanged\n  confine convert -- ./batch.sh     exec-allowlist: may only exec `convert`\n  confine ls,df                     confine the current agsh session (sticky)\n    --rw PATH  add a writable root    --net/--no-net  toggle network\n    --explain  show capabilities      --dry-run  print profile, don't run\n    --force    run a refused agent    --best-effort  shim layer if no sandbox\n  enforced via sandbox-exec (macOS); Linux Landlock planned, fails closed\n  elsewhere. Self-managing agents (claude, …) are refused — use --allowedTools.\n\nAGSH TOOLS (ag-prefixed where a common CLI shares the name; bare otherwise):\n  agview FILE…   rich render (markdown, code, images)   agz DIR    frecent jump\n  agpatch        structured patch        agtrace/agtrust/agcontext/agmath/agjump\n  confine, peek, risk, snapshot, pty     stay bare (no common CLI conflict)\n  sessions       list/resume Claude & Codex sessions for this folder (sessions N)\n  mode:output M  set the session default output mode\n\nMODE SELECTION (highest priority first):\n  per-command wrapper   semantic git diff\n  --output flag         agsh --output compact -c 'pytest -q'\n  mode builtin          mode:output compact   (session default; `mode` shows all)\n  AGSH_OUTPUT_MODE env  AGSH_OUTPUT_MODE=semantic agsh -c 'cargo test'\n  ~/.config/agsh/token.toml  [mode] default = \"compact\"  (interactive sessions)\n  default               raw\n  (the config/`mode` default makes plain `ls` render like `compact ls`; it applies\n   to interactive sessions only — piped `agsh -c`/scripts stay raw)\n\nRICH RENDERING (human display, TTY only; raw bytes still pipe/redirect):\n  agview FILE...        render by type (markdown, JSON, CSV/TSV, diff, binary)\n  agview main.py        syntax-highlight source code (py, rs, js, ts, go, c, …)\n  agview image.png      show images inline (any terminal; crisp in iTerm2/Kitty)\n  AGSH_OUTPUT_MODE=rich  auto-render recognized command output\n\nTRACE:\n  raw output is captured in capturing modes and addressable via trace://<id>/...\n  trace                 list recent captured commands\n  trace <id>            print a command's raw stdout\n\nEXAMPLES:\n  agsh -c 'echo hello'\n  agsh --output semantic -c 'git status'\n  view README.md\n  semantic git diff"
     );
 }

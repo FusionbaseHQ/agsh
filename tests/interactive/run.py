@@ -331,7 +331,24 @@ def scenario_programmable_completion():
         s.close()
 
 
+def scenario_rc_autoload():
+    # An interactive session sources its rc file: aliases + exports must persist.
+    rc = "/tmp/agsh-pty-rc.agshrc"
+    with open(rc, "w") as f:
+        f.write("alias hi='echo hello-from-rc'\nexport RCVAR=rcworks\n")
+    s = Session(args=["--rcfile", rc])
+    try:
+        s.send("hi" + ENTER, 0.4)
+        check("rc alias is loaded", "hello-from-rc" in s.screen(), s.screen())
+        s.send("echo $RCVAR" + ENTER, 0.4)
+        check("rc export is loaded", "rcworks" in s.screen(), s.screen())
+    finally:
+        s.close()
+        os.remove(rc)
+
+
 SCENARIOS = [
+    scenario_rc_autoload,
     scenario_mode_builtin_session_default,
     scenario_view_image_inline_and_fallback,
     scenario_view_code_highlighting,

@@ -10,11 +10,28 @@ default; nothing is required. Example files live in [`configs/agsh/`](../configs
 | `~/.config/agsh/token.toml` | output modes and token-economy defaults             |
 | `~/.config/agsh/config.toml`| general shell settings                              |
 | `~/.config/agsh/policies/`  | `confine`/allowlist policy files                    |
+| `~/.config/agsh/agshrc`     | **startup rc** — sourced at interactive startup (aliases, functions, prompt, `export`s, `mode:…`) |
 
-> **Startup rc file:** an [`agshrc.example`](../configs/agsh/agshrc.example) ships
-> as a template, but automatic sourcing at startup is not wired up yet. For now,
-> load your aliases/functions/prompt manually with `source ~/.agshrc`. Automatic
-> rc autoload is on the roadmap.
+### Startup rc file
+
+Interactive sessions source a startup rc file — the place for your aliases,
+functions, exports, prompt hooks (`precmd`/`preexec`/`chpwd`), and a default mode.
+The first file found is used:
+
+1. `--rcfile PATH` or `$AGSH_RC`
+2. `~/.config/agsh/agshrc` (recommended)
+3. `~/.agshrc` (dotfile fallback)
+
+Start from the template ([`agshrc.example`](../configs/agsh/agshrc.example)):
+
+```sh
+mkdir -p ~/.config/agsh
+cp configs/agsh/agshrc.example ~/.config/agsh/agshrc
+```
+
+Only **interactive** sessions source it — `agsh -c …`, scripts, and piped input do
+not, so scripted behavior is never affected. Skip it with `--norc` (or
+`AGSH_NORC=1`). A syntax error in the rc is reported but never blocks startup.
 
 Copy an example to get started:
 

@@ -20,7 +20,7 @@ AGSH = os.environ.get("AGSH", os.path.join(_REPO, "target", "debug", "agsh"))
 
 
 class Session:
-    def __init__(self, rows=20, cols=80, history=None):
+    def __init__(self, rows=20, cols=80, history=None, args=None):
         self.rows, self.cols = rows, cols
         self.term = Term(rows, cols)
         env = dict(os.environ)
@@ -37,10 +37,13 @@ class Session:
         env.pop("AGSH_OUTPUT_MODE", None)
         env.pop("NO_COLOR", None)
         pid, fd = pty.fork()
+        # Default to --norc so scenarios are deterministic regardless of any rc
+        # file in the isolated HOME; the rc scenario opts in with args=["--rcfile", …].
+        argv = [AGSH] + (args if args is not None else ["--norc"])
         if pid == 0:
             os.environ.clear()
             os.environ.update(env)
-            os.execv(AGSH, [AGSH])
+            os.execv(AGSH, argv)
         self.pid, self.fd = pid, fd
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         self.drain(0.4)
