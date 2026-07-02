@@ -31,6 +31,13 @@ struct CliOptions {
     /// `--observe CMD ARGS…`: run CMD as a captured/observed external command
     /// (the compacting proxy behind shell interception). Consumes the rest of argv.
     observe: Option<Vec<String>>,
+    /// `--broker-daemon`: run the keep broker (agshd) in the foreground.
+    broker_daemon: bool,
+    /// `--broker-launch`: spawn a detached broker daemon and exit (autostart).
+    broker_launch: bool,
+    /// `--supervise -- CMD…`: setsid + adopt the PTY on stdin as controlling
+    /// terminal, then exec CMD (the broker's per-job leader shim).
+    supervise: Option<Vec<String>>,
     show_help: bool,
     show_version: bool,
 }
@@ -51,6 +58,38 @@ fn main() {
     if options.show_version {
         println!("agsh {}", env!("CARGO_PKG_VERSION"));
         return;
+    }
+
+    // Keep-broker plumbing (internal modes; see docs/SESSIONS.md). Handled
+    // before any shell setup — the daemon and the per-job supervisor are not
+    // shells and must not load history, rc files, or signal handlers.
+    if options.broker_launch {
+        match std::env::current_exe().and_then(|exe| agsh_broker::daemon::launch_detached(&exe)) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("agsh: broker launch: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if options.broker_daemon {
+        let Some(socket) = agsh_broker::paths::socket_path() else {
+            eprintln!("agsh: broker: cannot resolve socket path (HOME unset?)");
+            std::process::exit(1);
+        };
+        if let Err(error) = agsh_broker::daemon::run(&socket) {
+            eprintln!("agsh: broker: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(argv) = options.supervise.clone() {
+        let error = agsh_broker::supervise_exec(&argv);
+        eprintln!(
+            "agsh: supervise: {}: {error}",
+            argv.first().map(String::as_str).unwrap_or("")
+        );
+        std::process::exit(127);
     }
 
     let mut state = ShellState::from_current_process();
@@ -311,7 +350,14 @@ fn main() {
         // precmd hook: runs before each prompt (zsh `precmd` / `precmd_functions`).
         run_hooks(&mut executor, &mut state, &exec_options, "precmd", None);
 
-        let prompt = render_prompt(&state);
+        let mut prompt = render_prompt(&state);
+        // Shell integration: prompt-end mark (`B`) rendered with the prompt, so
+        // everything after it on the line is user input. Embedded in the prompt
+        // string (rather than emitted separately) so it always sits exactly at
+        // the prompt/input boundary, including across line-editor repaints.
+        if integrate {
+            prompt.push_str("\x1b]133;B\x07");
+        }
         let line = match read_line(&prompt, &state) {
             Ok(Some(line)) => line,
             Ok(None) => break,
@@ -775,6 +821,16 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CliOptions, String> 
                     rest.remove(0);
                 }
                 options.observe = Some(rest);
+            }
+            "--broker-daemon" => options.broker_daemon = true,
+            "--broker-launch" => options.broker_launch = true,
+            "--supervise" => {
+                // Everything after `--supervise` is the command to exec.
+                let mut rest: Vec<String> = args.by_ref().collect();
+                if rest.first().is_some_and(|a| a == "--") {
+                    rest.remove(0);
+                }
+                options.supervise = Some(rest);
             }
             "-h" | "--help" => options.show_help = true,
             "--version" => options.show_version = true,

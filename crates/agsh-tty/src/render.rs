@@ -164,21 +164,38 @@ pub fn refresh_with_menu(
     (out, cursor_row)
 }
 
-/// Visible width of a string, ignoring ANSI escape sequences (CSI/SGR), counting
-/// one column per remaining `char`.
+/// Visible width of a string, ignoring ANSI escape sequences (CSI/SGR) and OSC
+/// sequences (e.g. shell-integration marks), counting one column per remaining
+/// `char`.
 pub fn visible_width(s: &str) -> usize {
     let mut width = 0usize;
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\u{1b}' {
-            // Skip an escape sequence: ESC [ ... final-byte.
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for n in chars.by_ref() {
-                    if n.is_ascii_alphabetic() || n == '~' {
-                        break;
+            match chars.peek() {
+                // CSI: ESC [ ... final-byte.
+                Some('[') => {
+                    chars.next();
+                    for n in chars.by_ref() {
+                        if n.is_ascii_alphabetic() || n == '~' {
+                            break;
+                        }
                     }
                 }
+                // OSC: ESC ] ... terminated by BEL or ST (ESC \).
+                Some(']') => {
+                    chars.next();
+                    while let Some(n) = chars.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
             }
             continue;
         }
@@ -220,6 +237,13 @@ mod tests {
     fn visible_width_ignores_ansi() {
         assert_eq!(visible_width("\x1b[31mred\x1b[0m"), 3);
         assert_eq!(visible_width("abc"), 3);
+    }
+
+    #[test]
+    fn visible_width_ignores_osc() {
+        // BEL-terminated (shell-integration prompt marks) and ST-terminated.
+        assert_eq!(visible_width("> \x1b]133;B\x07"), 2);
+        assert_eq!(visible_width("\x1b]2;title\x1b\\ok"), 2);
     }
 
     #[test]

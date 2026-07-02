@@ -5,11 +5,15 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+agsh-broker = { path = "../agsh-broker" }
 agsh-core = { path = "../agsh-core" }
 agsh-exec = { path = "../agsh-exec" }
 agsh-output = { path = "../agsh-output" }
 agsh-policy = { path = "../agsh-policy" }
 agsh-tty = { path = "../agsh-tty" }
+
+[dev-dependencies]
+agsh-broker = { path = "../agsh-broker" }
 
 [lints]
 workspace = true
