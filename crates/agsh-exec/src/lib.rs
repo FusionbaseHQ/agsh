@@ -18,9 +18,13 @@ pub use executor::{
 pub use state::{ShellFunction, ShellState};
 
 /// Install signal handlers for interactive use: SIGINT/SIGQUIT set the shell's
-/// interrupt flag (so the shell interrupts loops/commands instead of dying),
-/// while SIGTTOU/SIGTTIN are ignored so terminal handoff does not stop the
-/// shell. Foreground children still receive terminal signals directly.
+/// interrupt flag so the shell interrupts loops/commands instead of dying.
+/// Foreground children still receive terminal signals directly.
+///
+/// Known gaps (see SHIP_READINESS_PLAN P0-10): SIGTERM/SIGHUP are not handled, so
+/// a kill at the raw-mode prompt can leave the terminal non-canonical until the
+/// next `reset`; and SIGTTOU/SIGTTIN are not yet ignored (only relevant once
+/// job-control terminal handoff lands).
 pub fn install_signal_handlers(state: &ShellState) -> std::io::Result<()> {
     use signal_hook::consts::{SIGINT, SIGQUIT};
     signal_hook::flag::register(SIGINT, state.interrupt_flag())?;
