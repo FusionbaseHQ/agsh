@@ -210,16 +210,27 @@ fn finish_attach(
             Vec::new(),
         ),
         Ok(AttachOutcome::Ended) => {
-            let code = client
-                .status(id)
-                .ok()
-                .and_then(|info| info.exit_code)
-                .unwrap_or(0);
-            CommandOutcome::captured(
-                code,
-                format!("keep: [{id}] exited (code {code})\n").into_bytes(),
-                Vec::new(),
-            )
+            // The stream closing means job exit OR another client taking the
+            // attach over — the job's status tells them apart.
+            match client.status(id) {
+                Ok(info) if info.running => CommandOutcome::captured(
+                    0,
+                    format!(
+                        "keep: attach taken over by another client — [{id}] keeps running \
+                         (reattach: keep attach {id})\n"
+                    )
+                    .into_bytes(),
+                    Vec::new(),
+                ),
+                status => {
+                    let code = status.ok().and_then(|info| info.exit_code).unwrap_or(0);
+                    CommandOutcome::captured(
+                        code,
+                        format!("keep: [{id}] exited (code {code})\n").into_bytes(),
+                        Vec::new(),
+                    )
+                }
+            }
         }
         Err(e) => fail(1, format!("keep attach: {e}")),
     }

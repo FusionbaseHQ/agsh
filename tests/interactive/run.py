@@ -584,11 +584,47 @@ def scenario_keep_full_session_survives_client_death():
             shutil.rmtree(session_dir, ignore_errors=True)
 
 
+def scenario_keep_attach_takeover():
+    # Two terminals, one job: the second attach takes over (last wins); the
+    # first client lands back at its prompt with an honest message — the job
+    # was NOT killed, just re-owned.
+    import tempfile
+
+    broker_dir = tempfile.mkdtemp(prefix="agsh-pty-steal-")
+    try:
+        s1 = Session(broker_dir=broker_dir)
+        s2 = Session(broker_dir=broker_dir)
+        try:
+            s1.send("keep -- sh -c 'echo steal-hello; exec cat'" + ENTER, 1.2)
+            check("first client attached", "steal-hello" in s1.screen(), s1.screen())
+
+            s2.send("keep attach k1" + ENTER, 1.2)
+            check("second client gets replay", "steal-hello" in s2.screen(), s2.screen())
+
+            s1.drain(0.6)
+            scr = s1.screen()
+            check("loser told the truth (taken over, still running)",
+                  "taken over" in scr and "keeps running" in scr, scr)
+            check("loser not told the job exited", "exited" not in scr, scr)
+
+            s2.send("\x1d", 0.6)  # detach the winner
+            s2.send("keep kill k1 KILL" + ENTER, 0.5)
+            s2.send("keep stop" + ENTER, 0.5)
+        finally:
+            s1._owns_broker_dir = False
+            s2._owns_broker_dir = False
+            s1.close()
+            s2.close()
+    finally:
+        shutil.rmtree(broker_dir, ignore_errors=True)
+
+
 SCENARIOS = [
     scenario_terminal_restore_on_signal,
     scenario_session_resume_after_kill,
     scenario_keep_attach_detach,
     scenario_keep_full_session_survives_client_death,
+    scenario_keep_attach_takeover,
     scenario_clear_passes_through_in_compact_mode,
     scenario_mode_intercept_toggle,
     scenario_rc_autoload,
@@ -618,6 +654,8 @@ def main():
         print("ERROR: agsh binary not found (run `cargo build`)")
         sys.exit(2)
     for sc in SCENARIOS:
+        if os.environ.get("AGSH_PTY_VERBOSE"):
+            print(f"--- {sc.__name__}", flush=True)
         try:
             sc()
         except Exception as e:  # noqa: BLE001

@@ -303,3 +303,84 @@ fn keep_builtin_job_survives_the_spawning_shell() {
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Last attach wins: a second client taking over hangs up the first WITHOUT
+/// disturbing the job, and the first client can tell (job still running).
+#[test]
+fn attach_takeover_hangs_up_the_previous_client_only() {
+    use std::io::Read;
+
+    let daemon = Daemon::start("steal");
+    let info = daemon.spawn_sh("echo takeover-ready; exec cat");
+
+    let (first, _) = daemon
+        .client
+        .attach_stream(&info.id, 24, 80, 4096)
+        .expect("first attach");
+    let mut first_reader = first.try_clone().expect("clone");
+    first_reader
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+
+    let (_second, attached) = daemon
+        .client
+        .attach_stream(&info.id, 24, 80, 4096)
+        .expect("second attach");
+    assert_eq!(attached.id, info.id);
+
+    // The first client's stream is hung up (EOF after any buffered bytes)…
+    let mut buf = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match first_reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {} // replayed scrollback before the hangup
+            Err(e) => panic!("first client should see EOF, got {e}"),
+        }
+        assert!(Instant::now() < deadline, "first client never hung up");
+    }
+    // …while the job is untouched and the second client owns the attach.
+    let status = daemon.client.status(&info.id).expect("status");
+    assert!(status.running, "takeover must not disturb the job");
+    assert!(status.attached, "second client must hold the attach");
+
+    daemon.client.signal(&info.id, "KILL").expect("kill");
+    daemon.wait_exit(&info.id);
+}
+
+/// Daemon shutdown must hang up its kept jobs (their PTY controllers close ⇒
+/// SIGHUP). Regression for the CLOEXEC leak: a job that inherits its own
+/// controller fd can never be hung up, silently orphaning shells forever.
+#[test]
+fn broker_shutdown_hangs_up_kept_jobs() {
+    let daemon = Daemon::start("hup");
+    let info = daemon.spawn_sh("sleep 30");
+    std::thread::sleep(Duration::from_millis(150)); // let setsid+exec settle
+
+    daemon.client.shutdown().expect("shutdown");
+
+    // The job's process must die of SIGHUP shortly after.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let alive = pid_probe(info.pid);
+        if !alive {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "job {} survived broker shutdown (controller fd leak?)",
+            info.pid
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `kill -0` probe: /bin/kill -0 exits 0 iff the process exists.
+fn pid_probe(pid: i32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}

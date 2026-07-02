@@ -9,6 +9,7 @@ import os
 import pty
 import select
 import shutil
+import signal
 import struct
 import tempfile
 import termios
@@ -90,16 +91,48 @@ class Session:
     def screen(self):
         return self.term.screen()
 
+    def _wait_exit(self, timeout):
+        """Poll-wait for the shell to exit, draining the pty so it never
+        blocks on a full output buffer. True once reaped."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                pid, _ = os.waitpid(self.pid, os.WNOHANG)
+            except OSError:
+                return True  # already reaped
+            if pid:
+                return True
+            self.drain(0.05)
+        return False
+
     def close(self):
+        # Polite exit first — but never trust it blindly: the ^C can race the
+        # cooked-mode window between a command returning and the editor
+        # re-entering raw mode, where it raises SIGINT and the shell discards
+        # the type-ahead (including our "exit"). Retype once at the settled
+        # prompt, then escalate to SIGKILL. A cleanup path must not be able to
+        # hang the whole suite.
         try:
             os.write(self.fd, b"\x03")  # interrupt any pending line
             os.write(self.fd, b"exit\r")
-            self.drain(0.2)
         except OSError:
             pass
+        if not self._wait_exit(1.5):
+            try:
+                os.write(self.fd, b"exit\r")
+            except OSError:
+                pass
+            if not self._wait_exit(1.5):
+                try:
+                    os.kill(self.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    os.waitpid(self.pid, 0)
+                except OSError:
+                    pass
         try:
             os.close(self.fd)
-            os.waitpid(self.pid, 0)
         except OSError:
             pass
         if self._owns_session_dir:

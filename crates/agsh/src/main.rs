@@ -572,13 +572,22 @@ fn finish_session_attach(client: &agsh_broker::Client, id: &str) -> i32 {
             0
         }
         Ok(agsh_broker::AttachOutcome::Ended) => {
-            let code = client
-                .status(id)
-                .ok()
-                .and_then(|info| info.exit_code)
-                .unwrap_or(0);
-            eprintln!("agsh: kept session [{id}] ended (code {code})");
-            code
+            // Stream closed: session exit, or another terminal took the attach
+            // over (last attach wins) — the session's status tells them apart.
+            match client.status(id) {
+                Ok(info) if info.running => {
+                    eprintln!(
+                        "agsh: attach taken over by another terminal — session [{id}] keeps \
+                         running (`agsh --attach {id}`)"
+                    );
+                    0
+                }
+                status => {
+                    let code = status.ok().and_then(|info| info.exit_code).unwrap_or(0);
+                    eprintln!("agsh: kept session [{id}] ended (code {code})");
+                    code
+                }
+            }
         }
         Err(error) => {
             eprintln!("agsh: attach: {error}");
