@@ -164,12 +164,14 @@ impl SessionRecorder {
     }
 
     /// A callback for the terminal-restore signal thread: journals a `hup`
-    /// record when the terminal hangs up (SIGHUP), so the restore banner can
-    /// say *why* the session died. Owns its own journal handle (`Send`).
+    /// record on SIGHUP (terminal closed) and SIGTERM (kill / system
+    /// shutdown). Both are *deliberate external termination*, as opposed to a
+    /// crash — the restore banner stays quiet for an idle session that ended
+    /// this way, instead of nagging after every window close or reboot.
     pub fn hangup_hook(&self) -> Box<dyn Fn(i32) + Send> {
         let journal = self.journal.clone();
         Box::new(move |signal| {
-            if signal == signal_hook::consts::SIGHUP {
+            if signal == signal_hook::consts::SIGHUP || signal == signal_hook::consts::SIGTERM {
                 journal.append(&SessionEvent::Hup { at: unix_now() });
             }
         })
@@ -610,11 +612,28 @@ fn tilde(path: &str) -> String {
     }
 }
 
-/// One-line interactive-startup banner when a dead session is restorable, or
-/// `None`. Muted styling; never blocks (one directory scan of small files).
+/// Whether a dead session's end merits interrupting the user at startup.
+///
+/// Closing a terminal window sends SIGHUP — for most people that IS how a
+/// session ends, so a hangup at an idle prompt must NOT banner (it would fire
+/// on nearly every new shell). It stays quietly available via `resume list`.
+/// What banners is plausible *loss*: a crash (no `hup` record — SIGKILL,
+/// panic, reboot, power) or a hangup while work was still running.
+fn banner_worthy(s: &RestorableSession) -> bool {
+    s.foreground.is_some() || !s.jobs.is_empty() || !s.hangup
+}
+
+/// Only recent deaths banner; older ones stay in `resume list`.
+const BANNER_MAX_AGE_SECS: u64 = 48 * 3600;
+
+/// One-line interactive-startup banner when a dead session likely lost work,
+/// or `None`. Muted styling; never blocks (one directory scan of small files).
 pub fn restore_banner(state: &ShellState) -> Option<String> {
     let sessions = restorable_sessions();
-    let info = sessions.first()?;
+    let info = sessions.iter().find(|info| {
+        banner_worthy(&info.session)
+            && unix_now().saturating_sub(mtime_unix(info.modified)) <= BANNER_MAX_AGE_SECS
+    })?;
     let s = &info.session;
     let mut what = Vec::new();
     let cwd = s.cwd.clone().unwrap_or_default();
@@ -653,8 +672,9 @@ pub fn restore_banner(state: &ShellState) -> Option<String> {
     } else {
         "ended unexpectedly"
     };
-    let more = if sessions.len() > 1 {
-        format!("; {} older: `resume list`", sessions.len() - 1)
+    let others = sessions.len() - 1;
+    let more = if others > 0 {
+        format!("; {others} more: `resume list`")
     } else {
         String::new()
     };
@@ -1055,6 +1075,70 @@ mod tests {
         assert!(!job_still_alive(pid, now), "dead process is dead");
         assert!(!job_still_alive(99_999_999, now), "nonexistent pid");
         assert!(!job_still_alive(0, now), "pgid 0 is never a job");
+    }
+
+    #[test]
+    fn window_close_at_idle_prompt_does_not_banner() {
+        fn start(id: &str, pid: u32) -> SessionEvent {
+            SessionEvent::Start {
+                id: id.into(),
+                pid,
+                cwd: "/w".into(),
+                host: "h".into(),
+                at: 1,
+                version: "0".into(),
+            }
+        }
+        // A hangup at an idle prompt is a normal window close: restorable via
+        // `resume list`, but never worth interrupting the next session for.
+        let hup_at_prompt = fold_session(&[
+            start("s", 1),
+            SessionEvent::Cwd { path: "/w".into() },
+            SessionEvent::Env {
+                k: "A".into(),
+                v: "1".into(),
+            },
+            SessionEvent::Fg {
+                cmd: "ls".into(),
+                at: 2,
+            },
+            SessionEvent::FgEnd { code: 0, at: 3 },
+            SessionEvent::Hup { at: 4 },
+        ]);
+        assert!(!banner_worthy(&hup_at_prompt));
+
+        // Hangup with a foreground command still running: lost work — banner.
+        let hup_mid_command = fold_session(&[
+            start("s", 1),
+            SessionEvent::Fg {
+                cmd: "claude".into(),
+                at: 2,
+            },
+            SessionEvent::Hup { at: 3 },
+        ]);
+        assert!(banner_worthy(&hup_mid_command));
+
+        // Hangup with background jobs recorded: banner.
+        let hup_with_jobs = fold_session(&[
+            start("s", 1),
+            SessionEvent::Job {
+                pgid: 42,
+                cmd: "server &".into(),
+                at: 2,
+            },
+            SessionEvent::Hup { at: 3 },
+        ]);
+        assert!(banner_worthy(&hup_with_jobs));
+
+        // No hup record at all (SIGKILL/crash/reboot): banner.
+        let crashed = fold_session(&[
+            start("s", 1),
+            SessionEvent::Env {
+                k: "A".into(),
+                v: "1".into(),
+            },
+        ]);
+        assert!(banner_worthy(&crashed));
     }
 
     #[test]
