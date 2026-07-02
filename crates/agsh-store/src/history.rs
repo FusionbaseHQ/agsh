@@ -75,11 +75,25 @@ impl HistoryStore {
         let mut entries: Vec<HistoryEntry> = Vec::new();
         let mut total = 0usize;
         if let Ok(file) = std::fs::File::open(&path) {
-            for line in BufReader::new(file).lines().map_while(Result::ok) {
-                if line.trim().is_empty() {
+            // Read line-by-line as bytes and lossy-decode: a corrupt/non-UTF8 line
+            // just fails to parse and is skipped, instead of truncating the whole
+            // (newest) history the way `.lines().map_while(Result::ok)` did at the
+            // first bad byte. (Also avoids the `lines_filter_map_ok` lint, whose
+            // suggested `map_while` is exactly that truncating behavior.)
+            let mut reader = BufReader::new(file);
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let line = String::from_utf8_lossy(&buf);
+                let line = line.trim();
+                if line.is_empty() {
                     continue;
                 }
-                if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) {
+                if let Ok(entry) = serde_json::from_str::<HistoryEntry>(line) {
                     total += 1;
                     entries.push(entry);
                     // Keep load memory bounded: never hold much more than `max`.
@@ -346,6 +360,40 @@ mod tests {
         // The on-disk log was compacted, so it cannot grow without bound.
         let on_disk = std::fs::read_to_string(&path).unwrap().lines().count();
         assert!(on_disk <= 10, "log not compacted: {on_disk} lines");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_skips_corrupt_line_and_keeps_newer_entries() {
+        // SHIP_READINESS_PLAN P1-23: a single non-UTF8/unparseable line must not
+        // truncate the rest of the (newest) history.
+        let dir = std::env::temp_dir().join(format!("agsh_histbad_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.jsonl");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(
+            serde_json::to_string(&entry("first", "/x", 1))
+                .unwrap()
+                .as_bytes(),
+        );
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&[0xff, 0xfe, 0x00]); // invalid UTF-8 line
+        bytes.push(b'\n');
+        bytes.extend_from_slice(
+            serde_json::to_string(&entry("last", "/x", 2))
+                .unwrap()
+                .as_bytes(),
+        );
+        bytes.push(b'\n');
+        std::fs::write(&path, &bytes).unwrap();
+
+        let store = HistoryStore::with_file(path, 100);
+        let cmds: Vec<&str> = store.entries().iter().map(|e| e.command.as_str()).collect();
+        assert!(cmds.contains(&"first"), "first entry missing: {cmds:?}");
+        assert!(
+            cmds.contains(&"last"),
+            "entry after the corrupt line was dropped: {cmds:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
