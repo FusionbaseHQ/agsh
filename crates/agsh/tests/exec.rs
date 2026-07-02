@@ -1297,3 +1297,76 @@ fn agjob_runs_in_background_and_captures_output() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- crash / DoS guards (SHIP_READINESS_PLAN P0-6, P0-7) -------------------
+// Pathological input must terminate with a normal exit code — never be killed
+// by a signal (SIGABRT from a stack overflow) and never hang/OOM. On Unix
+// `status.code()` is `None` only when the child was terminated by a signal, so
+// it is the direct "did the process crash?" probe.
+
+fn agsh_dash_c(src: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["-c", src])
+        .output()
+        .expect("run agsh")
+}
+
+#[test]
+fn deep_arithmetic_nesting_errors_without_crashing() {
+    // Ternary and assignment recursion in `$(( … ))` used to overflow the stack.
+    let ternary = format!("echo $(( {}1{} ))", "1?".repeat(5000), ":1".repeat(5000));
+    let assignment = format!("echo $(( {}1 ))", "a=".repeat(5000));
+    for src in [ternary, assignment] {
+        let out = agsh_dash_c(&src);
+        assert!(
+            out.status.code().is_some(),
+            "killed by signal (stack overflow?) on {}…",
+            &src[..40.min(src.len())]
+        );
+        assert_ne!(out.status.code(), Some(0), "expected a clean error exit");
+    }
+}
+
+#[test]
+fn deep_execution_nesting_errors_without_crashing() {
+    // Nested command substitution, nested subshells, and unbounded function
+    // recursion used to abort the whole process.
+    let cmd_subst = format!("echo {}echo hi{}", "$(".repeat(2000), ")".repeat(2000));
+    let subshell = format!("{}echo hi{}", "( ".repeat(2000), " )".repeat(2000));
+    let recursion = "f() { f; }; f".to_string();
+    for src in [cmd_subst, subshell, recursion] {
+        let out = agsh_dash_c(&src);
+        assert!(
+            out.status.code().is_some(),
+            "killed by signal (stack overflow?)"
+        );
+        assert_ne!(out.status.code(), Some(0), "expected a clean error exit");
+    }
+}
+
+#[test]
+fn pathological_brace_expansion_is_bounded() {
+    // A range far over the element cap is left literal rather than allocating
+    // ~1e9 strings.
+    let over_cap = agsh_dash_c("echo {1..1000000000}");
+    assert_eq!(
+        String::from_utf8_lossy(&over_cap.stdout),
+        "{1..1000000000}\n",
+        "huge range should be left literal, not expanded"
+    );
+    // Ranges that step past i64 bounds must neither panic (debug) nor spin
+    // forever via wraparound (release).
+    for src in [
+        "echo {9223372036854775806..9223372036854775807..5}",
+        "echo {-9223372036854775808..-9223372036854775807}",
+    ] {
+        let out = agsh_dash_c(src);
+        assert!(out.status.code().is_some(), "overflow crashed on {src}");
+    }
+    // Ordinary brace expansion is unaffected.
+    let normal = agsh_dash_c("echo {1..5}; echo a{b,c}; echo {a..e}");
+    assert_eq!(
+        String::from_utf8_lossy(&normal.stdout),
+        "1 2 3 4 5\nab ac\na b c d e\n"
+    );
+}

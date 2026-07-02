@@ -7,12 +7,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use agsh_core::{CommandId, Value};
+use agsh_core::{CommandId, ShellError, Value};
 use agsh_index::{GitContext, PathCache};
 use agsh_output::{CompactorConfig, OutputMode};
 use agsh_store::history::{self, HistoryEntry};
 use agsh_store::{HistoryStore, TraceRecord, TraceStore};
 use agsh_style::{Role, Theme};
+
+/// Max graph-execution nesting before we error instead of overflowing the stack.
+/// Generous for legitimate recursion/nesting yet well below the point where the
+/// heavier per-frame executor stack would abort the process. See
+/// [`ShellState::enter_exec`].
+const MAX_EXEC_DEPTH: usize = 256;
 
 /// Cache of PATH executable names, keyed by the `$PATH` value it was built from.
 type CommandNameCache = Arc<Mutex<Option<(String, std::collections::HashSet<String>)>>>;
@@ -243,6 +249,11 @@ pub struct ShellState {
     should_exit: bool,
     return_request: Option<i32>,
     source_depth: usize,
+    /// Nesting depth of graph execution (functions, `$( )`, `<( )`, subshells,
+    /// brace groups, `eval`, `source`). Bounds runaway recursion before it can
+    /// overflow the process stack. Copied on `clone()` so it keeps accumulating
+    /// across the state-clone that command substitution performs.
+    exec_depth: usize,
     local_scopes: Vec<Vec<LocalSaved>>,
     loop_depth: usize,
     loop_control: Option<LoopControl>,
@@ -370,6 +381,7 @@ impl ShellState {
             should_exit: false,
             return_request: None,
             source_depth: 0,
+            exec_depth: 0,
             local_scopes: Vec::new(),
             loop_depth: 0,
             loop_control: None,
@@ -830,6 +842,25 @@ impl ShellState {
 
     pub(crate) fn in_source(&self) -> bool {
         self.source_depth > 0
+    }
+
+    /// Enter one level of graph execution, erroring if nested too deeply (a
+    /// runaway `f() { f; }`, `$( $( … ) )`, or `( ( … ) )`). Returns the error
+    /// instead of letting the recursion overflow the stack (SIGABRT). Pair every
+    /// `Ok(())` with a [`leave_exec`](Self::leave_exec).
+    pub(crate) fn enter_exec(&mut self) -> Result<(), ShellError> {
+        self.exec_depth += 1;
+        if self.exec_depth > MAX_EXEC_DEPTH {
+            self.exec_depth -= 1;
+            return Err(ShellError::execution(
+                "execution nested too deeply (possible infinite recursion)",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn leave_exec(&mut self) {
+        self.exec_depth = self.exec_depth.saturating_sub(1);
     }
 
     /// Declare `name` as local to the innermost function scope, recording its

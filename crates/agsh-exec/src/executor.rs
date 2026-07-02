@@ -295,7 +295,15 @@ impl Executor {
         state: &mut ShellState,
         options: &ExecutionOptions,
     ) -> Result<CommandOutcome, ShellError> {
-        let outcome = self.run_graph_inner(graph, state, options)?;
+        // Bound total execution nesting here — the single chokepoint every
+        // nested path re-enters (functions, `$( )`, `<( )`, subshells, brace
+        // groups, `eval`, `source`, loop/compound bodies). Guards against
+        // runaway recursion (`f() { f; }`, deeply nested `$( … )`) that would
+        // otherwise overflow the stack and abort the whole shell.
+        state.enter_exec()?;
+        let result = self.run_graph_inner(graph, state, options);
+        state.leave_exec();
+        let outcome = result?;
         state.set_last_status(outcome.exit_code);
         Ok(outcome)
     }
@@ -9104,7 +9112,9 @@ impl<'a> ArithmeticParser<'a> {
         if let Some(name) = self.try_read_identifier() {
             self.skip_ws();
             if let Some(op) = self.try_read_assignment_op() {
-                let rhs = self.parse_assignment()?;
+                // Guard the right-associative RHS recursion (`a=a=…=1`) so a long
+                // assignment chain errors cleanly instead of overflowing the stack.
+                let rhs = self.guarded_arith(|s| s.parse_assignment())?;
                 let value = self.apply_assignment(&name, op, rhs)?;
                 return Ok(value);
             }
@@ -9189,13 +9199,14 @@ impl<'a> ArithmeticParser<'a> {
         self.skip_ws();
         if self.peek() == Some('?') {
             self.index += 1;
-            let when_true = self.parse_ternary()?;
+            // Guard the ternary recursion (`1?1?…?1`) against stack overflow.
+            let when_true = self.guarded_arith(|s| s.parse_ternary())?;
             self.skip_ws();
             if self.peek() != Some(':') {
                 return Err(ShellError::parse("missing ':' in arithmetic ternary"));
             }
             self.index += 1;
-            let when_false = self.parse_ternary()?;
+            let when_false = self.guarded_arith(|s| s.parse_ternary())?;
             return Ok(if condition != 0 {
                 when_true
             } else {
@@ -9762,7 +9773,21 @@ fn has_unquoted_brace(segments: &[WordSegment]) -> bool {
     })
 }
 
+/// Caps that keep pathological brace input (`{1..1000000000}`, `{a,b}` repeated
+/// dozens of times, `{{{{…}}}}`) from hanging or OOM-ing the shell. Both sit far
+/// above any realistic use; input that would exceed them is left un-expanded
+/// (literal) rather than crashing — never silently truncated to a wrong result.
+const MAX_BRACE_ELEMENTS: usize = 1 << 20; // 1,048,576 generated words
+const MAX_BRACE_DEPTH: usize = 64; // nested `{…}` levels
+
 fn expand_braces(input: &str) -> Vec<String> {
+    expand_braces_depth(input, 0)
+}
+
+fn expand_braces_depth(input: &str, depth: usize) -> Vec<String> {
+    if depth > MAX_BRACE_DEPTH {
+        return vec![input.to_string()];
+    }
     let Some((open, close)) = find_brace_pair(input) else {
         return vec![input.to_string()];
     };
@@ -9779,12 +9804,16 @@ fn expand_braces(input: &str) -> Vec<String> {
 
     let prefix = &input[..open];
     let suffix = &input[close + 1..];
-    let suffix_expanded = expand_braces(suffix);
+    let suffix_expanded = expand_braces_depth(suffix, depth + 1);
     let mut out = Vec::new();
     for alternative in alternatives {
         // Each alternative may itself contain nested braces, e.g. {a,b{1,2}}.
-        for expanded_alt in expand_braces(&alternative) {
+        for expanded_alt in expand_braces_depth(&alternative, depth + 1) {
             for expanded_suffix in &suffix_expanded {
+                if out.len() >= MAX_BRACE_ELEMENTS {
+                    // Combinatorial blow-up: leave the original text literal.
+                    return vec![input.to_string()];
+                }
                 out.push(format!("{prefix}{expanded_alt}{expanded_suffix}"));
             }
         }
@@ -9831,25 +9860,36 @@ fn expand_brace_range(inner: &str) -> Option<Vec<String>> {
             None => 1,
             Some(s) => {
                 let v = s.parse::<i64>().ok()?;
-                if v == 0 {
-                    1
-                } else {
-                    v.abs()
-                }
+                // saturating_abs avoids a panic on i64::MIN.
+                if v == 0 { 1 } else { v.saturating_abs() }
             }
         };
+        // Bail out (leaving the brace literal) if the sequence would exceed the
+        // element cap — computed without allocating, so a giant range like
+        // `{1..1000000000}` can't OOM the shell.
+        if start.abs_diff(end) / (step as u64) >= MAX_BRACE_ELEMENTS as u64 {
+            return None;
+        }
         let pad = brace_pad_width(parts[0], parts[1]);
         let mut out = Vec::new();
         let mut n = start;
         if start <= end {
             while n <= end {
                 out.push(format_brace_number(n, pad));
-                n += step;
+                // checked_add: near i64::MAX this would otherwise overflow —
+                // a panic in debug, an infinite loop via wraparound in release.
+                match n.checked_add(step) {
+                    Some(next) => n = next,
+                    None => break,
+                }
             }
         } else {
             while n >= end {
                 out.push(format_brace_number(n, pad));
-                n -= step;
+                match n.checked_sub(step) {
+                    Some(next) => n = next,
+                    None => break,
+                }
             }
         }
         return Some(out);
@@ -9859,15 +9899,14 @@ fn expand_brace_range(inner: &str) -> Option<Vec<String>> {
     let (sb, eb) = (parts[0].as_bytes(), parts[1].as_bytes());
     if sb.len() == 1 && eb.len() == 1 && sb[0].is_ascii_alphabetic() && eb[0].is_ascii_alphabetic()
     {
-        let step = match step_tok {
-            None => 1i32,
+        let step: i32 = match step_tok {
+            None => 1,
             Some(s) => {
-                let v = s.parse::<i64>().ok()?.unsigned_abs() as i32;
-                if v == 0 {
-                    1
-                } else {
-                    v
-                }
+                let v = s.parse::<i64>().ok()?;
+                // Clamp the magnitude to a sane positive i32 (a char range spans
+                // at most 26): avoids the `as i32` wrap that could make the step
+                // negative and spin the loop forever.
+                v.unsigned_abs().min(i32::MAX as u64).max(1) as i32
             }
         };
         let (s, e) = (sb[0] as i32, eb[0] as i32);
@@ -9876,12 +9915,18 @@ fn expand_brace_range(inner: &str) -> Option<Vec<String>> {
         if s <= e {
             while c <= e {
                 out.push((c as u8 as char).to_string());
-                c += step;
+                match c.checked_add(step) {
+                    Some(next) => c = next,
+                    None => break,
+                }
             }
         } else {
             while c >= e {
                 out.push((c as u8 as char).to_string());
-                c -= step;
+                match c.checked_sub(step) {
+                    Some(next) => c = next,
+                    None => break,
+                }
             }
         }
         return Some(out);
