@@ -1430,6 +1430,9 @@ fn trace_files_are_private() {
         );
         checked += 1;
     }
-    assert!(checked > 0, "expected at least one trace file to be written");
+    assert!(
+        checked > 0,
+        "expected at least one trace file to be written"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }

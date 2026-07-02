@@ -9861,7 +9861,11 @@ fn expand_brace_range(inner: &str) -> Option<Vec<String>> {
             Some(s) => {
                 let v = s.parse::<i64>().ok()?;
                 // saturating_abs avoids a panic on i64::MIN.
-                if v == 0 { 1 } else { v.saturating_abs() }
+                if v == 0 {
+                    1
+                } else {
+                    v.saturating_abs()
+                }
             }
         };
         // Bail out (leaving the brace literal) if the sequence would exceed the
