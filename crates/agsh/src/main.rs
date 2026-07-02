@@ -249,11 +249,21 @@ fn main() {
     // hooks, `mode:…`) into the live session. Gated on stdin being a TTY — `-c`,
     // script files, and piped input returned or are excluded above, so scripts and
     // the differential tests are never affected.
+    let mut session_recorder = None;
     if std::io::stdin().is_terminal() {
         source_rc(&mut executor, &mut state, &options, &exec_options);
         // Restore the terminal on SIGTERM/SIGHUP so a kill at the raw-mode prompt
         // doesn't leave the tty non-canonical (SHIP_READINESS_PLAN P0-10).
         agsh_tty::arm_terminal_restore_on_signals();
+        // Journal this session's state deltas (crash-safe restore via `resume`).
+        // Begun after the rc file, so only state typed into THIS session is
+        // journaled — rc state is recreated by the rc file on the next start.
+        session_recorder = agsh_exec::journal::SessionRecorder::begin(&mut state);
+        if session_recorder.is_some() {
+            if let Some(banner) = agsh_exec::journal::restore_banner(&state) {
+                eprintln!("{banner}");
+            }
+        }
     }
 
     let integrate = std::io::stdout().is_terminal();
@@ -302,6 +312,12 @@ fn main() {
             emit_osc(&format!("\x1b]133;C\x07\x1b]2;{}\x07", title_text(&line)));
         }
 
+        // Flight recorder: journal the command line before it runs, so a session
+        // that dies mid-command knows what was running.
+        if let Some(recorder) = &session_recorder {
+            recorder.command_started(&line);
+        }
+
         let exit = match run_one(&line, &mut executor, &mut state, &exec_options) {
             Ok(code) => code,
             Err(error) => {
@@ -316,6 +332,12 @@ fn main() {
         // A SIGINT during the command interrupts it, not the next prompt.
         state.clear_interrupt();
 
+        // Journal any state deltas the command produced (cwd, exports, aliases,
+        // …), so a crash after this point loses nothing.
+        if let Some(recorder) = &mut session_recorder {
+            recorder.command_finished(&state, exit);
+        }
+
         // chpwd hook: runs after the command if the working directory changed
         // (covers cd/pushd/popd) — zsh `chpwd` / `chpwd_functions`.
         if state.cwd() != cwd_before {
@@ -328,6 +350,10 @@ fn main() {
     }
 
     run_exit_trap(&mut executor, &mut state, &exec_options);
+    // Clean end: mark the journal so this session is never offered for restore.
+    if let Some(recorder) = &session_recorder {
+        recorder.finish(state.last_status());
+    }
 }
 
 /// Run the `EXIT` trap action, if any, exactly once. Driven from the shell's

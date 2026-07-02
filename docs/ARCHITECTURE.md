@@ -14,7 +14,7 @@ crates/
   agsh-style/    theme, palette, color levels, roles
   agsh-tty/      line editor, completion, history, syntax highlighting
   agsh-agent/    agent protocol / server
-  agsh-store/    trace and history store
+  agsh-store/    trace, history, and session-journal store
   agsh-index/    project / filesystem indexer
   agsh-compat/   command resolution / POSIX compatibility
 ```

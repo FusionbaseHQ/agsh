@@ -1700,3 +1700,65 @@ fn help_builtin_lists_and_details_commands() {
     let out = agsh_dash_c("type help");
     assert!(String::from_utf8_lossy(&out.stdout).contains("builtin"));
 }
+
+#[test]
+fn resume_restores_a_dead_sessions_state_and_consumes_the_journal() {
+    let base = std::env::temp_dir().join(format!("agsh_resume_{}", std::process::id()));
+    let sessions = base.join("sessions");
+    let workdir = base.join("proj");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    // A journal from a session that died (no `exit` record, pid can't exist).
+    let journal = format!(
+        concat!(
+            "{{\"e\":\"start\",\"id\":\"t1\",\"pid\":99999999,\"cwd\":\"/\",",
+            "\"host\":\"h\",\"at\":1,\"version\":\"0\"}}\n",
+            "{{\"e\":\"cwd\",\"path\":\"{workdir}\"}}\n",
+            "{{\"e\":\"env\",\"k\":\"API_URL\",\"v\":\"http://localhost:9\"}}\n",
+            "{{\"e\":\"alias\",\"k\":\"gs\",\"v\":\"git status\"}}\n",
+            "{{\"e\":\"fg\",\"cmd\":\"claude\",\"at\":2}}\n",
+        ),
+        workdir = workdir.display()
+    );
+    std::fs::write(sessions.join("t1.jsonl"), &journal).unwrap();
+
+    // `resume list` sees it, with what was running.
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["-c", "resume list"])
+        .env("AGSH_SESSION_DIR", &sessions)
+        .output()
+        .expect("run agsh");
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stderr: {listing}");
+    assert!(listing.contains("claude"), "listing: {listing}");
+
+    // `resume` replays cwd + env + alias into the live session.
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["-c", "resume; pwd; echo url=$API_URL; alias gs"])
+        .env("AGSH_SESSION_DIR", &sessions)
+        .output()
+        .expect("run agsh");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&workdir.display().to_string()),
+        "cwd not restored: {stdout}"
+    );
+    assert!(stdout.contains("url=http://localhost:9"), "env: {stdout}");
+    assert!(stdout.contains("git status"), "alias: {stdout}");
+    assert!(
+        stdout.contains("claude") && stdout.contains("sessions"),
+        "agent resume hint missing: {stdout}"
+    );
+
+    // The journal is consumed: a second resume finds nothing.
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["-c", "resume"])
+        .env("AGSH_SESSION_DIR", &sessions)
+        .output()
+        .expect("run agsh");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nothing to restore"));
+
+    let _ = std::fs::remove_dir_all(&base);
+}

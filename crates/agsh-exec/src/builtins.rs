@@ -82,6 +82,7 @@ pub fn builtin_names() -> &'static [&'static str] {
         "mode:output",
         "mode:intercept",
         "sessions",
+        "resume",
         "help",
     ]
 }
@@ -512,6 +513,7 @@ pub fn is_builtin(name: &str) -> bool {
             | "agconfine"
             | "mode"
             | "sessions"
+            | "resume"
             | "help"
     )
 }
@@ -536,6 +538,7 @@ Sandbox
 
 Agent & workflow tools
   sessions [N]            list / resume the Claude & Codex sessions for this folder
+  resume [list | N]       restore the shell state of a session that died (crash/HUP)
   agtrace [id]            list, or print, raw captured command output (trace://)
   agz DIR   (agjump)      jump to a frecently-used directory by substring
   agtrust                 trust this project's .env so it auto-activates here
@@ -620,6 +623,23 @@ sessions — find and resume the Claude Code / Codex sessions that ran in this f
   sessions        list sessions here, newest first (agent, age, id, summary)
   sessions N      resume the Nth listed session (claude --resume / codex resume)
   sessions --all  every folder, not just this one
+"
+        }
+        "resume" => {
+            "\
+resume — restore the shell state of a session that died without a clean exit
+(crash, closed terminal / SIGHUP, reboot). Interactive sessions journal their
+state deltas as they happen, so nothing is saved at exit — and nothing is lost
+without one.
+
+  resume          restore the most recent dead session
+  resume list     show restorable sessions (age, cwd, changes, what was running)
+  resume N        restore the Nth listed session
+
+Restores cwd, exported vars, shell vars, aliases, abbreviations, functions, and
+set/shopt options by replaying journaled deltas — commands are never re-run. If
+an agent (claude/codex) was running when the session died, `sessions` can resume
+its conversation too. A restored journal is consumed (never offered twice).
 "
         }
         "agtrace" | "trace" => {
@@ -818,6 +838,7 @@ pub fn run_builtin(
         "agz" | "agjump" => builtin_z(args, state),
         n if n == "mode" || n.starts_with("mode:") => Ok(builtin_mode(n, args, state)),
         "sessions" => Ok(crate::sessions::builtin_sessions(args, state)),
+        "resume" => Ok(crate::journal::builtin_resume(args, state)),
         "help" => Ok(builtin_help(args)),
         "external" => Err(ShellError::execution("external: missing command")),
         "builtin" => Err(ShellError::execution("builtin: missing command")),
@@ -1240,7 +1261,8 @@ fn builtin_complete(args: &[String], state: &mut ShellState) -> CommandOutcome {
 }
 
 /// Known `shopt` options agsh honors.
-const SHOPT_NAMES: &[&str] = &["globstar", "extglob", "nullglob", "dotglob", "nocaseglob"];
+pub(crate) const SHOPT_NAMES: &[&str] =
+    &["globstar", "extglob", "nullglob", "dotglob", "nocaseglob"];
 
 /// `shopt [-s|-u|-q] [name...]`: set/unset/query shell options. With no `-s/-u`,
 /// lists option states (`name on|off`).
