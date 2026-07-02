@@ -5075,7 +5075,7 @@ fn read_capped(mut reader: impl Read) -> io::Result<Vec<u8>> {
 fn run_external(
     invocation: &ExpandedInvocation,
     state: &ShellState,
-    _output_mode: OutputMode,
+    output_mode: OutputMode,
     stdin_data: Option<&[u8]>,
     capture_outputs: bool,
     command_path: Option<&Path>,
@@ -5091,6 +5091,22 @@ fn run_external(
     command.envs(state.exported_env());
     for assignment in &invocation.assignments {
         command.env(&assignment.name, &assignment.value);
+    }
+
+    // In the agent capturing modes, output is parsed heuristically (git status,
+    // cargo, pytest, …). Force a stable C locale so a non-English user locale
+    // can't make those parsers misread — e.g. `git status` reporting "clean" on a
+    // dirty tree because its localized headers didn't match. Not applied in raw
+    // (exact bytes) or rich (human display) modes; an explicit `LC_ALL=… cmd`
+    // still wins. (P1-12)
+    if capture_outputs
+        && output_mode != OutputMode::Rich
+        && !invocation
+            .assignments
+            .iter()
+            .any(|assignment| assignment.name == "LC_ALL")
+    {
+        command.env("LC_ALL", "C");
     }
 
     // Heredocs/herestrings carry literal stdin bytes; an explicit stdin

@@ -1638,3 +1638,32 @@ fn substitution_scanning_honors_quotes() {
         assert_eq!(out.status.code(), Some(0), "src={src:?}");
     }
 }
+
+#[test]
+fn capturing_mode_forces_c_locale_for_parsers() {
+    // SHIP_READINESS_PLAN P1-12: agent capturing modes run externals under LC_ALL=C
+    // so localized output (e.g. `git status` in a non-English locale) can't fool
+    // the heuristic compactors into e.g. reporting a dirty tree as "clean".
+    let compact = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["--output", "compact", "-c", "printenv LC_ALL"])
+        .env("LC_ALL", "de_DE.UTF-8")
+        .output()
+        .expect("run agsh");
+    let cs = String::from_utf8_lossy(&compact.stdout);
+    assert!(
+        cs.lines().any(|l| l.trim() == "C"),
+        "compact should force LC_ALL=C: {cs:?}"
+    );
+    assert!(
+        !cs.contains("de_DE"),
+        "compact leaked the user locale to the child: {cs:?}"
+    );
+
+    // Raw mode must not alter the child's locale (exact-bytes contract).
+    let raw = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["--output", "raw", "-c", "printenv LC_ALL"])
+        .env("LC_ALL", "de_DE.UTF-8")
+        .output()
+        .expect("run agsh");
+    assert_eq!(String::from_utf8_lossy(&raw.stdout), "de_DE.UTF-8\n");
+}
