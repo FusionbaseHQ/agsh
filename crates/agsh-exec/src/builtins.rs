@@ -1252,163 +1252,113 @@ fn builtin_set(args: &[String], state: &mut ShellState) -> CommandOutcome {
         return CommandOutcome::captured(0, out.into_bytes(), Vec::new());
     }
 
-    if args.first().is_some_and(|arg| arg == "--") {
-        state.set_positionals(&args[1..]);
-        return CommandOutcome::captured(0, Vec::new(), Vec::new());
+    // Process leading option words: `-e`, `+e`, bundled short flags (`-eu`,
+    // `-euo pipefail`), and `-o NAME` / `+o NAME` (getopt-style: the name is the
+    // rest of the current token if any, else the next word). Stop at `--` or the
+    // first non-option word; the remainder (if any) replaces the positionals.
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let on = match arg.as_bytes().first() {
+            Some(b'-') => true,  // `-` turns options on
+            Some(b'+') => false, // `+` turns options off
+            _ => break,          // first non-option word
+        };
+        if arg == "--" {
+            state.set_positionals(&args[i + 1..]);
+            return CommandOutcome::captured(0, Vec::new(), Vec::new());
+        }
+        let letters: Vec<char> = arg[1..].chars().collect();
+        let mut k = 0;
+        while k < letters.len() {
+            match letters[k] {
+                'a' => state.set_allexport(on),
+                'e' => state.set_errexit(on),
+                'f' => state.set_noglob(on),
+                'u' => state.set_nounset(on),
+                'C' => state.set_noclobber(on),
+                'x' => state.set_xtrace(on),
+                'o' => {
+                    let name = if k + 1 < letters.len() {
+                        letters[k + 1..].iter().collect::<String>()
+                    } else if let Some(next) = args.get(i + 1) {
+                        i += 1; // consume the name word
+                        next.clone()
+                    } else {
+                        // `set -o` / `set +o` alone: print the current options.
+                        return print_set_options(on, state);
+                    };
+                    if !apply_named_option(&name, on, state) {
+                        return CommandOutcome::captured(
+                            2,
+                            Vec::new(),
+                            format!("set: unsupported option name: {name}\n").into_bytes(),
+                        );
+                    }
+                    break; // `o` consumed the remainder of this token
+                }
+                other => {
+                    return CommandOutcome::captured(
+                        2,
+                        Vec::new(),
+                        format!(
+                            "set: unsupported option: {}{other}\n",
+                            if on { '-' } else { '+' }
+                        )
+                        .into_bytes(),
+                    );
+                }
+            }
+            k += 1;
+        }
+        i += 1;
     }
 
-    if let Some(outcome) = apply_set_option(args, state) {
-        return outcome;
+    // Any remaining words replace the positional parameters (`set -e a b`,
+    // `set a b`). With only options and no operands, positionals are untouched.
+    if i < args.len() {
+        state.set_positionals(&args[i..]);
     }
-
-    if args
-        .first()
-        .is_some_and(|arg| arg.starts_with('-') || arg.starts_with('+'))
-    {
-        return CommandOutcome::captured(
-            2,
-            Vec::new(),
-            format!("set: unsupported option: {}\n", args[0]).into_bytes(),
-        );
-    }
-
-    state.set_positionals(args);
     CommandOutcome::captured(0, Vec::new(), Vec::new())
 }
 
-fn apply_set_option(args: &[String], state: &mut ShellState) -> Option<CommandOutcome> {
-    let option = args.first()?;
-    match (
-        option.as_str(),
-        args.get(1).map(String::as_str),
-        args.get(2),
-    ) {
-        ("-a", None, None) => {
-            state.set_allexport(true);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("+a", None, None) => {
-            state.set_allexport(false);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("-e", None, None) => {
-            state.set_errexit(true);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("+e", None, None) => {
-            state.set_errexit(false);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("-f", None, None) => {
-            state.set_noglob(true);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("+f", None, None) => {
-            state.set_noglob(false);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("-u", None, None) => {
-            state.set_nounset(true);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("+u", None, None) => {
-            state.set_nounset(false);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("-C", None, None) => {
-            state.set_noclobber(true);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("+C", None, None) => {
-            state.set_noclobber(false);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("-x", None, None) => {
-            state.set_xtrace(true);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("+x", None, None) => {
-            state.set_xtrace(false);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("-o", None, None) => Some(CommandOutcome::captured(
-            0,
-            format!(
-                "allexport\t{}\nerrexit\t{}\nnounset\t{}\nnoclobber\t{}\nnoglob\t{}\npipefail\t{}\nxtrace\t{}\n",
-                if state.allexport() { "on" } else { "off" },
-                if state.errexit() { "on" } else { "off" },
-                if state.nounset() { "on" } else { "off" },
-                if state.noclobber() { "on" } else { "off" },
-                if state.noglob() { "on" } else { "off" },
-                if state.pipefail() { "on" } else { "off" },
-                if state.xtrace() { "on" } else { "off" }
-            )
-            .into_bytes(),
-            Vec::new(),
-        )),
-        ("-o", Some("allexport"), None) => {
-            state.set_allexport(true);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("+o", Some("allexport"), None) => {
-            state.set_allexport(false);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("-o", Some("errexit"), None) => {
-            state.set_errexit(true);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("+o", Some("errexit"), None) => {
-            state.set_errexit(false);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("-o", Some("nounset"), None) => {
-            state.set_nounset(true);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("+o", Some("nounset"), None) => {
-            state.set_nounset(false);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("-o", Some("noclobber"), None) => {
-            state.set_noclobber(true);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("+o", Some("noclobber"), None) => {
-            state.set_noclobber(false);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("-o", Some("noglob"), None) => {
-            state.set_noglob(true);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("+o", Some("noglob"), None) => {
-            state.set_noglob(false);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("-o", Some("pipefail"), None) => {
-            state.set_pipefail(true);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("+o", Some("pipefail"), None) => {
-            state.set_pipefail(false);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("-o", Some("xtrace"), None) => {
-            state.set_xtrace(true);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("+o", Some("xtrace"), None) => {
-            state.set_xtrace(false);
-            Some(CommandOutcome::captured(0, Vec::new(), Vec::new()))
-        }
-        ("-o" | "+o", Some(name), None) => Some(CommandOutcome::captured(
-            2,
-            Vec::new(),
-            format!("set: unsupported option name: {name}\n").into_bytes(),
-        )),
-        _ => None,
+/// Apply a long option name (`set -o pipefail` / `set +o pipefail`). Returns
+/// false for an unknown name so the caller can report it.
+fn apply_named_option(name: &str, on: bool, state: &mut ShellState) -> bool {
+    match name {
+        "allexport" => state.set_allexport(on),
+        "errexit" => state.set_errexit(on),
+        "nounset" => state.set_nounset(on),
+        "noclobber" => state.set_noclobber(on),
+        "noglob" => state.set_noglob(on),
+        "pipefail" => state.set_pipefail(on),
+        "xtrace" => state.set_xtrace(on),
+        _ => return false,
     }
+    true
+}
+
+/// Print the current option settings: `set -o` is a `name<TAB>on|off` table;
+/// `set +o` is the re-readable `set -o NAME` / `set +o NAME` form.
+fn print_set_options(dash: bool, state: &ShellState) -> CommandOutcome {
+    let opts = [
+        ("allexport", state.allexport()),
+        ("errexit", state.errexit()),
+        ("nounset", state.nounset()),
+        ("noclobber", state.noclobber()),
+        ("noglob", state.noglob()),
+        ("pipefail", state.pipefail()),
+        ("xtrace", state.xtrace()),
+    ];
+    let mut out = String::new();
+    for (name, is_on) in opts {
+        if dash {
+            out.push_str(&format!("{name}\t{}\n", if is_on { "on" } else { "off" }));
+        } else {
+            out.push_str(&format!("set {}o {name}\n", if is_on { '-' } else { '+' }));
+        }
+    }
+    CommandOutcome::captured(0, out.into_bytes(), Vec::new())
 }
 
 fn builtin_alias(args: &[String], state: &mut ShellState) -> Result<CommandOutcome, ShellError> {
@@ -2333,6 +2283,15 @@ fn builtin_type(args: &[String], state: &ShellState) -> Result<CommandOutcome, S
             continue;
         }
 
+        // Builtins take precedence at execution, so report them as such — using
+        // the authoritative `is_builtin` set rather than the resolver's narrower
+        // list (which omitted getopts/trap/local/…, so `type getopts` wrongly
+        // reported the external /usr/bin/getopts).
+        if is_builtin(arg) {
+            out.push_str(&format!("{arg} is an agsh builtin\n"));
+            continue;
+        }
+
         match resolver.resolve(arg, state.lookup("PATH")) {
             CommandResolution::Builtin(name) => {
                 out.push_str(&format!("{name} is an agsh builtin\n"))
@@ -2497,6 +2456,17 @@ fn command_description(
             format!("{name} is abbreviated to {}", shell_single_quote(value))
         } else {
             format!("abbr {name}='{}'", shell_single_quote(value))
+        });
+    }
+
+    // Builtins take execution precedence — report them from the authoritative
+    // `is_builtin` set (the resolver's list omitted many, so `command -v getopts`
+    // returned the external path).
+    if is_builtin(name) {
+        return Some(if verbose {
+            format!("{name} is an agsh builtin")
+        } else {
+            name.to_string()
         });
     }
 

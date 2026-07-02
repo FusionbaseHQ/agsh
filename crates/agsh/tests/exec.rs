@@ -1457,3 +1457,67 @@ fn trace_files_are_private() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn set_bundled_and_multiple_flags_apply() {
+    // SHIP_READINESS_PLAN P1-1: `set -euo pipefail` and other bundled/multi-flag
+    // forms used to error and, worse, silently leave the options off.
+
+    // A bundled `-eu` enables errexit, so a failure stops the script.
+    let out = agsh_dash_c("set -eu; false; echo REACHED");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("REACHED"),
+        "errexit from `set -eu` didn't stop execution"
+    );
+    assert_ne!(out.status.code(), Some(0));
+
+    // `-euo pipefail` turns all three on (checked via `set -o`).
+    let shown = agsh_dash_c("set -euo pipefail; set -o");
+    let s = String::from_utf8_lossy(&shown.stdout);
+    assert!(s.contains("errexit\ton"), "errexit not on: {s}");
+    assert!(s.contains("nounset\ton"), "nounset not on: {s}");
+    assert!(s.contains("pipefail\ton"), "pipefail not on: {s}");
+
+    // `+e` turns errexit back off; `-o NAME` and operands still work.
+    let out = agsh_dash_c("set -e -u; set +e; false; echo AFTER");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("AFTER"),
+        "`set +e` should re-enable continuation"
+    );
+    let out = agsh_dash_c("set -o pipefail; set a b c; echo \"$1-$2-$3\"");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a-b-c\n");
+    let out = agsh_dash_c("set -- -x -y; echo \"$1 $2\"");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "-x -y\n");
+
+    // Unknown flag / unknown option name error with exit 2.
+    assert_eq!(agsh_dash_c("set -Z").status.code(), Some(2));
+    assert_eq!(agsh_dash_c("set -o bogus").status.code(), Some(2));
+}
+
+#[test]
+fn type_and_command_v_report_all_builtins_truthfully() {
+    // SHIP_READINESS_PLAN P1-2: introspection used the resolver's narrower list,
+    // so builtins missing from it were misreported (`type getopts` → the external
+    // /usr/bin/getopts; `type local` → not found). They must agree with execution.
+    for name in [
+        "getopts", "local", "trap", "declare", "let", "shift", "return", "readonly", ":", "times",
+        "shopt", "complete",
+    ] {
+        let t = agsh_dash_c(&format!("type {name}"));
+        assert!(
+            String::from_utf8_lossy(&t.stdout).contains("is an agsh builtin"),
+            "`type {name}` should report a builtin, got stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&t.stdout),
+            String::from_utf8_lossy(&t.stderr)
+        );
+        assert_eq!(t.status.code(), Some(0), "`type {name}` exit");
+
+        let c = agsh_dash_c(&format!("command -v {name}"));
+        assert_eq!(
+            String::from_utf8_lossy(&c.stdout).trim(),
+            name,
+            "`command -v {name}` should print the name"
+        );
+        assert_eq!(c.status.code(), Some(0), "`command -v {name}` exit");
+    }
+}
