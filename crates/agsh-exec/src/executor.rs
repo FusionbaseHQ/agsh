@@ -7634,10 +7634,21 @@ fn expand_substitution_fragments(
         if chars[i] == '{' {
             i += 1;
             let start = i;
-            // Match nested braces so `${VAR:-${INNER}}` reads the full expression.
+            // Match nested braces, and skip a `}` inside a quoted default value, so
+            // `${VAR:-${INNER}}` and `${x:-'a}b'}` read the full expression.
             let mut depth = 1usize;
+            let mut quote: Option<char> = None;
             while i < chars.len() && depth > 0 {
-                match chars[i] {
+                let ch = chars[i];
+                if let Some(q) = quote {
+                    if ch == q {
+                        quote = None;
+                    }
+                    i += 1;
+                    continue;
+                }
+                match ch {
+                    '\'' | '"' => quote = Some(ch),
                     '{' => depth += 1,
                     '}' => {
                         depth -= 1;
@@ -9091,8 +9102,18 @@ fn read_backtick_command(chars: &[char], start_i: usize) -> Option<(String, usiz
 
 fn find_command_substitution_end(chars: &[char], open_index: usize) -> Option<(usize, usize)> {
     let mut depth = 0usize;
+    // Skip metacharacters inside quotes so `$(echo ')')` / `$(echo "a)b")` aren't
+    // closed at a parenthesis that's actually inside a quoted string.
+    let mut quote: Option<char> = None;
     for (index, ch) in chars.iter().enumerate().skip(open_index) {
+        if let Some(q) = quote {
+            if *ch == q {
+                quote = None;
+            }
+            continue;
+        }
         match ch {
+            '\'' | '"' => quote = Some(*ch),
             '(' => depth += 1,
             ')' => {
                 depth = depth.checked_sub(1)?;

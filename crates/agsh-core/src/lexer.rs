@@ -687,10 +687,21 @@ fn is_lex_identifier(text: &str) -> bool {
 
 fn read_dollar_paren(chars: &[(usize, char)], start_i: usize) -> Option<(String, usize, usize)> {
     let mut depth = 0usize;
+    // Track single/double quotes so metacharacters inside them don't end the
+    // substitution early — e.g. `$(echo ')')`, `grep ')'`, `$(echo "a)b")`.
+    let mut quote: Option<char> = None;
     let mut i = start_i + 1;
     while i < chars.len() {
         let (_, ch) = chars[i];
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
         match ch {
+            '\'' | '"' => quote = Some(ch),
             '(' => depth += 1,
             ')' => {
                 depth = depth.checked_sub(1)?;
@@ -711,10 +722,21 @@ fn read_dollar_paren(chars: &[(usize, char)], start_i: usize) -> Option<(String,
 /// expansion (including internal spaces) stays a single word segment.
 fn read_dollar_brace(chars: &[(usize, char)], start_i: usize) -> Option<(String, usize, usize)> {
     let mut depth = 0usize;
+    // Track quotes so a `}` inside a quoted default value doesn't close the
+    // expansion early — e.g. `${x:-'a}b'}`, `${x:-"a}b"}`.
+    let mut quote: Option<char> = None;
     let mut i = start_i + 1;
     while i < chars.len() {
         let (_, ch) = chars[i];
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
         match ch {
+            '\'' | '"' => quote = Some(ch),
             '{' => depth += 1,
             '}' => {
                 depth = depth.checked_sub(1)?;
@@ -763,6 +785,29 @@ mod tests {
         assert_eq!(tokens.len(), 2);
         assert_eq!(tokens[0].text, "echo");
         assert_eq!(tokens[1].text, "hello");
+    }
+
+    #[test]
+    fn lex_dollar_paren_honors_quotes() {
+        // SHIP_READINESS_PLAN P1-3: a quote inside $(…) must not end it early.
+        for src in [
+            "echo $(echo ')')",
+            "echo $(echo \"a)b\")",
+            "echo $(echo $(echo hi))", // nested still balances
+        ] {
+            let tokens = lex(src).unwrap();
+            assert_eq!(tokens.len(), 2, "{src}: {tokens:?}");
+            assert_eq!(tokens[1].text, &src["echo ".len()..]);
+        }
+    }
+
+    #[test]
+    fn lex_dollar_brace_honors_quotes() {
+        for src in ["echo ${x:-'a}b'}", "echo ${x:-\"a}b\"}"] {
+            let tokens = lex(src).unwrap();
+            assert_eq!(tokens.len(), 2, "{src}: {tokens:?}");
+            assert_eq!(tokens[1].text, &src["echo ".len()..]);
+        }
     }
 
     #[test]

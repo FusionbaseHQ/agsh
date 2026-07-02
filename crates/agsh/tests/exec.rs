@@ -1616,3 +1616,25 @@ fn pipeline_compound_producer_streams_in_order() {
     let out = agsh_c_timeout("{ echo a; echo b; echo c; } | grep b", 20).expect("hang");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "b\n");
 }
+
+#[test]
+fn substitution_scanning_honors_quotes() {
+    // SHIP_READINESS_PLAN P1-3: quotes inside $(…) / ${…} must not terminate the
+    // substitution early — these all used to error "unterminated quoted string".
+    for (src, want) in [
+        ("echo $(echo ')')", ")\n"),
+        ("echo $(echo \"a)b\")", "a)b\n"),
+        ("echo $(printf '%s' 'a)b')", "a)b\n"),
+        ("echo $(echo \"$(echo nested)\")", "nested\n"),
+        ("echo $(echo $(echo hi))", "hi\n"),
+    ] {
+        let out = agsh_dash_c(src);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            want,
+            "src={src:?} stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.status.code(), Some(0), "src={src:?}");
+    }
+}
