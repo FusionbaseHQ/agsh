@@ -36,6 +36,7 @@ pub fn normalize(input: &str, options: &NormalizeOptions) -> String {
     }
     if options.strip_ansi {
         text = strip_ansi(&text);
+        text = sanitize_control_chars(&text);
     }
     if options.shorten_workspace {
         if let Some(workspace) = options.workspace.as_deref() {
@@ -51,6 +52,31 @@ pub fn normalize(input: &str, options: &NormalizeOptions) -> String {
         text = dedupe_repeated_lines(&text);
     }
     text
+}
+
+/// Replace bare C0/C1 control characters (except `\n` and `\t`) with U+FFFD, so a
+/// crafted filename or log line can't use raw backspaces, BEL, or other controls
+/// to rewrite what a human sees (e.g. hide a `rm -rf`) or spam the terminal.
+/// Observation-only — the raw stream is preserved exactly. Runs after
+/// [`strip_ansi`], which has already removed well-formed escape sequences; this
+/// catches the stray controls those don't cover.
+fn sanitize_control_chars(input: &str) -> String {
+    if !input
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return input.to_string();
+    }
+    input
+        .chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Remove ANSI escape sequences: CSI (`ESC[...`), OSC (`ESC]...BEL`/`ST`), and
@@ -163,6 +189,28 @@ mod tests {
         assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
         assert_eq!(strip_ansi("\u{1b}]0;title\u{07}body"), "body");
         assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn sanitizes_bare_control_chars() {
+        // SHIP_READINESS_PLAN P1-15: backspace/BEL/etc. must not survive into an
+        // observation and rewrite the display; newlines and tabs are preserved.
+        assert_eq!(sanitize_control_chars("rm\u{08} -rf"), "rm\u{FFFD} -rf");
+        assert_eq!(
+            sanitize_control_chars("a\u{07}b\u{00}c"),
+            "a\u{FFFD}b\u{FFFD}c"
+        );
+        assert_eq!(
+            sanitize_control_chars("keep\tthis\nand this"),
+            "keep\tthis\nand this"
+        );
+        // And it's wired into the full pipeline via normalize().
+        let opts = NormalizeOptions {
+            home: None,
+            workspace: None,
+            ..Default::default()
+        };
+        assert_eq!(normalize("x\u{08}y", &opts), "x\u{FFFD}y");
     }
 
     #[test]
