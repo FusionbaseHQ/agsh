@@ -9,6 +9,7 @@ Exit:   0 if all checks pass, else 1. Requires a working PTY (skips with code 0
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -385,15 +386,20 @@ def scenario_terminal_restore_on_signal():
     import time
     from pty_helper import AGSH
 
+    import tempfile
+
     icanon, echo = termios.ICANON, termios.ECHO
     for sig, name in [(signal.SIGTERM, "SIGTERM"), (signal.SIGHUP, "SIGHUP")]:
         master, slave = pty.openpty()
         base = termios.tcgetattr(slave)[3]
+        # Isolated session dir: these shells die by signal and must not leave
+        # unclean journals in the developer's real state directory.
+        sess_dir = tempfile.mkdtemp(prefix="agsh-pty-sig-")
         p = subprocess.Popen(
             [AGSH, "--norc"],
             stdin=slave, stdout=slave, stderr=slave,
             start_new_session=True,
-            env={**os.environ, "TERM": "xterm"},
+            env={**os.environ, "TERM": "xterm", "AGSH_SESSION_DIR": sess_dir},
         )
         # Wait until agsh enters raw mode (ICANON+ECHO cleared on the tty).
         entered = False
@@ -413,16 +419,61 @@ def scenario_terminal_restore_on_signal():
             p.kill()
             check(f"{name}: shell exited on signal", False, "timed out")
             os.close(master); os.close(slave)
+            shutil.rmtree(sess_dir, ignore_errors=True)
             continue
         lf = termios.tcgetattr(slave)[3]
         os.close(master)
         os.close(slave)
         check(f"{name}: terminal restored (canonical+echo)",
               bool(lf & icanon) and bool(lf & echo), f"lflag={lf:#x}")
+        shutil.rmtree(sess_dir, ignore_errors=True)
+
+
+def scenario_session_resume_after_kill():
+    # Session resilience: a session killed hard (simulated crash) leaves a
+    # journal; the next session in the same journal dir shows the restore
+    # banner, and `resume` replays the dead session's state.
+    import signal
+    import tempfile
+
+    sess_dir = tempfile.mkdtemp(prefix="agsh-pty-resume-")
+    try:
+        s = Session(session_dir=sess_dir)
+        try:
+            s.send("export RESUME_PROBE=alive-42" + ENTER, 0.5)
+            s.send("alias rgs='git status'" + ENTER, 0.5)
+            os.kill(s.pid, signal.SIGKILL)  # crash: no clean `exit` record
+            os.waitpid(s.pid, 0)
+        finally:
+            try:
+                os.close(s.fd)
+            except OSError:
+                pass
+
+        s2 = Session(session_dir=sess_dir)
+        try:
+            scr = s2.screen()
+            check("restore banner offers resume", "resume" in scr and "2 changes" in scr, scr)
+            s2.send("resume" + ENTER, 0.6)
+            check("resume reports restore", "restored session" in s2.screen(), s2.screen())
+            s2.send("echo probe=$RESUME_PROBE" + ENTER, 0.5)
+            check("export restored", "probe=alive-42" in s2.screen(), s2.screen())
+            # A third session sees nothing: the journal was consumed and the
+            # second session is still alive (its own journal is not offered).
+            s3 = Session(session_dir=sess_dir)
+            try:
+                check("consumed journal not re-offered", "resume" not in s3.screen(), s3.screen())
+            finally:
+                s3.close()
+        finally:
+            s2.close()
+    finally:
+        shutil.rmtree(sess_dir, ignore_errors=True)
 
 
 SCENARIOS = [
     scenario_terminal_restore_on_signal,
+    scenario_session_resume_after_kill,
     scenario_clear_passes_through_in_compact_mode,
     scenario_mode_intercept_toggle,
     scenario_rc_autoload,

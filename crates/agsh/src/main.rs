@@ -274,9 +274,32 @@ fn main() {
 
     let integrate = std::io::stdout().is_terminal();
 
+    // Wake-from-standby detection (interactive TTY sessions only): the wall
+    // clock advances during sleep, the monotonic clock does not, so a large
+    // divergence between prompts means the machine slept. Saying so makes
+    // dropped ssh connections and stale state legible instead of mysterious.
+    let mut sleep_watch = session_recorder
+        .as_ref()
+        .map(|_| (std::time::SystemTime::now(), std::time::Instant::now()));
+
     loop {
-        // Report any background jobs that finished since the last prompt.
-        for notice in state.reap_finished_jobs() {
+        let slept = sleep_watch.as_mut().and_then(|(wall, mono)| {
+            let wall_delta = std::time::SystemTime::now()
+                .duration_since(*wall)
+                .unwrap_or_default();
+            let gap = wall_delta.saturating_sub(mono.elapsed());
+            *wall = std::time::SystemTime::now();
+            *mono = std::time::Instant::now();
+            (gap.as_secs() >= 30).then_some(gap.as_secs())
+        });
+
+        // Report any background jobs that finished since the last prompt (after
+        // a sleep was detected, so the wake note below explains any deaths).
+        let notices = state.reap_finished_jobs();
+        if let Some(secs) = slept {
+            eprintln!("{}", agsh_exec::journal::wake_note(&state, secs));
+        }
+        for notice in notices {
             eprintln!("{notice}");
         }
 

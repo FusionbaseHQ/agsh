@@ -558,9 +558,8 @@ fn name_list(names: &[&str]) -> String {
     }
 }
 
-/// "12s" / "4m" / "3h" / "2d" — compact age for banners and listings.
-fn ago(from: u64) -> String {
-    let secs = unix_now().saturating_sub(from);
+/// "12s" / "4m" / "3h" / "2d" — compact duration for banners and listings.
+fn human_secs(secs: u64) -> String {
     if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {
@@ -570,6 +569,28 @@ fn ago(from: u64) -> String {
     } else {
         format!("{}d", secs / 86_400)
     }
+}
+
+/// Compact age of a past unix timestamp.
+fn ago(from: u64) -> String {
+    human_secs(unix_now().saturating_sub(from))
+}
+
+/// One-line note after the system wakes from standby: how long it slept and
+/// what survived. Sleep freezes processes rather than killing them, but it
+/// drops TCP connections (ssh!) and makes wall-clock state stale — so say it
+/// happened instead of letting the shell silently pretend time didn't pass.
+pub fn wake_note(state: &ShellState, slept_secs: u64) -> String {
+    let jobs = state.running_jobs_snapshot();
+    let mut line = format!("agsh: system was asleep ~{}", human_secs(slept_secs));
+    if !jobs.is_empty() {
+        line.push_str(&format!(
+            " — {} background job{} still running",
+            jobs.len(),
+            if jobs.len() == 1 { "" } else { "s" }
+        ));
+    }
+    state.theme().paint(Role::Muted, &line)
 }
 
 fn mtime_unix(t: SystemTime) -> u64 {

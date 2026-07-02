@@ -33,6 +33,11 @@ confine ls,df -- ./monitor.sh                # kernel-confined to ls + df (macOS
 - **Rich `agview`** — markdown, JSON, CSV/TSV, diffs, **inline images** (iTerm2/Kitty
   protocols with a universal truecolor half-block fallback), and **syntax
   highlighting** for a dozen languages.
+- **Crash-safe sessions** — interactive sessions journal their state deltas as
+  they happen; after a crash, closed terminal, or reboot, `resume` replays cwd,
+  exports, aliases, functions, and options onto a new shell — and tells you what
+  was running, with a real resume path for Claude/Codex sessions. The shell also
+  announces wake-from-standby instead of silently pretending time didn't pass.
 - **Modern interactive editor** — syntax highlighting, completion, history with
   reverse search and autosuggestions, themed truecolor UI, and `precmd`/`preexec`/
   `chpwd` hooks.
@@ -171,6 +176,24 @@ Resume runs `claude --resume <id>` / `codex resume <id>` from the session's
 directory. In a hyperlink-aware terminal each row is clickable (opens the
 transcript). Sessions are matched by the real `cwd` recorded inside each one.
 
+### `resume` — survive crashes, hangups, and reboots
+
+Interactive sessions journal their state deltas (cwd, exports, vars, aliases,
+functions, options, running jobs) as they happen — crash-only design, nothing
+is saved "at exit". When a session dies without a clean exit (crash, closed
+terminal, dropped SSH, reboot), the next interactive shell offers it back:
+
+```sh
+resume          # restore the most recent dead session's state
+resume list     # show restorable sessions (age, cwd, changes, what ran)
+resume 2        # restore the 2nd listed one
+```
+
+Restore replays state deltas — it never re-runs commands. If an agent
+(`claude`/`codex`) was running when the session died, agsh points at the real
+resume path (`sessions`); surviving background jobs are rediscovered with a
+pid-reuse-safe liveness check. See [docs/SESSIONS.md](docs/SESSIONS.md).
+
 ## Repository layout
 
 ```text
@@ -184,7 +207,7 @@ crates/
   agsh-style/    theme, palette, color levels, roles
   agsh-tty/      line editor, completion, history, highlighting
   agsh-agent/    agent protocol/server
-  agsh-store/    trace and history store
+  agsh-store/    trace, history, and session-journal store
   agsh-index/    project/filesystem indexer
   agsh-compat/   command resolution / POSIX compatibility
 
@@ -197,6 +220,7 @@ tests/           golden checks, differential (vs bash/sh), interactive (PTY)
 - [Architecture](docs/ARCHITECTURE.md) — crates, execution pipeline, design contract
 - [`confine` sandbox](docs/CONFINE.md) — capability sandbox, presets, guarantees
 - [Configuration](docs/CONFIGURATION.md) — output modes, config files, environment
+- [Session resilience](docs/SESSIONS.md) — crash-safe journaling, `resume`, wake detection
 
 ## Development
 

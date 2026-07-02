@@ -8,7 +8,9 @@ import fcntl
 import os
 import pty
 import select
+import shutil
 import struct
+import tempfile
 import termios
 import time
 
@@ -20,17 +22,22 @@ AGSH = os.environ.get("AGSH", os.path.join(_REPO, "target", "debug", "agsh"))
 
 
 class Session:
-    def __init__(self, rows=20, cols=80, history=None, args=None):
+    def __init__(self, rows=20, cols=80, history=None, args=None, session_dir=None):
         self.rows, self.cols = rows, cols
         self.term = Term(rows, cols)
         env = dict(os.environ)
         home = "/tmp/agsh-pty-home"
         os.makedirs(home, exist_ok=True)
+        # Session journals go to a per-Session temp dir so scenarios never see
+        # each other's (or the developer's) crashed-session restore banners.
+        self._owns_session_dir = session_dir is None
+        self.session_dir = session_dir or tempfile.mkdtemp(prefix="agsh-pty-sess-")
         env.update(
             HOME=home,
             XDG_CONFIG_HOME=os.path.join(home, ".config"),
             XDG_DATA_HOME=os.path.join(home, ".local", "share"),
             AGSH_HISTORY_FILE=history or "/tmp/agsh-pty-history.jsonl",
+            AGSH_SESSION_DIR=self.session_dir,
             TERM="xterm",
             LANG="C",
         )
@@ -84,6 +91,8 @@ class Session:
             os.waitpid(self.pid, 0)
         except OSError:
             pass
+        if self._owns_session_dir:
+            shutil.rmtree(self.session_dir, ignore_errors=True)
 
 
 # Common control keys.
