@@ -471,9 +471,55 @@ def scenario_session_resume_after_kill():
         shutil.rmtree(sess_dir, ignore_errors=True)
 
 
+def scenario_keep_attach_detach():
+    # Phase-2 interactive path: `keep -- cmd` attaches to a broker-held PTY;
+    # Ctrl-] detaches leaving the job running; reattach replays scrollback;
+    # the job survives the whole shell being replaced.
+    CTRL_RBRACKET = "\x1d"
+    s = Session()
+    try:
+        s.send("keep -- sh -c 'echo kept-hello; exec cat'" + ENTER, 1.2)
+        scr = s.screen()
+        check("keep spawn+attach shows job output", "kept-hello" in scr, scr)
+        check("keep attach hint shown", "Ctrl-]" in scr, scr)
+
+        # Typed input reaches the kept job (cat echoes it through the PTY).
+        s.send("marco" + ENTER, 0.6)
+        check("input reaches kept job", "marco" in s.screen(), s.screen())
+
+        # Detach: back at the prompt, job still running.
+        s.send(CTRL_RBRACKET, 0.8)
+        scr = s.screen()
+        check("detach returns to prompt", "detached" in scr, scr)
+        s.send("keep list" + ENTER, 0.8)
+        scr = s.screen()
+        check("job listed running after detach", "running" in scr, scr)
+
+        # Reattach in a brand-new shell process (the old one exits): the
+        # scrollback replay brings back what happened before.
+        broker_dir = s.broker_dir
+        s._owns_broker_dir = False  # keep the broker alive across sessions
+        s.close()
+        s2 = Session(broker_dir=broker_dir)
+        try:
+            s2.send("keep attach k1" + ENTER, 1.0)
+            scr = s2.screen()
+            check("reattach replays scrollback", "kept-hello" in scr, scr)
+            s2.send(CTRL_RBRACKET, 0.8)
+            s2.send("keep kill k1 KILL" + ENTER, 0.6)
+            s2.send("keep stop" + ENTER, 0.6)
+            check("broker stops cleanly", "broker stopped" in s2.screen(), s2.screen())
+        finally:
+            s2._owns_broker_dir = True  # last user cleans up
+            s2.close()
+    finally:
+        shutil.rmtree(s.broker_dir, ignore_errors=True)
+
+
 SCENARIOS = [
     scenario_terminal_restore_on_signal,
     scenario_session_resume_after_kill,
+    scenario_keep_attach_detach,
     scenario_clear_passes_through_in_compact_mode,
     scenario_mode_intercept_toggle,
     scenario_rc_autoload,

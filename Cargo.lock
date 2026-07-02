@@ -53,6 +53,7 @@ version = "0.1.0"
 name = "agsh-exec"
 version = "0.1.0"
 dependencies = [
+ "agsh-broker",
  "agsh-compat",
  "agsh-core",
  "agsh-index",

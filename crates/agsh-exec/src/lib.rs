@@ -3,6 +3,7 @@ pub mod builtins;
 pub mod confine;
 pub mod executor;
 pub mod journal;
+pub mod keep;
 pub mod math;
 pub mod sessions;
 pub mod state;

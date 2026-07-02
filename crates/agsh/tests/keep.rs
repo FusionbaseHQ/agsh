@@ -238,3 +238,68 @@ fn autostart_launches_a_daemon_on_demand() {
     client.shutdown().expect("shutdown");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The Phase-2 property, end to end through the builtin: a `keep`-spawned job
+/// outlives the shell process that started it, and later shells manage it.
+#[test]
+fn keep_builtin_job_survives_the_spawning_shell() {
+    let dir = std::env::temp_dir().join(format!("agshb_bi_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let agsh = |cmd: &str| {
+        Command::new(env!("CARGO_BIN_EXE_agsh"))
+            .args(["-c", cmd])
+            .env("AGSH_BROKER_DIR", &dir)
+            .output()
+            .expect("run agsh")
+    };
+
+    // Shell #1 spawns a kept job and EXITS (non-TTY ⇒ spawn detached).
+    let out = agsh("keep -- sh -c 'echo builtin-probe; sleep 30'");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "spawn failed: {stdout}");
+    assert!(stdout.contains("running detached"), "spawn: {stdout}");
+    let id = stdout
+        .split('[')
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .expect("job id in output")
+        .to_string();
+
+    // The spawning shell is gone; a NEW shell still sees the job running.
+    let out = agsh("keep list");
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        listing.contains(&id) && listing.contains("running"),
+        "job must survive its spawning shell: {listing}"
+    );
+
+    // Its output was journaled and is readable from yet another shell.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = agsh(&format!("keep tail {id}"));
+        if String::from_utf8_lossy(&out.stdout).contains("builtin-probe") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "log never got the probe output");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Kill it, confirm the exit is tracked, and clean up.
+    let out = agsh(&format!("keep kill {id} KILL"));
+    assert_eq!(out.status.code(), Some(0));
+    let client = Client::at(dir.join("agshd.sock"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let info = client.status(&id).expect("status");
+        if !info.running {
+            assert_eq!(info.exit_code, Some(128 + 9));
+            break;
+        }
+        assert!(Instant::now() < deadline, "job never died");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let out = agsh("keep stop");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&dir);
+}

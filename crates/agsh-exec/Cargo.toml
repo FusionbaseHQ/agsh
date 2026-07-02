@@ -5,6 +5,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+agsh-broker = { path = "../agsh-broker" }
 agsh-compat = { path = "../agsh-compat" }
 agsh-core = { path = "../agsh-core" }
 agsh-index = { path = "../agsh-index" }

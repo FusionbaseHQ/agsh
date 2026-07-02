@@ -83,6 +83,7 @@ pub fn builtin_names() -> &'static [&'static str] {
         "mode:intercept",
         "sessions",
         "resume",
+        "keep",
         "help",
     ]
 }
@@ -514,6 +515,7 @@ pub fn is_builtin(name: &str) -> bool {
             | "mode"
             | "sessions"
             | "resume"
+            | "keep"
             | "help"
     )
 }
@@ -539,6 +541,7 @@ Sandbox
 Agent & workflow tools
   sessions [N]            list / resume the Claude & Codex sessions for this folder
   resume [list | N]       restore the shell state of a session that died (crash/HUP)
+  keep -- CMD             run CMD under the keep broker: it survives this terminal
   agtrace [id]            list, or print, raw captured command output (trace://)
   agz DIR   (agjump)      jump to a frecently-used directory by substring
   agtrust                 trust this project's .env so it auto-activates here
@@ -623,6 +626,25 @@ sessions — find and resume the Claude Code / Codex sessions that ran in this f
   sessions        list sessions here, newest first (agent, age, id, summary)
   sessions N      resume the Nth listed session (claude --resume / codex resume)
   sessions --all  every folder, not just this one
+"
+        }
+        "keep" => {
+            "\
+keep — run a command on a broker-held PTY so it survives this terminal. The
+`agshd` broker (auto-started, per user) owns the job's pseudo-terminal; close
+the window, drop the SSH connection, or crash the shell and the job keeps
+running, its output journaled to a log.
+
+  keep -- CMD ARGS…    start CMD kept; on a terminal, attach immediately
+  keep list            kept jobs (id, state, age, command; * = attached)
+  keep attach ID       reattach with scrollback replay (Ctrl-] detaches)
+  keep tail ID [N]     print the last N bytes (default 4096) of the output log
+  keep kill ID [SIG]   signal the job's process group (default TERM)
+  keep rm ID           drop a finished job from the list
+  keep stop            stop the broker (hangs up every kept job)
+
+The job gets a real controlling terminal (Ctrl-C works), your exported env,
+and your cwd. Detaching never kills it; exiting your shell never kills it.
 "
         }
         "resume" => {
@@ -839,6 +861,7 @@ pub fn run_builtin(
         n if n == "mode" || n.starts_with("mode:") => Ok(builtin_mode(n, args, state)),
         "sessions" => Ok(crate::sessions::builtin_sessions(args, state)),
         "resume" => Ok(crate::journal::builtin_resume(args, state)),
+        "keep" => Ok(crate::keep::builtin_keep(args, state)),
         "help" => Ok(builtin_help(args)),
         "external" => Err(ShellError::execution("external: missing command")),
         "builtin" => Err(ShellError::execution("builtin: missing command")),

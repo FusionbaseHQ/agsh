@@ -22,7 +22,7 @@ AGSH = os.environ.get("AGSH", os.path.join(_REPO, "target", "debug", "agsh"))
 
 
 class Session:
-    def __init__(self, rows=20, cols=80, history=None, args=None, session_dir=None):
+    def __init__(self, rows=20, cols=80, history=None, args=None, session_dir=None, broker_dir=None):
         self.rows, self.cols = rows, cols
         self.term = Term(rows, cols)
         env = dict(os.environ)
@@ -32,12 +32,18 @@ class Session:
         # each other's (or the developer's) crashed-session restore banners.
         self._owns_session_dir = session_dir is None
         self.session_dir = session_dir or tempfile.mkdtemp(prefix="agsh-pty-sess-")
+        # Keep-broker state is isolated too: a scenario that uses `keep` must
+        # never autostart a broker in the developer's real state dir. (The
+        # scenario is responsible for `keep stop` before closing.)
+        self._owns_broker_dir = broker_dir is None
+        self.broker_dir = broker_dir or tempfile.mkdtemp(prefix="agsh-pty-broker-")
         env.update(
             HOME=home,
             XDG_CONFIG_HOME=os.path.join(home, ".config"),
             XDG_DATA_HOME=os.path.join(home, ".local", "share"),
             AGSH_HISTORY_FILE=history or "/tmp/agsh-pty-history.jsonl",
             AGSH_SESSION_DIR=self.session_dir,
+            AGSH_BROKER_DIR=self.broker_dir,
             TERM="xterm",
             LANG="C",
         )
@@ -93,6 +99,8 @@ class Session:
             pass
         if self._owns_session_dir:
             shutil.rmtree(self.session_dir, ignore_errors=True)
+        if self._owns_broker_dir:
+            shutil.rmtree(self.broker_dir, ignore_errors=True)
 
 
 # Common control keys.
