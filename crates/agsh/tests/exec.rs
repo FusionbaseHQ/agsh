@@ -1667,3 +1667,36 @@ fn capturing_mode_forces_c_locale_for_parsers() {
         .expect("run agsh");
     assert_eq!(String::from_utf8_lossy(&raw.stdout), "de_DE.UTF-8\n");
 }
+
+#[test]
+fn help_builtin_lists_and_details_commands() {
+    // Bare `help` is a readable overview naming the agsh-specific tools.
+    let out = agsh_dash_c("help");
+    assert_eq!(out.status.code(), Some(0));
+    let overview = String::from_utf8_lossy(&out.stdout);
+    for needle in ["mode:output", "agview", "confine", "sessions", "agtrace"] {
+        assert!(
+            overview.contains(needle),
+            "help overview missing {needle:?}"
+        );
+    }
+
+    // `help <command>` gives detail for that command.
+    let out = agsh_dash_c("help mode");
+    assert_eq!(out.status.code(), Some(0));
+    let detail = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        detail.contains("lossless-ref"),
+        "help mode missing detail: {detail:?}"
+    );
+
+    // An unknown topic fails (exit 1) and explains itself on stderr, not stdout.
+    let out = agsh_dash_c("help frobnicate");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no help topic"));
+
+    // And it is registered as a builtin (registries agree — type resolves it).
+    let out = agsh_dash_c("type help");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("builtin"));
+}

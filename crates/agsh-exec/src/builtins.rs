@@ -82,6 +82,7 @@ pub fn builtin_names() -> &'static [&'static str] {
         "mode:output",
         "mode:intercept",
         "sessions",
+        "help",
     ]
 }
 
@@ -511,7 +512,217 @@ pub fn is_builtin(name: &str) -> bool {
             | "agconfine"
             | "mode"
             | "sessions"
+            | "help"
     )
+}
+
+/// Readable overview of agsh's own commands, shown by bare `help`. Focused on the
+/// agsh-specific tools; standard POSIX builtins are listed by name (`type NAME`).
+const HELP_OVERVIEW: &str = "\
+agsh — built-in commands            (help <command> for details · --help for CLI flags)
+
+Output modes — how command output is shown to an agent
+  mode                    show the current output / intercept mode
+  mode:output MODE        set the default view: raw clean compact semantic lossless-ref silent rich
+  mode:output off         reset to the session startup default
+  mode:intercept SPEC     route the agent's own bash/sh through agsh (SPEC, or: off)
+
+Rich rendering — human display, TTY only (pipes & redirects still get exact bytes)
+  agview FILE...          render markdown, source code, JSON, CSV/TSV, diffs, and images
+
+Sandbox
+  confine PRESET -- CMD   kernel-enforced sandbox: read-only | workspace | offline | <exec-allowlist>
+  pty CMD                 run CMD under a pseudo-terminal
+
+Agent & workflow tools
+  sessions [N]            list / resume the Claude & Codex sessions for this folder
+  agtrace [id]            list, or print, raw captured command output (trace://)
+  agz DIR   (agjump)      jump to a frecently-used directory by substring
+  agtrust                 trust this project's .env so it auto-activates here
+  agcontext [--json]      structured shell / project context for an agent
+  peek FILE               print a line-numbered slice of a file
+  agpatch FILE            apply a unified diff (read from stdin / a heredoc)
+  risk 'CMD'              rate how dangerous a command is before you run it
+  snapshot                take a git snapshot as a rollback point
+  agmath EXPR             evaluate integer or floating-point math
+  agjob CMD               run CMD in the background with its output captured
+
+Standard POSIX builtins (use `type NAME` for one)
+  cd pwd export unset set alias jobs fg bg wait kill trap read test [ [[ source . eval
+  exec local return shift readonly getopts declare printf echo history ulimit umask …
+
+Naming: agsh's own tools are ag-prefixed only where a bare name would shadow a real
+CLI (agview, agpatch, agmath, agz); conflict-free ones keep the bare name
+(confine, peek, risk, snapshot, pty) and also accept an ag-alias (agpeek, agrisk,
+agsnapshot). Type `help <command>` for usage and examples.
+";
+
+/// Detailed, example-driven help for one agsh command; `None` for unknown names.
+fn help_topic(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "mode" | "mode:output" | "mode:intercept" => {
+            "\
+mode — control, for the session, how command output is presented to an agent.
+
+  mode                    show all current mode aspects
+  mode:output MODE        set the default output view (below); `mode MODE` is shorthand
+  mode:output             show just the output aspect
+  mode:output off         reset to the session startup default
+  mode:intercept SPEC     route the agent's own bash/sh through agsh; `off` to stop
+
+Output MODEs:
+  raw           exact bytes, streamed (the default)
+  clean         raw with ANSI / control noise removed
+  compact       trimmed + de-duplicated
+  semantic      a structured observation of recognized commands
+  lossless-ref  compact view + a trace:// pointer to the full raw output
+  silent        suppress display, keep exit status + trace
+  rich          human rich rendering (see `help agview`)
+
+The default applies to interactive sessions only; piped `agsh -c` and scripts stay
+raw, so pipelines are never transformed.
+"
+        }
+        "agview" => {
+            "\
+agview FILE... — render a file for the human terminal, detecting its type. Rich
+rendering is TTY-only: piped or redirected output is always the exact bytes.
+
+  agview README.md      markdown            agview data.json      pretty JSON
+  agview report.csv     aligned table       agview change.diff     colored diff
+  agview src/main.rs    syntax highlight     agview photo.png       inline image
+                        (py rs js ts go c …) (crisp in iTerm2/Kitty; half-blocks elsewhere)
+"
+        }
+        "confine" => {
+            "\
+confine — run a payload under a kernel-enforced capability sandbox (macOS Seatbelt;
+Linux Landlock is planned and fails closed until then).
+
+  confine read-only -- python x.py   read + run; no writes, network, or secret reads
+  confine workspace -- ./build.sh     writes only within $PWD (+ a private scratch dir)
+  confine offline -- npm test         network off; filesystem unchanged
+  confine convert -- ./thumb.sh       exec-allowlist: the payload may only run `convert`
+  confine ls,df                       confine the CURRENT session (sticky) to an allowlist
+
+  --rw PATH   add a writable root     --net / --no-net   toggle network
+  --explain   show the capabilities   --dry-run          print the profile, don't run
+  --force     run a refused agent     --best-effort      shim layer if no kernel backend
+
+Self-managing agents (claude, …) are refused — use their own tool-permission systems.
+See docs/CONFINE.md for the guarantees and non-guarantees.
+"
+        }
+        "sessions" => {
+            "\
+sessions — find and resume the Claude Code / Codex sessions that ran in this folder.
+
+  sessions        list sessions here, newest first (agent, age, id, summary)
+  sessions N      resume the Nth listed session (claude --resume / codex resume)
+  sessions --all  every folder, not just this one
+"
+        }
+        "agtrace" | "trace" => {
+            "\
+agtrace — inspect the raw output captured in capturing modes (addressable as trace://).
+
+  agtrace                       list recent captured commands
+  agtrace <id>                  print a command's full raw stdout
+  agtrace <id> --grep PATTERN   filter that output
+  agtrace <id> START:END        print a line range
+"
+        }
+        "agz" | "agjump" => {
+            "\
+agz DIR  (alias: agjump) — jump to a directory you've used before, ranked by
+frecency (frequency + recency). DIR is a substring of the target path.
+  agz proj      cd to the best-matching frecent directory containing \"proj\"
+"
+        }
+        "agtrust" => {
+            "\
+agtrust — mark the current project directory as trusted, so its .env is sourced
+automatically when you enter it (project environments require explicit trust).
+"
+        }
+        "agcontext" => {
+            "\
+agcontext [--json] — print a structured snapshot of the shell / project context
+(cwd, git, recent commands, last result) for an agent. --json for machine parsing.
+"
+        }
+        "peek" | "agpeek" => {
+            "\
+peek FILE  (alias: agpeek) — print a file with line numbers.
+  peek FILE                 the whole file, numbered
+  peek FILE --range 20:40   only lines 20-40
+"
+        }
+        "agpatch" => {
+            "\
+agpatch FILE — apply a unified diff to FILE, read from stdin or a heredoc.
+  agpatch src.rs <<'EOF'
+  @@ -1,3 +1,3 @@
+   a
+  -b
+  +B
+   c
+  EOF
+"
+        }
+        "risk" | "agrisk" => {
+            "\
+risk 'CMD'  (alias: agrisk) — rate how dangerous a command is BEFORE running it,
+flagging things like recursive deletes. Advisory only — it does not block.
+  risk 'rm -rf /'    → flags fs.recursive_delete
+"
+        }
+        "snapshot" | "agsnapshot" => {
+            "\
+snapshot  (alias: agsnapshot) — take a git snapshot of the working tree as a
+rollback point, without disturbing your index or current branch.
+"
+        }
+        "pty" => {
+            "\
+pty CMD — run CMD under a pseudo-terminal, so tools that check for a TTY (color,
+interactive prompts, progress bars) behave as they would in a real terminal.
+"
+        }
+        "agmath" => {
+            "\
+agmath EXPR — evaluate an arithmetic or floating-point expression.
+  agmath '2 + 3 * 4'    → 14
+  agmath 'sqrt(2)'      → 1.4142135…
+"
+        }
+        "agjob" => {
+            "\
+agjob CMD — run CMD in the background with its stdout/stderr captured to a log,
+so a non-blocking command's output stays recoverable (unlike a bare `&`).
+"
+        }
+        _ => return None,
+    })
+}
+
+/// `help` — a readable overview of agsh's own commands, or `help <command>` detail.
+fn builtin_help(args: &[String]) -> CommandOutcome {
+    match args.first() {
+        None => CommandOutcome::captured(0, HELP_OVERVIEW.as_bytes().to_vec(), Vec::new()),
+        Some(topic) => match help_topic(topic) {
+            Some(text) => CommandOutcome::captured(0, text.as_bytes().to_vec(), Vec::new()),
+            None => CommandOutcome::captured(
+                1,
+                Vec::new(),
+                format!(
+                    "help: no help topic for `{topic}`. Run `help` for the command list, \
+                     or `type {topic}` to see what it resolves to.\n"
+                )
+                .into_bytes(),
+            ),
+        },
+    }
 }
 
 pub fn run_builtin(
@@ -607,6 +818,7 @@ pub fn run_builtin(
         "agz" | "agjump" => builtin_z(args, state),
         n if n == "mode" || n.starts_with("mode:") => Ok(builtin_mode(n, args, state)),
         "sessions" => Ok(crate::sessions::builtin_sessions(args, state)),
+        "help" => Ok(builtin_help(args)),
         "external" => Err(ShellError::execution("external: missing command")),
         "builtin" => Err(ShellError::execution("builtin: missing command")),
         other => Err(ShellError::unsupported(format!(
