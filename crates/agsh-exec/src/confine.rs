@@ -53,6 +53,36 @@ const INJECTION_ENV_VARS: &[&str] = &[
     "RUBYLIB",
 ];
 
+/// Credential-bearing environment variables scrubbed by the confining presets,
+/// so a sandboxed payload can't read a cloud/API token straight out of the
+/// inherited environment. NOT exhaustive — the stronger long-term model is an
+/// allowlist (pass only PATH/HOME/TERM/LANG + explicit `--env`); see
+/// docs/CONFINE.md — but this covers the common high-value secrets. `SSH_AUTH_SOCK`
+/// is included so the ssh-agent socket path is gone even before the network deny.
+const CREDENTIAL_ENV_VARS: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITLAB_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+    "NPM_TOKEN",
+    "PYPI_TOKEN",
+    "VAULT_TOKEN",
+    "DATABASE_URL",
+    "SLACK_TOKEN",
+    "CLOUDFLARE_API_TOKEN",
+    "DIGITALOCEAN_ACCESS_TOKEN",
+    "DOCKER_PASSWORD",
+];
+
 /// Credential locations denied for reading under the confining presets (relative
 /// to `$HOME` unless absolute). Closes the read-then-exfiltrate path; pair with
 /// network-deny so even an in-process read can't leave the host.
@@ -559,11 +589,14 @@ pub fn sandbox_exec_wrap(
         profile.push_str(")\n");
     }
 
-    // Network denial (local unix sockets stay allowed so basic IPC works).
+    // Network denial. Deny *all* outbound/inbound network, including AF_UNIX
+    // sockets: previously `(allow … remote unix-socket)` re-opened them, which let
+    // a confined payload connect to `/var/run/docker.sock` (→ full host root) or
+    // `$SSH_AUTH_SOCK`, defeating the network, write, and secret-read denies at
+    // once. Basic IPC is not worth that escape; per-socket opt-in can be added
+    // later if a concrete need appears.
     if caps.net_deny {
         profile.push_str("(deny network-outbound)\n(deny network-inbound)\n");
-        profile.push_str("(allow network-outbound (remote unix-socket))\n");
-        profile.push_str("(allow network-inbound (local unix-socket))\n");
     }
 
     // Cross-process hardening for the confining presets: a payload can't inspect,
@@ -581,6 +614,8 @@ pub fn sandbox_exec_wrap(
     if caps.scrub_env {
         prefix.push_str("unset ");
         prefix.push_str(&INJECTION_ENV_VARS.join(" "));
+        prefix.push(' ');
+        prefix.push_str(&CREDENTIAL_ENV_VARS.join(" "));
         prefix.push_str(" 2>/dev/null; ");
     }
     if let Some(s) = &scratch {

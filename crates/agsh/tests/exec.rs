@@ -637,6 +637,32 @@ fn confine_refuses_self_managing_agent() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn confine_readonly_scrubs_credential_env() {
+    // SHIP_READINESS_PLAN P0-3: a confining preset must not hand inherited
+    // cloud/API tokens (or the ssh-agent socket) to the payload.
+    if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
+        return;
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args([
+            "-c",
+            "confine read-only -- sh -c 'echo [$AWS_SECRET_ACCESS_KEY][$SSH_AUTH_SOCK][$GITHUB_TOKEN]'",
+        ])
+        .env("AWS_SECRET_ACCESS_KEY", "SEKRET")
+        .env("SSH_AUTH_SOCK", "/tmp/agent.sock")
+        .env("GITHUB_TOKEN", "ghp_leak")
+        .env_remove("AGSH_CONFINE")
+        .output()
+        .expect("run agsh");
+    let so = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        so.contains("[][][]"),
+        "credential env leaked into confined payload: {so:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn confine_leaf_payload_kernel_enforced() {
     // Real enforcement: a leaf payload runs, but the kernel denies any command off
     // the allowlist — via PATH bash, absolute /bin/bash, and python os.system —
@@ -1369,4 +1395,41 @@ fn pathological_brace_expansion_is_bounded() {
         String::from_utf8_lossy(&normal.stdout),
         "1 2 3 4 5\nab ac\na b c d e\n"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_files_are_private() {
+    // SHIP_READINESS_PLAN P0-11: on-disk traces are unredacted and can contain
+    // secrets, so the dir must be 0700 and files 0600 — not umask-default 0755/0644.
+    use std::os::unix::fs::PermissionsExt;
+    let base = std::env::temp_dir().join(format!("agsh-trace-perm-{}", std::process::id()));
+    let dir = base.join("traces");
+    let _ = std::fs::remove_dir_all(&base);
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["--output", "compact", "-c", "echo trace-me"])
+        .env("AGSH_TRACE_DIR", &dir)
+        .output()
+        .expect("run agsh");
+    assert!(out.status.success(), "agsh failed: {:?}", out.status);
+    let dir_mode = std::fs::metadata(&dir)
+        .expect("trace dir")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(dir_mode, 0o700, "trace dir not private: {dir_mode:o}");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("read trace dir") {
+        let entry = entry.unwrap();
+        let mode = entry.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "trace file {:?} not private: {mode:o}",
+            entry.file_name()
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "expected at least one trace file to be written");
+    let _ = std::fs::remove_dir_all(&base);
 }

@@ -1662,6 +1662,7 @@ fn trace_dir_cap() -> usize {
 /// process that produced them. No-op unless `$AGSH_TRACE_DIR` is set. The dir is
 /// bounded (oldest files reaped) on every write, so it never grows without bound.
 fn persist_trace_to_disk(cmd_id: &CommandId, stdout: &[u8], stderr: &[u8]) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let Some(dir) = std::env::var_os("AGSH_TRACE_DIR") else {
         return;
     };
@@ -1669,9 +1670,24 @@ fn persist_trace_to_disk(cmd_id: &CommandId, stdout: &[u8], stderr: &[u8]) {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
+    // Raw traces are stored verbatim and are never redacted, so they can contain
+    // secrets (from `env`, `cat .env`, `curl -v`, …). Keep them private to this
+    // user: 0700 dir, 0600 files — not the umask-default 0755/0644.
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    let write_private = |path: PathBuf, bytes: &[u8]| {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+        {
+            let _ = f.write_all(bytes);
+        }
+    };
     let pid = std::process::id();
-    let _ = std::fs::write(dir.join(format!("{pid}_{cmd_id}.out")), stdout);
-    let _ = std::fs::write(dir.join(format!("{pid}_{cmd_id}.err")), stderr);
+    write_private(dir.join(format!("{pid}_{cmd_id}.out")), stdout);
+    write_private(dir.join(format!("{pid}_{cmd_id}.err")), stderr);
     prune_trace_dir(&dir, trace_dir_cap());
 }
 
