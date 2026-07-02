@@ -498,11 +498,24 @@ fn confine_propagates_to_child_agsh() {
         .output()
         .expect("run agsh");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("childok"), "stdout={stdout:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Core guardrail invariant on every platform: the non-allowlisted `uname`
+    // never runs, so its output never leaks.
     assert!(
         !stdout.contains("Darwin") && !stdout.contains("Linux"),
         "leak: {stdout:?}"
     );
+    if cfg!(target_os = "macos") {
+        // Seatbelt/shim enforcement: the allowlisted command still runs.
+        assert!(stdout.contains("childok"), "stdout={stdout:?}");
+    } else {
+        // No kernel allowlist backend (e.g. Landlock) built in → fail closed:
+        // refuse to run at all rather than enforce weakly. See docs/CONFINE.md.
+        assert!(
+            stderr.contains("cannot enforce"),
+            "expected fail-closed, stderr={stderr:?}"
+        );
+    }
 }
 
 #[test]
@@ -528,11 +541,17 @@ fn confine_shims_intercept_agent_bash_tool() {
         .output()
         .expect("run agsh");
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !stdout.contains("Darwin") && !stdout.contains("Linux"),
         "leak: {stdout:?}"
     );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not permitted"));
+    if cfg!(target_os = "macos") {
+        assert!(stderr.contains("not permitted"), "stderr={stderr:?}");
+    } else {
+        // Fail closed with no kernel allowlist backend (see docs/CONFINE.md).
+        assert!(stderr.contains("cannot enforce"), "stderr={stderr:?}");
+    }
 }
 
 #[test]
@@ -565,12 +584,17 @@ fn confine_shim_handles_login_and_rc_flags() {
             .env_remove("AGSH_CONFINE")
             .output()
             .expect("run agsh");
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout),
-            "OK\n",
-            "invocation {inv:?} stderr={:?}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if cfg!(target_os = "macos") {
+            assert_eq!(stdout, "OK\n", "invocation {inv:?} stderr={stderr:?}");
+        } else {
+            // Fail closed without a kernel allowlist backend (see docs/CONFINE.md).
+            assert!(
+                stderr.contains("cannot enforce"),
+                "invocation {inv:?} stderr={stderr:?}"
+            );
+        }
     }
     // ...and a denied command stays denied even with login/rc flags.
     let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
@@ -579,11 +603,16 @@ fn confine_shim_handles_login_and_rc_flags() {
         .output()
         .expect("run agsh");
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !stdout.contains("Darwin") && !stdout.contains("Linux"),
         "leak: {stdout:?}"
     );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not permitted"));
+    if cfg!(target_os = "macos") {
+        assert!(stderr.contains("not permitted"), "stderr={stderr:?}");
+    } else {
+        assert!(stderr.contains("cannot enforce"), "stderr={stderr:?}");
+    }
 }
 
 // ---- OS-enforced confine (MILESTONE_CONFINE_OS) ---------------------------

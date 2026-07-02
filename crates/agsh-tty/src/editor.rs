@@ -603,7 +603,7 @@ impl<'a> Editor<'a> {
             let desc = match &cand.description {
                 Some(d) if !d.is_empty() => {
                     let budget = self.cols.saturating_sub(max_val + 18);
-                    let shown: String = d.chars().take(budget.max(0)).collect();
+                    let shown: String = d.chars().take(budget).collect();
                     if shown.is_empty() {
                         String::new()
                     } else {

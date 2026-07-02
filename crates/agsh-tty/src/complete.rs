@@ -504,8 +504,8 @@ fn path_candidates(state: &ShellState, dir_prefix: &str, dirs_only: bool) -> Vec
             files.push(Candidate::new(name, CandidateKind::File));
         }
     }
-    dirs.sort_by(|a, b| a.value.cmp(&b.value));
-    files.sort_by(|a, b| a.value.cmp(&b.value));
+    dirs.sort_by_key(|c| c.value.clone());
+    files.sort_by_key(|c| c.value.clone());
     dirs.extend(files);
     dirs
 }

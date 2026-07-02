@@ -1,3 +1,6 @@
 [toolchain]
-channel = "stable"
+# Pinned to a concrete version so local, CI, and containers resolve the same
+# compiler + clippy. Bump deliberately (a floating "stable" silently introduced
+# new deny-by-default clippy lints that broke CI while passing on older locals).
+channel = "1.96.1"
 components = ["rustfmt", "clippy"]

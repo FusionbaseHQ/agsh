@@ -136,7 +136,7 @@ fn find_sessions(cwd: &Path, all: bool) -> Vec<Session> {
     let cwd_s = cwd.to_string_lossy().into_owned();
     find_claude(&home, &cwd_s, all, &mut out);
     find_codex(&home, &cwd_s, all, &mut out);
-    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out.sort_by_key(|s| std::cmp::Reverse(s.modified));
     out
 }
 
@@ -203,7 +203,7 @@ fn find_codex(home: &Path, cwd: &str, all: bool, out: &mut Vec<Session>) {
     let root = home.join(".codex/sessions");
     let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
     collect_jsonl(&root, &mut files);
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|f| std::cmp::Reverse(f.1));
     files.truncate(CODEX_SCAN_LIMIT);
     for (p, modified) in files {
         // Cheap filter: only the first record (session_meta) has the cwd + id, so

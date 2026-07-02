@@ -216,7 +216,7 @@ impl HistoryStore {
             let score = match_score + frecency_weight(now, entry.started_at);
             best.push((entry, score));
         }
-        best.sort_by(|a, b| b.1.cmp(&a.1));
+        best.sort_by_key(|b| std::cmp::Reverse(b.1));
         best.truncate(limit);
         best.into_iter().map(|(e, _)| e).collect()
     }
@@ -235,7 +235,7 @@ impl HistoryStore {
             .into_iter()
             .map(|(d, s)| (d.to_string(), s))
             .collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.sort_by_key(|b| std::cmp::Reverse(b.1));
         ranked
     }
 }

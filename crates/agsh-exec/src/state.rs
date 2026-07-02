@@ -1660,7 +1660,7 @@ fn prune_trace_dir(dir: &Path, cap: usize) {
     if files.len() <= cap {
         return;
     }
-    files.sort_by(|a, b| a.0.cmp(&b.0)); // oldest first
+    files.sort_by_key(|a| a.0); // oldest first
     let drop = files.len() - cap;
     for (_, path) in files.into_iter().take(drop) {
         let _ = std::fs::remove_file(path);
