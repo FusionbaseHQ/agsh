@@ -62,19 +62,24 @@ class Session:
         self.drain(0.4)
 
     def drain(self, dt=0.35):
-        time.sleep(dt)
+        # Read WHILE waiting (not sleep-then-read): on macOS a pty's queued
+        # output is discarded when its last peripheral fd closes (revoke), so a
+        # reader that naps first can lose a dying child's final bytes.
         buf = b""
+        deadline = time.time() + dt
         while True:
-            r, _, _ = select.select([self.fd], [], [], 0.1)
-            if not r:
+            r, _, _ = select.select([self.fd], [], [], 0.05)
+            if r:
+                try:
+                    chunk = os.read(self.fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                continue
+            if time.time() >= deadline:
                 break
-            try:
-                chunk = os.read(self.fd, 65536)
-            except OSError:
-                break
-            if not chunk:
-                break
-            buf += chunk
         self.term.feed(buf.decode(errors="replace"))
         return buf
 

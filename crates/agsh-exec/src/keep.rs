@@ -69,6 +69,30 @@ fn job_env(state: &ShellState) -> Vec<(String, String)> {
         .collect()
 }
 
+/// One-line interactive-startup hint when detached kept agsh sessions exist —
+/// the "your session is still alive, come back" breadcrumb. `None` when the
+/// broker isn't running (never autostarts one), when nothing is detached, or
+/// inside a kept session itself.
+pub fn detached_sessions_hint(state: &ShellState) -> Option<String> {
+    if std::env::var_os("AGSH_KEPT").is_some() {
+        return None;
+    }
+    let client = Client::from_env().ok()?;
+    let jobs = client.list().ok()?;
+    let detached = jobs
+        .iter()
+        .filter(|j| j.kind == JobKind::Session && j.running && !j.attached)
+        .count();
+    if detached == 0 {
+        return None;
+    }
+    let line = format!(
+        "agsh: {detached} detached agsh session{} running — `agsh --attach` reattaches",
+        if detached == 1 { "" } else { "s" }
+    );
+    Some(state.theme().paint(agsh_style::Role::Muted, &line))
+}
+
 pub fn builtin_keep(args: &[String], state: &mut ShellState) -> CommandOutcome {
     let first = args.first().map(String::as_str);
     match first {

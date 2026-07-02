@@ -38,6 +38,11 @@ struct CliOptions {
     /// `--supervise -- CMD…`: setsid + adopt the PTY on stdin as controlling
     /// terminal, then exec CMD (the broker's per-job leader shim).
     supervise: Option<Vec<String>>,
+    /// `--keep`: run this interactive session under the keep broker, so it
+    /// survives the terminal (detach instead of dying on hangup).
+    keep_session: bool,
+    /// `--attach [ID]`: reattach to a detached kept agsh session.
+    attach: Option<Option<String>>,
     show_help: bool,
     show_version: bool,
 }
@@ -90,6 +95,14 @@ fn main() {
             argv.first().map(String::as_str).unwrap_or("")
         );
         std::process::exit(127);
+    }
+    // `--keep` / `--attach`: this process is a thin attach client; the real
+    // interactive session lives under the broker and survives us.
+    if options.keep_session {
+        std::process::exit(run_kept_session(&options));
+    }
+    if let Some(id) = options.attach.clone() {
+        std::process::exit(run_attach(id.as_deref()));
     }
 
     let mut state = ShellState::from_current_process();
@@ -309,6 +322,10 @@ fn main() {
                 eprintln!("{banner}");
             }
         }
+        // Breadcrumb for kept sessions left running (never autostarts a broker).
+        if let Some(hint) = agsh_exec::keep::detached_sessions_hint(&state) {
+            eprintln!("{hint}");
+        }
     }
 
     let integrate = std::io::stdout().is_terminal();
@@ -428,6 +445,145 @@ fn main() {
     // Clean end: mark the journal so this session is never offered for restore.
     if let Some(recorder) = &session_recorder {
         recorder.finish(state.last_status());
+    }
+}
+
+/// `agsh --keep`: start a NEW interactive agsh session under the keep broker
+/// and attach this terminal to it. The session survives this client — closing
+/// the terminal (or SIGHUP during standby) merely detaches; `agsh --attach`
+/// from any later terminal resumes it exactly where it was.
+fn run_kept_session(options: &CliOptions) -> i32 {
+    use std::io::IsTerminal;
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        eprintln!("agsh: --keep needs a terminal");
+        return 2;
+    }
+    if std::env::var_os("AGSH_KEPT").is_some() {
+        eprintln!("agsh: already inside a kept session (Ctrl-] detaches it)");
+        return 2;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            eprintln!("agsh: --keep: cannot find agsh binary: {error}");
+            return 1;
+        }
+    };
+    let client = match agsh_broker::Client::connect_or_start(&exe) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("agsh: --keep: {error}");
+            return 1;
+        }
+    };
+    // The inner agsh: same binary, interactive, marked kept. Startup flags
+    // that shape the session are propagated; session identity is not.
+    let mut cmd = vec![exe.display().to_string()];
+    if options.norc {
+        cmd.push("--norc".into());
+    }
+    if let Some(rcfile) = &options.rcfile {
+        cmd.push("--rcfile".into());
+        cmd.push(rcfile.clone());
+    }
+    let mut env: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| k != "AGSH_SESSION")
+        .collect();
+    env.push(("AGSH_KEPT".into(), "1".into()));
+    let cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    let (rows, cols) = agsh_broker::attach::term_size();
+    let info = match client.spawn_job(agsh_broker::SpawnSpec {
+        cmd,
+        cwd,
+        env,
+        rows,
+        cols,
+        kind: agsh_broker::JobKind::Session,
+        title: "agsh".into(),
+    }) {
+        Ok(info) => info,
+        Err(error) => {
+            eprintln!("agsh: --keep: {error}");
+            return 1;
+        }
+    };
+    eprintln!(
+        "agsh: kept session [{}] — closing this terminal only detaches it; \
+         `agsh --attach` resumes it",
+        info.id
+    );
+    finish_session_attach(&client, &info.id)
+}
+
+/// `agsh --attach [ID]`: reattach to a detached kept agsh session.
+fn run_attach(id: Option<&str>) -> i32 {
+    use std::io::IsTerminal;
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        eprintln!("agsh: --attach needs a terminal");
+        return 2;
+    }
+    let client = match agsh_broker::Client::from_env() {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("agsh: --attach: {error}");
+            return 1;
+        }
+    };
+    if client.ping().is_err() {
+        eprintln!("agsh: --attach: broker not running — no kept sessions");
+        return 1;
+    }
+    let id = match id {
+        Some(id) => id.to_string(),
+        None => {
+            // Pick the newest detached session; list the rest if ambiguous.
+            let jobs = client.list().unwrap_or_default();
+            let mut detached: Vec<_> = jobs
+                .iter()
+                .filter(|j| j.kind == agsh_broker::JobKind::Session && j.running && !j.attached)
+                .collect();
+            detached.sort_by_key(|j| std::cmp::Reverse(j.started_at));
+            match detached.len() {
+                0 => {
+                    eprintln!("agsh: no detached kept sessions (start one with `agsh --keep`)");
+                    return 1;
+                }
+                1 => {}
+                n => {
+                    eprintln!("agsh: {n} detached sessions — attaching the newest:");
+                    for job in &detached {
+                        eprintln!("  agsh --attach {}   ({})", job.id, job.title);
+                    }
+                }
+            }
+            detached[0].id.clone()
+        }
+    };
+    finish_session_attach(&client, &id)
+}
+
+/// Attach the terminal to a kept session and translate how it ended.
+fn finish_session_attach(client: &agsh_broker::Client, id: &str) -> i32 {
+    match agsh_broker::attach_interactive(client, id) {
+        Ok(agsh_broker::AttachOutcome::Detached) => {
+            eprintln!("agsh: detached — session [{id}] keeps running (`agsh --attach {id}`)");
+            0
+        }
+        Ok(agsh_broker::AttachOutcome::Ended) => {
+            let code = client
+                .status(id)
+                .ok()
+                .and_then(|info| info.exit_code)
+                .unwrap_or(0);
+            eprintln!("agsh: kept session [{id}] ended (code {code})");
+            code
+        }
+        Err(error) => {
+            eprintln!("agsh: attach: {error}");
+            1
+        }
     }
 }
 
@@ -824,6 +980,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CliOptions, String> 
             }
             "--broker-daemon" => options.broker_daemon = true,
             "--broker-launch" => options.broker_launch = true,
+            "--keep" => options.keep_session = true,
+            "--attach" => {
+                // Optional session id: `--attach` or `--attach s1`.
+                let has_id = args.peek().is_some_and(|a| !a.starts_with('-'));
+                let id = if has_id { args.next() } else { None };
+                options.attach = Some(id);
+            }
             "--supervise" => {
                 // Everything after `--supervise` is the command to exec.
                 let mut rest: Vec<String> = args.by_ref().collect();
@@ -858,7 +1021,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CliOptions, String> 
 
 fn print_help() {
     println!(
-        "agsh - Aegis Shell\n\nUSAGE:\n  agsh [--output MODE] [--allow LIST] [--run COMMAND] [--rcfile FILE] [--norc] [-c COMMAND]\n\nSTARTUP:\n  interactive sessions source ~/.config/agsh/agshrc (or ~/.agshrc); --norc skips,\n  --rcfile FILE / $AGSH_RC picks another, $AGSH_NORC=1 disables\n\nINTERCEPTION (route the agent's own shell through agsh; off by default):\n  AGSH_INTERCEPT=compact agsh …   shim bash/sh/… to `agsh --observe` (real shell,\n                                  captured+rendered); nested shells pass through\n    :native  agsh interprets the command    :deep  also catch absolute-path\n    (instead of running the real shell)     /bin/bash + posix_spawn (preload)\n  toggle at runtime: `mode:intercept compact:deep` / `mode:intercept off`\n\nMODES:\n  raw | clean | compact | semantic | lossless-ref | silent | rich\n\nCONFINE (kernel-enforced capability sandbox for a leaf payload):\n  confine read-only -- python x.py  read+run; no writes/network/secret-reads\n  confine workspace -- ./build.sh   writes only within $PWD (+ a scratch dir)\n  confine offline -- npm test       network off; filesystem unchanged\n  confine convert -- ./batch.sh     exec-allowlist: may only exec `convert`\n  confine ls,df                     confine the current agsh session (sticky)\n    --rw PATH  add a writable root    --net/--no-net  toggle network\n    --explain  show capabilities      --dry-run  print profile, don't run\n    --force    run a refused agent    --best-effort  shim layer if no sandbox\n  enforced via sandbox-exec (macOS); Linux Landlock planned, fails closed\n  elsewhere. Self-managing agents (claude, …) are refused — use --allowedTools.\n\nAGSH TOOLS (ag-prefixed where a common CLI shares the name; bare otherwise):\n  agview FILE…   rich render (markdown, code, images)   agz DIR    frecent jump\n  agpatch        structured patch        agtrace/agtrust/agcontext/agmath/agjump\n  confine, peek, risk, snapshot, pty     stay bare (no common CLI conflict)\n  sessions       list/resume Claude & Codex sessions for this folder (sessions N)\n  mode:output M  set the session default output mode\n\nMODE SELECTION (highest priority first):\n  per-command wrapper   semantic git diff\n  --output flag         agsh --output compact -c 'pytest -q'\n  mode builtin          mode:output compact   (session default; `mode` shows all)\n  AGSH_OUTPUT_MODE env  AGSH_OUTPUT_MODE=semantic agsh -c 'cargo test'\n  ~/.config/agsh/token.toml  [mode] default = \"compact\"  (interactive sessions)\n  default               raw\n  (the config/`mode` default makes plain `ls` render like `compact ls`; it applies\n   to interactive sessions only — piped `agsh -c`/scripts stay raw)\n\nRICH RENDERING (human display, TTY only; raw bytes still pipe/redirect):\n  agview FILE...        render by type (markdown, JSON, CSV/TSV, diff, binary)\n  agview main.py        syntax-highlight source code (py, rs, js, ts, go, c, …)\n  agview image.png      show images inline (any terminal; crisp in iTerm2/Kitty)\n  AGSH_OUTPUT_MODE=rich  auto-render recognized command output\n\nTRACE:\n  raw output is captured in capturing modes and addressable via trace://<id>/...\n  trace                 list recent captured commands\n  trace <id>            print a command's raw stdout\n\nEXAMPLES:\n  agsh -c 'echo hello'\n  agsh --output semantic -c 'git status'\n  view README.md\n  semantic git diff"
+        "agsh - Aegis Shell\n\nUSAGE:\n  agsh [--output MODE] [--allow LIST] [--run COMMAND] [--rcfile FILE] [--norc] [-c COMMAND]\n  agsh --keep | --attach [ID]     kept sessions (survive the terminal; below)\n\nKEPT SESSIONS & JOBS (the keep broker):\n  agsh --keep         run this whole session under the per-user broker: closing\n                      the terminal (or losing SSH during standby) only DETACHES it\n  agsh --attach [ID]  reattach a detached session (newest, or by id)\n  keep -- CMD…        keep a single command instead (builtin; `help keep`)\n  Ctrl-]              detach key while attached\n\nSTARTUP:\n  interactive sessions source ~/.config/agsh/agshrc (or ~/.agshrc); --norc skips,\n  --rcfile FILE / $AGSH_RC picks another, $AGSH_NORC=1 disables\n\nINTERCEPTION (route the agent's own shell through agsh; off by default):\n  AGSH_INTERCEPT=compact agsh …   shim bash/sh/… to `agsh --observe` (real shell,\n                                  captured+rendered); nested shells pass through\n    :native  agsh interprets the command    :deep  also catch absolute-path\n    (instead of running the real shell)     /bin/bash + posix_spawn (preload)\n  toggle at runtime: `mode:intercept compact:deep` / `mode:intercept off`\n\nMODES:\n  raw | clean | compact | semantic | lossless-ref | silent | rich\n\nCONFINE (kernel-enforced capability sandbox for a leaf payload):\n  confine read-only -- python x.py  read+run; no writes/network/secret-reads\n  confine workspace -- ./build.sh   writes only within $PWD (+ a scratch dir)\n  confine offline -- npm test       network off; filesystem unchanged\n  confine convert -- ./batch.sh     exec-allowlist: may only exec `convert`\n  confine ls,df                     confine the current agsh session (sticky)\n    --rw PATH  add a writable root    --net/--no-net  toggle network\n    --explain  show capabilities      --dry-run  print profile, don't run\n    --force    run a refused agent    --best-effort  shim layer if no sandbox\n  enforced via sandbox-exec (macOS); Linux Landlock planned, fails closed\n  elsewhere. Self-managing agents (claude, …) are refused — use --allowedTools.\n\nAGSH TOOLS (ag-prefixed where a common CLI shares the name; bare otherwise):\n  agview FILE…   rich render (markdown, code, images)   agz DIR    frecent jump\n  agpatch        structured patch        agtrace/agtrust/agcontext/agmath/agjump\n  confine, peek, risk, snapshot, pty     stay bare (no common CLI conflict)\n  sessions       list/resume Claude & Codex sessions for this folder (sessions N)\n  mode:output M  set the session default output mode\n\nMODE SELECTION (highest priority first):\n  per-command wrapper   semantic git diff\n  --output flag         agsh --output compact -c 'pytest -q'\n  mode builtin          mode:output compact   (session default; `mode` shows all)\n  AGSH_OUTPUT_MODE env  AGSH_OUTPUT_MODE=semantic agsh -c 'cargo test'\n  ~/.config/agsh/token.toml  [mode] default = \"compact\"  (interactive sessions)\n  default               raw\n  (the config/`mode` default makes plain `ls` render like `compact ls`; it applies\n   to interactive sessions only — piped `agsh -c`/scripts stay raw)\n\nRICH RENDERING (human display, TTY only; raw bytes still pipe/redirect):\n  agview FILE...        render by type (markdown, JSON, CSV/TSV, diff, binary)\n  agview main.py        syntax-highlight source code (py, rs, js, ts, go, c, …)\n  agview image.png      show images inline (any terminal; crisp in iTerm2/Kitty)\n  AGSH_OUTPUT_MODE=rich  auto-render recognized command output\n\nTRACE:\n  raw output is captured in capturing modes and addressable via trace://<id>/...\n  trace                 list recent captured commands\n  trace <id>            print a command's raw stdout\n\nEXAMPLES:\n  agsh -c 'echo hello'\n  agsh --output semantic -c 'git status'\n  view README.md\n  semantic git diff"
     );
 }
 

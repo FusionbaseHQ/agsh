@@ -87,10 +87,67 @@ Two security properties hold across restore:
 - **Session identity is never replayed.** `AGSH_SESSION`, `PWD`/`OLDPWD`,
   `SHLVL`, and positional parameters are excluded from journaling and replay.
 
+## The keep broker: processes that survive the terminal
+
+The journal restores *state*. Keeping *processes* alive across terminal death
+is the broker's job: `agshd`, a per-user daemon that owns pseudo-terminals, so
+a kept process's lifetime is tied to the daemon instead of the terminal that
+started it. It is shpool-shaped, deliberately not tmux-shaped: one PTY per
+job, no windows, no panes — just lifetime, logs, and scrollback.
+
+### `keep` — keep one command
+
+```sh
+keep -- npm run dev     # start kept; on a terminal, attach immediately
+keep list               # id, state, age, command (* = attached)
+keep attach k1          # reattach with scrollback replay (Ctrl-] detaches)
+keep tail k1            # last bytes of the output log
+keep kill k1 [SIG]      # signal the job's process group
+keep stop               # stop the broker (hangs up every kept job)
+```
+
+The broker auto-starts on first use. Jobs get a real controlling terminal
+(`setsid` + `TIOCSCTTY` in the safe-Rust supervisor shim, so Ctrl-C works),
+your exported env and cwd, a rotating on-disk output log, and a 64 KiB
+scrollback ring replayed on attach. Detaching — by key or by your terminal
+dying — never kills the job. Agents calling `keep` without a TTY get the id
+and tail/attach hints as a captured observation.
+
+### `agsh --keep` — keep the whole session
+
+```sh
+agsh --keep             # this interactive session now survives the terminal
+agsh --attach [ID]      # reattach a detached session (newest, or by id)
+```
+
+Under `--keep`, the `agsh` you launched is a thin attach client; the real
+session runs under the broker. Closing the window, killing the client, or
+losing SSH during standby only *detaches* — the session keeps its cwd, env,
+running children, everything. Plain interactive startup prints a breadcrumb
+when detached sessions exist. Typing `exit` inside the session ends it for
+real, and the client reports the exit code.
+
+The layers compose: a kept session still journals its state deltas, so even if
+the *broker* dies (reboot), `resume` restores the session's state on the next
+start. Terminal death → broker keeps the process; host death → journal
+restores the state.
+
+### Broker storage & security
+
+Broker state lives in `$AGSH_BROKER_DIR` (else `$XDG_STATE_HOME/agsh/broker`,
+else `~/.local/state/agsh/broker`): a 0700 directory holding the 0600 control
+socket (`agshd.sock` — the ssh-agent model: only the owning user can reach
+it), per-job logs (rotated at 8 MiB, ≤2 generations), and the daemon log.
+Job environments are passed explicitly by the spawning shell, so confinement
+(`AGSH_CONFINE`) propagates into kept jobs like any child. Stopping the broker
+hangs up its jobs (their PTYs close) — that is the documented `keep stop`
+contract, never an accident.
+
 ## Boundaries (what this does not do)
 
-Restore brings back *state*, not *processes*: a foreground process that died
-with its terminal is not resurrected — it is reported, with a real resume path
-when one exists (Claude/Codex today). Keeping processes themselves alive
-across terminal death requires a PTY broker that owns their lifetimes — that
-is the planned next layer, deliberately separate from the journal.
+`resume` replays state, never processes; `keep` preserves processes, never
+retroactively — a command you didn't `keep` (or a session not under `--keep`)
+still dies with its terminal, and the journal's flight recorder + resume
+recipes are the fallback. The broker holds one attached client per job (last
+attach wins), and killing the daemon degrades kept jobs to orphans (alive but
+unreachable) — they are their own sessions, so they keep running.

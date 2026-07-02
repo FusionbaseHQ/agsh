@@ -33,6 +33,10 @@ confine ls,df -- ./monitor.sh                # kernel-confined to ls + df (macOS
 - **Rich `agview`** — markdown, JSON, CSV/TSV, diffs, **inline images** (iTerm2/Kitty
   protocols with a universal truecolor half-block fallback), and **syntax
   highlighting** for a dozen languages.
+- **Sessions that survive the terminal** — `agsh --keep` runs your session under
+  a per-user PTY broker: closing the window or losing SSH during standby only
+  *detaches* it, and `agsh --attach` resumes it exactly where it was. `keep --
+  CMD` does the same for a single command (dev server, agent). No tmux required.
 - **Crash-safe sessions** — interactive sessions journal their state deltas as
   they happen; after a crash, closed terminal, or reboot, `resume` replays cwd,
   exports, aliases, functions, and options onto a new shell — and tells you what
@@ -194,11 +198,31 @@ Restore replays state deltas — it never re-runs commands. If an agent
 resume path (`sessions`); surviving background jobs are rediscovered with a
 pid-reuse-safe liveness check. See [docs/SESSIONS.md](docs/SESSIONS.md).
 
+### `keep` — processes that survive the terminal
+
+The `agshd` broker (auto-started, per user) owns pseudo-terminals, so kept
+processes belong to it — not to the window you happened to start them in:
+
+```sh
+keep -- npm run dev   # kept job: close the terminal, it keeps running
+keep list             # id, state, age, command
+keep attach k1        # reattach with scrollback replay (Ctrl-] detaches)
+
+agsh --keep           # keep the WHOLE session: terminal death only detaches
+agsh --attach         # ...and this resumes it, exactly where it was
+```
+
+One PTY per job, output journaled, real controlling terminal (Ctrl-C works) —
+lifetime and scrollback without tmux's windows/panes/prefix-key world. Kept
+sessions still journal their state, so even a reboot degrades gracefully to
+`resume`. See [docs/SESSIONS.md](docs/SESSIONS.md).
+
 ## Repository layout
 
 ```text
 crates/
   agsh/          CLI binary and interactive shell entry point
+  agsh-broker/   keep broker: PTY-owning daemon, protocol, attach client
   agsh-core/     lexer, parser, command graph IR, values, shell errors
   agsh-exec/     shell state, builtins, executor, expansion, confine
   agsh-policy/   capabilities, risk analyzer, command allowlist
@@ -220,7 +244,7 @@ tests/           golden checks, differential (vs bash/sh), interactive (PTY)
 - [Architecture](docs/ARCHITECTURE.md) — crates, execution pipeline, design contract
 - [`confine` sandbox](docs/CONFINE.md) — capability sandbox, presets, guarantees
 - [Configuration](docs/CONFIGURATION.md) — output modes, config files, environment
-- [Session resilience](docs/SESSIONS.md) — crash-safe journaling, `resume`, wake detection
+- [Session resilience](docs/SESSIONS.md) — crash-safe journaling, `resume`, the keep broker, wake detection
 
 ## Development
 

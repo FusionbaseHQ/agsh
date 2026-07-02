@@ -516,10 +516,79 @@ def scenario_keep_attach_detach():
         shutil.rmtree(s.broker_dir, ignore_errors=True)
 
 
+def scenario_keep_full_session_survives_client_death():
+    # Phase 3: `agsh --keep` runs the whole session under the broker. Killing
+    # the attach client with SIGKILL (what terminal death looks like) leaves
+    # the inner session alive with all its state; `agsh --attach` from a new
+    # terminal resumes it exactly where it was.
+    import signal
+    import tempfile
+
+    import time
+
+    def wait_for(session, needle, timeout=6.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if needle in session.screen():
+                return True
+            session.drain(0.2)
+        return needle in session.screen()
+
+    broker_dir = tempfile.mkdtemp(prefix="agsh-pty-fullsess-")
+    session_dir = None
+    try:
+        s = Session(args=["--norc", "--keep"], broker_dir=broker_dir)
+        session_dir = s.session_dir
+        try:
+            s.drain(0.8)  # broker autostart + inner session spawn + attach
+            s.send("export SURVIVE_PROBE=through-death" + ENTER, 0.6)
+            s.send("cd /tmp" + ENTER, 0.5)
+            check("kept session is live", "SURVIVE_PROBE" in s.screen(), s.screen())
+            # Terminal death: SIGKILL the CLIENT. No detach key, no cleanup.
+            os.kill(s.pid, signal.SIGKILL)
+            os.waitpid(s.pid, 0)
+        finally:
+            try:
+                os.close(s.fd)
+            except OSError:
+                pass
+
+        s2 = Session(args=["--norc", "--attach"], broker_dir=broker_dir)
+        try:
+            s2.drain(0.8)
+            s2.send("echo probe=$SURVIVE_PROBE in $PWD" + ENTER, 0.8)
+            ok = wait_for(s2, "probe=through-death")
+            scr = s2.screen()
+            check(
+                "session state survived client death",
+                ok and "/tmp" in scr,
+                scr,
+            )
+            # `exit` inside the kept session ends it; the client reports that.
+            s2.send("exit" + ENTER, 1.0)
+            check("session end reported", wait_for(s2, "ended"), s2.screen())
+        finally:
+            s2._owns_broker_dir = False
+            s2.close()
+
+        # Stop the broker from a plain shell sharing the broker dir.
+        s3 = Session(broker_dir=broker_dir)
+        try:
+            s3.send("keep stop" + ENTER, 0.6)
+        finally:
+            s3._owns_broker_dir = True
+            s3.close()
+    finally:
+        shutil.rmtree(broker_dir, ignore_errors=True)
+        if session_dir:
+            shutil.rmtree(session_dir, ignore_errors=True)
+
+
 SCENARIOS = [
     scenario_terminal_restore_on_signal,
     scenario_session_resume_after_kill,
     scenario_keep_attach_detach,
+    scenario_keep_full_session_survives_client_death,
     scenario_clear_passes_through_in_compact_mode,
     scenario_mode_intercept_toggle,
     scenario_rc_autoload,
