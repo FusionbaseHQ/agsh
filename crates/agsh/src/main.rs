@@ -252,13 +252,19 @@ fn main() {
     let mut session_recorder = None;
     if std::io::stdin().is_terminal() {
         source_rc(&mut executor, &mut state, &options, &exec_options);
-        // Restore the terminal on SIGTERM/SIGHUP so a kill at the raw-mode prompt
-        // doesn't leave the tty non-canonical (SHIP_READINESS_PLAN P0-10).
-        agsh_tty::arm_terminal_restore_on_signals();
         // Journal this session's state deltas (crash-safe restore via `resume`).
         // Begun after the rc file, so only state typed into THIS session is
         // journaled — rc state is recreated by the rc file on the next start.
         session_recorder = agsh_exec::journal::SessionRecorder::begin(&mut state);
+        // Restore the terminal on SIGTERM/SIGHUP so a kill at the raw-mode prompt
+        // doesn't leave the tty non-canonical (SHIP_READINESS_PLAN P0-10); with a
+        // journal, also record *why* the session died (`hup` on terminal close).
+        match &session_recorder {
+            Some(recorder) => {
+                agsh_tty::arm_terminal_restore_on_signals_with(recorder.hangup_hook());
+            }
+            None => agsh_tty::arm_terminal_restore_on_signals(),
+        }
         if session_recorder.is_some() {
             if let Some(banner) = agsh_exec::journal::restore_banner(&state) {
                 eprintln!("{banner}");

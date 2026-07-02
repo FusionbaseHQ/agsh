@@ -1100,6 +1100,22 @@ impl ShellState {
         self.interrupt.store(false, Ordering::Relaxed);
     }
 
+    /// Live background jobs as `(pgid, command)`, for the session journal's
+    /// flight recorder (running or stopped; done-but-unreaped jobs excluded).
+    pub fn running_jobs_snapshot(&self) -> Vec<(i32, String)> {
+        self.jobs
+            .lock()
+            .map(|table| {
+                table
+                    .jobs
+                    .iter()
+                    .filter(|job| matches!(job.state, JobState::Running | JobState::Stopped))
+                    .map(|job| (job.pgid, job.command.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn has_running_jobs(&self) -> bool {
         self.jobs
             .lock()

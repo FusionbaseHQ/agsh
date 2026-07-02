@@ -1717,6 +1717,7 @@ fn resume_restores_a_dead_sessions_state_and_consumes_the_journal() {
             "{{\"e\":\"cwd\",\"path\":\"{workdir}\"}}\n",
             "{{\"e\":\"env\",\"k\":\"API_URL\",\"v\":\"http://localhost:9\"}}\n",
             "{{\"e\":\"alias\",\"k\":\"gs\",\"v\":\"git status\"}}\n",
+            "{{\"e\":\"job\",\"pgid\":99999998,\"cmd\":\"npm run dev &\",\"at\":2}}\n",
             "{{\"e\":\"fg\",\"cmd\":\"claude\",\"at\":2}}\n",
         ),
         workdir = workdir.display()
@@ -1749,6 +1750,10 @@ fn resume_restores_a_dead_sessions_state_and_consumes_the_journal() {
     assert!(
         stdout.contains("claude") && stdout.contains("sessions"),
         "agent resume hint missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("npm run dev") && stdout.contains("died"),
+        "dead background job not reported: {stdout}"
     );
 
     // The journal is consumed: a second resume finds nothing.

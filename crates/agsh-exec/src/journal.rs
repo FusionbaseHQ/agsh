@@ -91,6 +91,8 @@ struct StateSnapshot {
     abbrs: BTreeMap<String, String>,
     funcs: BTreeMap<String, String>,
     opts: BTreeMap<String, bool>,
+    /// Live background jobs (pgid → command), for `job`/`job_end` records.
+    jobs: BTreeMap<i32, String>,
 }
 
 impl StateSnapshot {
@@ -107,6 +109,7 @@ impl StateSnapshot {
                 .map(|(name, f)| (name.clone(), f.body.clone()))
                 .collect(),
             opts: option_states(state),
+            jobs: state.running_jobs_snapshot().into_iter().collect(),
         }
     }
 }
@@ -160,6 +163,18 @@ impl SessionRecorder {
         self.journal.clone()
     }
 
+    /// A callback for the terminal-restore signal thread: journals a `hup`
+    /// record when the terminal hangs up (SIGHUP), so the restore banner can
+    /// say *why* the session died. Owns its own journal handle (`Send`).
+    pub fn hangup_hook(&self) -> Box<dyn Fn(i32) + Send> {
+        let journal = self.journal.clone();
+        Box::new(move |signal| {
+            if signal == signal_hook::consts::SIGHUP {
+                journal.append(&SessionEvent::Hup { at: unix_now() });
+            }
+        })
+    }
+
     /// Flight recorder: the foreground command line is starting.
     pub fn command_started(&self, line: &str) {
         self.journal.append(&SessionEvent::Fg {
@@ -191,8 +206,8 @@ impl SessionRecorder {
     }
 }
 
-/// The delta events that turn `old` into `new`. Pure — unit-testable without a
-/// filesystem.
+/// The delta events that turn `old` into `new`. No I/O — unit-testable without
+/// a filesystem.
 fn diff_snapshots(old: &StateSnapshot, new: &StateSnapshot) -> Vec<SessionEvent> {
     let mut events = Vec::new();
 
@@ -276,6 +291,22 @@ fn diff_snapshots(old: &StateSnapshot, new: &StateSnapshot) -> Vec<SessionEvent>
         }
     }
 
+    // Background jobs: registered → `job`, reaped/gone → `job_end`.
+    for (pgid, cmd) in &new.jobs {
+        if !old.jobs.contains_key(pgid) {
+            events.push(SessionEvent::Job {
+                pgid: *pgid,
+                cmd: cmd.clone(),
+                at: unix_now(),
+            });
+        }
+    }
+    for pgid in old.jobs.keys() {
+        if !new.jobs.contains_key(pgid) {
+            events.push(SessionEvent::JobEnd { pgid: *pgid });
+        }
+    }
+
     events
 }
 
@@ -326,6 +357,53 @@ fn pid_alive(pid: u32) -> bool {
         Ok(()) => true,
         Err(errno) => errno == rustix::io::Errno::PERM,
     }
+}
+
+/// Whether a job recorded at `registered_at` is still the same live process:
+/// the pid must exist AND its observed start time must match the recorded
+/// registration time. The second check guards against pid reuse — after a
+/// reboot or a long gap, a recycled pid must not masquerade as the old job.
+fn job_still_alive(pgid: i32, registered_at: u64) -> bool {
+    if pgid <= 0 || !pid_alive(pgid as u32) {
+        return false;
+    }
+    match process_start_unix(pgid as u32) {
+        // `ps` etime has ~1s resolution and the job was registered a moment
+        // after the process spawned; a recycled pid would differ by far more.
+        Some(started) => started.abs_diff(registered_at) <= 120,
+        None => false,
+    }
+}
+
+/// A process's start time (unix seconds), derived from `ps -o etime=`
+/// (elapsed time; POSIX, same format on macOS and Linux — locale-proof,
+/// unlike `lstart`).
+fn process_start_unix(pid: u32) -> Option<u64> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "etime=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let etime = String::from_utf8_lossy(&out.stdout);
+    let elapsed = parse_etime(etime.trim())?;
+    Some(unix_now().saturating_sub(elapsed))
+}
+
+/// Parse `ps` elapsed time — `[[dd-]hh:]mm:ss` — into seconds.
+fn parse_etime(s: &str) -> Option<u64> {
+    let (days, rest) = match s.split_once('-') {
+        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
+        None => (0, s),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (h, m, sec): (u64, u64, u64) = match parts.as_slice() {
+        [h, m, s] => (h.parse().ok()?, m.parse().ok()?, s.parse().ok()?),
+        [m, s] => (0, m.parse().ok()?, s.parse().ok()?),
+        _ => return None,
+    };
+    Some(days * 86_400 + h * 3_600 + m * 60 + sec)
 }
 
 /// Replay a dead session's folded deltas onto the live shell. Returns human
@@ -533,11 +611,21 @@ pub fn restore_banner(state: &ShellState) -> Option<String> {
         what.push(format!("`{}` was running", truncate(&fg.cmd, 40)));
     }
     if !s.jobs.is_empty() {
-        what.push(format!(
-            "{} background job{}",
-            s.jobs.len(),
-            if s.jobs.len() == 1 { "" } else { "s" }
-        ));
+        let alive = s
+            .jobs
+            .iter()
+            .filter(|j| job_still_alive(j.pgid, j.started_at))
+            .count();
+        what.push(match (alive, s.jobs.len()) {
+            (0, n) => format!("{n} background job{} lost", if n == 1 { "" } else { "s" }),
+            (a, n) if a == n => {
+                format!(
+                    "{a} background job{} still running",
+                    if a == 1 { "" } else { "s" }
+                )
+            }
+            (a, n) => format!("{a}/{n} background jobs still running"),
+        });
     }
     let why = if s.hangup {
         "hung up"
@@ -657,11 +745,19 @@ pub fn builtin_resume(args: &[String], state: &mut ShellState) -> CommandOutcome
         ));
     }
     for job in &info.session.jobs {
-        out.push_str(&format!(
-            "  background job `{}` (pgid {}) was running when the session died\n",
-            truncate(&job.cmd, 60),
-            job.pgid,
-        ));
+        if job_still_alive(job.pgid, job.started_at) {
+            out.push_str(&format!(
+                "  background job `{}` SURVIVED (pgid {}) — signal it with `kill -- -{}`\n",
+                truncate(&job.cmd, 60),
+                job.pgid,
+                job.pgid,
+            ));
+        } else {
+            out.push_str(&format!(
+                "  background job `{}` was running when the session died\n",
+                truncate(&job.cmd, 60),
+            ));
+        }
     }
     CommandOutcome::captured(0, out.into_bytes(), Vec::new())
 }
@@ -878,5 +974,78 @@ mod tests {
         for k in ["FOO", "PATH", "count", "A1"] {
             assert!(!skip_key(k), "{k} must be journaled");
         }
+    }
+
+    #[test]
+    fn background_jobs_are_journaled_and_closed() {
+        let dir = temp_dir("jobs");
+        let mut state = ShellState::from_current_process();
+        let mut recorder = SessionRecorder::begin_in(&dir, &mut state);
+
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i32;
+        state.register_job(child, "sleep 30 &");
+        recorder.command_finished(&state, 0);
+
+        let folded = fold_session(&read_journal(recorder.journal_handle().path()));
+        assert_eq!(folded.jobs.len(), 1, "job journaled: {folded:?}");
+        assert_eq!(folded.jobs[0].pgid, pid);
+        assert_eq!(folded.jobs[0].cmd, "sleep 30 &");
+
+        // Kill + reap: the next boundary closes the job record.
+        let _ = rustix::process::kill_process(
+            rustix::process::Pid::from_raw(pid).unwrap(),
+            rustix::process::Signal::KILL,
+        );
+        // try_wait needs the child to be reapable; give the kernel a moment.
+        for _ in 0..50 {
+            if !state.reap_finished_jobs().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        recorder.command_finished(&state, 0);
+        let folded = fold_session(&read_journal(recorder.journal_handle().path()));
+        assert!(folded.jobs.is_empty(), "job_end journaled: {folded:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn job_liveness_guards_against_pid_reuse() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i32;
+        let now = unix_now();
+        assert!(
+            job_still_alive(pid, now),
+            "live process registered now must count as alive"
+        );
+        assert!(
+            !job_still_alive(pid, now - 10_000),
+            "same pid with a far-off registration time is a recycled pid, not our job"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!job_still_alive(pid, now), "dead process is dead");
+        assert!(!job_still_alive(99_999_999, now), "nonexistent pid");
+        assert!(!job_still_alive(0, now), "pgid 0 is never a job");
+    }
+
+    #[test]
+    fn etime_parses_all_ps_forms() {
+        assert_eq!(parse_etime("00:05"), Some(5));
+        assert_eq!(parse_etime("12:34"), Some(12 * 60 + 34));
+        assert_eq!(parse_etime("01:02:03"), Some(3600 + 2 * 60 + 3));
+        assert_eq!(
+            parse_etime("2-01:02:03"),
+            Some(2 * 86_400 + 3600 + 2 * 60 + 3)
+        );
+        assert_eq!(parse_etime(""), None);
+        assert_eq!(parse_etime("garbage"), None);
     }
 }

@@ -81,6 +81,15 @@ impl Drop for RawGuard {
 /// sound. After restoring we re-raise the signal's default disposition so the
 /// process still terminates as it normally would.
 pub fn arm_terminal_restore_on_signals() {
+    arm_terminal_restore_on_signals_with(Box::new(|_| {}));
+}
+
+/// Like [`arm_terminal_restore_on_signals`], with a callback run (on the
+/// handler thread, after the terminal restore, before the re-raise) so the
+/// shell can journal the death — e.g. record a SIGHUP when the terminal
+/// closes. Runs on a normal thread, so the callback may allocate and do I/O;
+/// it must be quick, since the process is about to die.
+pub fn arm_terminal_restore_on_signals_with(on_signal: Box<dyn Fn(i32) + Send>) {
     if SIGNAL_RESTORE_ARMED.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -99,6 +108,7 @@ pub fn arm_terminal_restore_on_signals() {
                     let _ = tcsetattr(io::stdin(), OptionalActions::Now, termios);
                 }
             }
+            on_signal(signal);
             // Terminate as if the signal had been unhandled.
             let _ = signal_hook::low_level::emulate_default_handler(signal);
         }

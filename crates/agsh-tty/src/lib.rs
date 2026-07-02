@@ -9,5 +9,5 @@ pub mod readline;
 pub mod render;
 
 pub use prompt::render_prompt;
-pub use raw::arm_terminal_restore_on_signals;
+pub use raw::{arm_terminal_restore_on_signals, arm_terminal_restore_on_signals_with};
 pub use readline::read_line;
