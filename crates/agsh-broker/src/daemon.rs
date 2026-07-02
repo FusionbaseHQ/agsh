@@ -211,6 +211,11 @@ impl Broker {
         }
         let controller = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)
             .map_err(|e| std::io::Error::other(format!("openpt: {e}")))?;
+        // CLOEXEC, or the controller leaks into every job we spawn — a job
+        // holding its own PTY controller can never be hung up by our exit
+        // (rustix, unlike std, does not set it automatically).
+        rustix::io::fcntl_setfd(&controller, rustix::io::FdFlags::CLOEXEC)
+            .map_err(|e| std::io::Error::other(format!("cloexec: {e}")))?;
         grantpt(&controller).map_err(|e| std::io::Error::other(format!("grantpt: {e}")))?;
         unlockpt(&controller).map_err(|e| std::io::Error::other(format!("unlockpt: {e}")))?;
         let size = rustix::termios::Winsize {
@@ -222,9 +227,11 @@ impl Broker {
         let _ = rustix::termios::tcsetwinsize(&controller, size);
         let peripheral_name = ptsname(&controller, Vec::new())
             .map_err(|e| std::io::Error::other(format!("ptsname: {e}")))?;
+        // CLOEXEC here too: Stdio::from dup2s it onto the job's 0/1/2 (dup2
+        // clears the flag), so the job gets stdio without leaking this fd.
         let peripheral = rustix::fs::open(
             &peripheral_name,
-            OFlags::RDWR | OFlags::NOCTTY,
+            OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(|e| std::io::Error::other(format!("open pts: {e}")))?;

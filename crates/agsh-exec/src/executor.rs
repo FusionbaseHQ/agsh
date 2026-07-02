@@ -4933,12 +4933,16 @@ fn run_under_pty(
     }
     let controller =
         openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).map_err(|e| pty_err("openpt", e))?;
+    // CLOEXEC, or the controller fd leaks into the child (rustix, unlike std,
+    // does not set it) — a child holding its own PTY controller never EOFs it.
+    rustix::io::fcntl_setfd(&controller, rustix::io::FdFlags::CLOEXEC)
+        .map_err(|e| pty_err("cloexec", e))?;
     grantpt(&controller).map_err(|e| pty_err("grantpt", e))?;
     unlockpt(&controller).map_err(|e| pty_err("unlockpt", e))?;
     let peripheral_name = ptsname(&controller, Vec::new()).map_err(|e| pty_err("ptsname", e))?;
     let peripheral = rustix::fs::open(
         &peripheral_name,
-        OFlags::RDWR | OFlags::NOCTTY,
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|e| pty_err("open pts", e))?;
