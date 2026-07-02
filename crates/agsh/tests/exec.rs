@@ -661,6 +661,30 @@ fn confine_readonly_scrubs_credential_env() {
     );
 }
 
+/// A `python3` that actually runs **under `sandbox-exec`** in this environment,
+/// or `None` to skip. Homebrew's framework `python3` (common on CI macOS runners)
+/// re-execs its inner interpreter and fails to `posix_spawn` it under Seatbelt, so
+/// a bare `python3 --version` check is not enough. Probe under the *exec-allowlist*
+/// mode (the strictest — a re-execing interpreter can't even start there), so the
+/// interpreter we return is guaranteed usable by every confine test; prefer the
+/// non-framework system python.
+#[cfg(target_os = "macos")]
+fn sandbox_capable_python() -> Option<&'static str> {
+    if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
+        return None;
+    }
+    for py in ["/usr/bin/python3", "python3"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+            .args(["-c", &format!("confine ls -- {py} -c 'print(\"ok\")'")])
+            .env_remove("AGSH_CONFINE")
+            .output();
+        if matches!(out, Ok(ref o) if String::from_utf8_lossy(&o.stdout).contains("ok")) {
+            return Some(py);
+        }
+    }
+    None
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn confine_leaf_payload_kernel_enforced() {
@@ -687,13 +711,17 @@ fn confine_leaf_payload_kernel_enforced() {
         "du not denied: {se:?}"
     );
 
-    // Denied via absolute /bin/bash and via python's os.system; no output leak.
-    for payload in [
-        "confine ls -- /bin/bash -c 'du -sh /tmp'",
-        "confine ls -- python3 -c 'import os; os.system(\"du -sh /tmp\")'",
-    ] {
+    // Denied via absolute /bin/bash always, and via python's os.system wherever a
+    // sandbox-capable python exists; no output leak either way.
+    let mut payloads = vec!["confine ls -- /bin/bash -c 'du -sh /tmp'".to_string()];
+    if let Some(py) = sandbox_capable_python() {
+        payloads.push(format!(
+            "confine ls -- {py} -c 'import os; os.system(\"du -sh /tmp\")'"
+        ));
+    }
+    for payload in payloads {
         let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
-            .args(["-c", payload])
+            .args(["-c", &payload])
             .env_remove("AGSH_CONFINE")
             .output()
             .expect("run agsh");
@@ -714,11 +742,11 @@ fn confine_leaf_payload_kernel_enforced() {
 fn confine_leaf_payload_quoting_preserved() {
     // The payload's argv (incl. quoted args like `python3 -c '…'`) must survive
     // the sh -c wrapper: the script runs, only its child command is denied.
-    if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
+    let Some(py) = sandbox_capable_python() else {
         return;
-    }
+    };
     let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
-        .args(["-c", "confine ls -- python3 -c 'print(\"py-ran\")'"])
+        .args(["-c", &format!("confine ls -- {py} -c 'print(\"py-ran\")'")])
         .env_remove("AGSH_CONFINE")
         .output()
         .expect("run agsh");
@@ -873,16 +901,9 @@ fn view_of_binary_is_raw_when_not_a_tty() {
 #[cfg(target_os = "macos")]
 #[test]
 fn confine_read_only_blocks_write_delete_network_secrets() {
-    if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
-        return;
-    }
-    if std::process::Command::new("python3")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        return; // no python3 to drive the payload
-    }
+    let Some(py) = sandbox_capable_python() else {
+        return; // no interpreter that runs under the sandbox here
+    };
     let dir = std::env::temp_dir().join(format!("agsh_cv2_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let victim = dir.join("victim.txt");
@@ -898,7 +919,7 @@ fn confine_read_only_blocks_write_delete_network_secrets() {
 
     // os.remove (direct unlink) must be denied — the v1 gap, now closed.
     let _ = run(&format!(
-        "confine read-only -- python3 -c 'import os; os.remove(\"{}\")'",
+        "confine read-only -- {py} -c 'import os; os.remove(\"{}\")'",
         victim.display()
     ));
     assert!(victim.exists(), "read-only failed to block os.remove");
@@ -906,7 +927,7 @@ fn confine_read_only_blocks_write_delete_network_secrets() {
     // A write outside scratch is denied.
     let outside = dir.join("new.txt");
     let _ = run(&format!(
-        "confine read-only -- python3 -c 'open(\"{}\",\"w\").write(\"x\")'",
+        "confine read-only -- {py} -c 'open(\"{}\",\"w\").write(\"x\")'",
         outside.display()
     ));
     assert!(
@@ -915,7 +936,7 @@ fn confine_read_only_blocks_write_delete_network_secrets() {
     );
 
     // Scratch (TMPDIR) IS writable, so tools that need temp still work.
-    let ok = run("confine read-only -- python3 -c 'import os; p=os.path.join(os.environ[\"TMPDIR\"],\"s\"); open(p,\"w\").write(\"1\"); print(\"SCRATCH_OK\")'");
+    let ok = run(&format!("confine read-only -- {py} -c 'import os; p=os.path.join(os.environ[\"TMPDIR\"],\"s\"); open(p,\"w\").write(\"1\"); print(\"SCRATCH_OK\")'"));
     assert!(
         String::from_utf8_lossy(&ok.stdout).contains("SCRATCH_OK"),
         "scratch should be writable: {}",
@@ -923,7 +944,7 @@ fn confine_read_only_blocks_write_delete_network_secrets() {
     );
 
     // Network is denied.
-    let net = run("confine read-only -- python3 -c 'import socket; socket.create_connection((\"1.1.1.1\",80),2); print(\"CONNECTED\")'");
+    let net = run(&format!("confine read-only -- {py} -c 'import socket; socket.create_connection((\"1.1.1.1\",80),2); print(\"CONNECTED\")'"));
     assert!(
         !String::from_utf8_lossy(&net.stdout).contains("CONNECTED"),
         "read-only failed to block network"
