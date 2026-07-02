@@ -9,6 +9,7 @@ Exit:   0 if all checks pass, else 1. Requires a working PTY (skips with code 0
 """
 import json
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -373,7 +374,55 @@ def scenario_rc_autoload():
         os.remove(rc)
 
 
+def scenario_terminal_restore_on_signal():
+    # SHIP_READINESS_PLAN P0-10: a SIGTERM/SIGHUP at the raw-mode prompt must
+    # restore the terminal (canonical + echo) before the shell dies, so the tty
+    # isn't left broken (needing `reset`). Driven directly (not via Session)
+    # because we inspect the pty's termios and send signals.
+    import pty
+    import signal
+    import termios
+    import time
+    from pty_helper import AGSH
+
+    icanon, echo = termios.ICANON, termios.ECHO
+    for sig, name in [(signal.SIGTERM, "SIGTERM"), (signal.SIGHUP, "SIGHUP")]:
+        master, slave = pty.openpty()
+        base = termios.tcgetattr(slave)[3]
+        p = subprocess.Popen(
+            [AGSH, "--norc"],
+            stdin=slave, stdout=slave, stderr=slave,
+            start_new_session=True,
+            env={**os.environ, "TERM": "xterm"},
+        )
+        # Wait until agsh enters raw mode (ICANON+ECHO cleared on the tty).
+        entered = False
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            lf = termios.tcgetattr(slave)[3]
+            if not (lf & icanon) and not (lf & echo):
+                entered = True
+                break
+            time.sleep(0.05)
+        check(f"{name}: reached raw-mode prompt", entered,
+              f"base={base:#x} lflag={termios.tcgetattr(slave)[3]:#x}")
+        p.send_signal(sig)
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            check(f"{name}: shell exited on signal", False, "timed out")
+            os.close(master); os.close(slave)
+            continue
+        lf = termios.tcgetattr(slave)[3]
+        os.close(master)
+        os.close(slave)
+        check(f"{name}: terminal restored (canonical+echo)",
+              bool(lf & icanon) and bool(lf & echo), f"lflag={lf:#x}")
+
+
 SCENARIOS = [
+    scenario_terminal_restore_on_signal,
     scenario_clear_passes_through_in_compact_mode,
     scenario_mode_intercept_toggle,
     scenario_rc_autoload,

@@ -251,6 +251,9 @@ fn main() {
     // the differential tests are never affected.
     if std::io::stdin().is_terminal() {
         source_rc(&mut executor, &mut state, &options, &exec_options);
+        // Restore the terminal on SIGTERM/SIGHUP so a kill at the raw-mode prompt
+        // doesn't leave the tty non-canonical (SHIP_READINESS_PLAN P0-10).
+        agsh_tty::arm_terminal_restore_on_signals();
     }
 
     let integrate = std::io::stdout().is_terminal();

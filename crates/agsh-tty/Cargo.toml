@@ -10,6 +10,7 @@ agsh-exec = { path = "../agsh-exec" }
 agsh-index = { path = "../agsh-index" }
 agsh-style = { version = "0.1.0", path = "../agsh-style" }
 rustix = { version = "1.1.4", features = ["termios", "event"] }
+signal-hook = "0.4.4"
 
 [lints]
 workspace = true
