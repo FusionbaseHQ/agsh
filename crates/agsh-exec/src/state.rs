@@ -213,6 +213,12 @@ impl StreamingStdout {
         writer.write_all(bytes)?;
         writer.flush()
     }
+
+    /// A dup of the underlying pipe writer, for handing a child process's stdout
+    /// straight to the downstream pipe.
+    fn try_clone_writer(&self) -> Option<io::PipeWriter> {
+        self.writer.lock().ok()?.try_clone().ok()
+    }
 }
 
 impl fmt::Debug for StreamingStdout {
@@ -248,6 +254,9 @@ pub struct ShellState {
     completion_specs: BTreeMap<String, Vec<String>>,
     should_exit: bool,
     return_request: Option<i32>,
+    /// Set when a streaming pipeline stage writes to a downstream pipe that has
+    /// closed (`… | head`); the producing loop/list then stops (SIGPIPE-like).
+    stream_pipe_closed: bool,
     source_depth: usize,
     /// Nesting depth of graph execution (functions, `$( )`, `<( )`, subshells,
     /// brace groups, `eval`, `source`). Bounds runaway recursion before it can
@@ -380,6 +389,7 @@ impl ShellState {
             completion_specs: BTreeMap::new(),
             should_exit: false,
             return_request: None,
+            stream_pipe_closed: false,
             source_depth: 0,
             exec_depth: 0,
             local_scopes: Vec::new(),
@@ -800,6 +810,16 @@ impl ShellState {
         self.should_exit
     }
 
+    /// True once a streaming pipeline stage hit a closed downstream pipe, so the
+    /// producing loop/list should stop iterating (SIGPIPE-like early exit).
+    pub(crate) fn stream_pipe_closed(&self) -> bool {
+        self.stream_pipe_closed
+    }
+
+    pub(crate) fn set_stream_pipe_closed(&mut self) {
+        self.stream_pipe_closed = true;
+    }
+
     pub fn request_exit(&mut self) {
         self.should_exit = true;
     }
@@ -988,6 +1008,14 @@ impl ShellState {
 
     pub(crate) fn streaming_stdout_is_none(&self) -> bool {
         self.streaming_stdout.is_none()
+    }
+
+    /// A clone of the downstream pipe writer when this scope streams stdout to a
+    /// pipeline consumer, so a leaf external can write straight to the pipe
+    /// (backpressure + SIGPIPE on early close) instead of being captured. `None`
+    /// outside a streaming pipeline stage.
+    pub(crate) fn streaming_stdout_writer(&self) -> Option<io::PipeWriter> {
+        self.streaming_stdout.as_ref()?.try_clone_writer()
     }
 
     /// Register a backgrounded child process and return its job id.

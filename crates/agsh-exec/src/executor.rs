@@ -330,6 +330,13 @@ impl Executor {
             .unwrap_or(&graph.pipeline);
 
         let mut outcome = run_pipeline_item(graph, pipeline, state, options)?;
+        // Stream this command's stdout to a downstream pipe if one is active (a
+        // pipeline stage). Without this, a single-command loop body (`while true;
+        // do echo x; done | head`) would accumulate its output and flush only at
+        // stage end — never streaming — so an early-exiting consumer couldn't stop
+        // an infinite producer. Multi-command lists already emit per command in
+        // run_command_list. No-op when not streaming. (P0-8)
+        emit_streaming_stdout(state, &mut outcome)?;
         if options.output_mode.should_capture() && outcome.observation.is_none() {
             state.record_trace(
                 &graph.id,
@@ -461,6 +468,7 @@ fn run_command_list(
             || state.loop_control_requested()
             || state.return_requested()
             || state.interrupted()
+            || state.stream_pipe_closed()
         {
             break;
         }
@@ -612,7 +620,15 @@ fn emit_streaming_stdout(
     }
 
     if let Some(result) = state.write_shell_stdout(&outcome.stdout) {
-        result?;
+        match result {
+            Ok(()) => {}
+            // Downstream pipe closed (`… | head`): flag it so an enclosing
+            // loop/list stops producing (SIGPIPE-like), rather than erroring.
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                state.set_stream_pipe_closed();
+            }
+            Err(error) => return Err(error.into()),
+        }
         outcome.stdout.clear();
     }
 
@@ -632,8 +648,10 @@ fn run_pipeline_item(
         Ok(outcome) => Ok(outcome),
         // A write to a downstream pipe that closed early (`… | head`, `… | grep -q`)
         // is a normal SIGPIPE, not an error: bash exits the producer silently. Emit
-        // nothing and let the pipeline's own exit status stand.
+        // nothing, and flag the closed pipe so an enclosing loop/list stops
+        // producing (P0-8) instead of iterating against a dead consumer.
         Err(error) if error.kind == ShellErrorKind::BrokenPipe => {
+            state.set_stream_pipe_closed();
             Ok(CommandOutcome::captured(0, Vec::new(), Vec::new()))
         }
         Err(error) if error.kind == ShellErrorKind::Io => Ok(CommandOutcome::captured(
@@ -1960,7 +1978,11 @@ fn run_while_invocation_inner(
         let mut condition = run_command_source(&while_block.condition, state, &nested_options)?;
         final_outcome.stdout.append(&mut condition.stdout);
         final_outcome.stderr.append(&mut condition.stderr);
-        if state.should_exit() || state.return_requested() || state.interrupted() {
+        if state.should_exit()
+            || state.return_requested()
+            || state.interrupted()
+            || state.stream_pipe_closed()
+        {
             final_outcome.exit_code = condition.exit_code;
             break;
         }
@@ -1989,6 +2011,7 @@ fn run_while_invocation_inner(
         if state.should_exit()
             || state.return_requested()
             || state.interrupted()
+            || state.stream_pipe_closed()
             || (state.errexit() && body.exit_code != 0)
         {
             break;
@@ -2060,6 +2083,7 @@ fn run_for_invocation_inner(
             if state.should_exit()
                 || state.return_requested()
                 || state.interrupted()
+                || state.stream_pipe_closed()
                 || (state.errexit() && body.exit_code != 0)
             {
                 break;
@@ -2090,6 +2114,7 @@ fn run_for_invocation_inner(
         if state.should_exit()
             || state.return_requested()
             || state.interrupted()
+            || state.stream_pipe_closed()
             || (state.errexit() && body.exit_code != 0)
         {
             break;
@@ -2172,6 +2197,7 @@ fn run_select_invocation_inner(
         if state.should_exit()
             || state.return_requested()
             || state.interrupted()
+            || state.stream_pipe_closed()
             || (state.errexit() && body.exit_code != 0)
         {
             break;
@@ -3844,6 +3870,7 @@ fn run_shell_source(
             || state.loop_control_requested()
             || state.return_requested()
             || state.interrupted()
+            || state.stream_pipe_closed()
         {
             break;
         }
@@ -5105,6 +5132,48 @@ fn run_external(
     )?;
 
     if capture_outputs {
+        // P0-8: when this is a streaming pipeline stage (stdout is a downstream
+        // pipe) and there are no redirections/merges to honor, hand the child's
+        // stdout straight to that pipe. Output then flows incrementally with real
+        // backpressure, and a consumer that exits early (`… | head`) closes the
+        // pipe so the producer gets SIGPIPE — instead of being captured and run to
+        // completion (or forever) first, which hung `{ yes; } | head`.
+        if invocation.redirections.is_empty() && !merge_stderr_to_stdout && !merge_stdout_to_stderr
+        {
+            if let Some(writer) = state.streaming_stdout_writer() {
+                command.stdout(Stdio::from(writer));
+                let mut child = command.spawn()?;
+                let stdin_writer = match (stdin_is_piped, stdin_data, child.stdin.take()) {
+                    (true, Some(input), Some(mut stdin)) => {
+                        let buf = input.to_vec();
+                        Some(std::thread::spawn(move || -> io::Result<()> {
+                            match stdin.write_all(&buf) {
+                                Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(e),
+                                _ => Ok(()),
+                            }
+                        }))
+                    }
+                    _ => None,
+                };
+                // stdout streams to the pipe; only stderr is captured (bounded).
+                let stderr = match child.stderr.take() {
+                    Some(reader) => read_capped(reader)?,
+                    None => Vec::new(),
+                };
+                if let Some(handle) = stdin_writer {
+                    handle
+                        .join()
+                        .map_err(|_| ShellError::execution("stdin writer thread panicked"))??;
+                }
+                let status = child.wait()?;
+                return Ok(CommandOutcome::captured(
+                    exit_status_code(status),
+                    Vec::new(),
+                    stderr,
+                ));
+            }
+        }
+
         let mut child = command.spawn()?;
         // Feed stdin from a separate thread so `wait_with_output` can drain the
         // child's stdout/stderr concurrently. Writing all of stdin first would

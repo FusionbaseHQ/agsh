@@ -1546,3 +1546,73 @@ fn capturing_mode_bounds_large_output() {
         out.stdout.len()
     );
 }
+
+/// Run `agsh -c src`, killing it after `secs` and returning `None` on timeout,
+/// so a pipeline-backpressure regression fails cleanly instead of hanging CI.
+fn agsh_c_timeout(src: &str, secs: u64) -> Option<std::process::Output> {
+    use std::io::Read;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["-c", src])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agsh");
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            if let Some(mut r) = child.stdout.take() {
+                let _ = r.read_to_end(&mut stdout);
+            }
+            if let Some(mut r) = child.stderr.take() {
+                let _ = r.read_to_end(&mut stderr);
+            }
+            return Some(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        if start.elapsed() > std::time::Duration::from_secs(secs) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn pipeline_infinite_producer_stops_on_early_consumer_exit() {
+    // SHIP_READINESS_PLAN P0-8: a compound/loop producer piped into a consumer
+    // that exits early (`… | head`) must stop (SIGPIPE-like) rather than running
+    // forever (or to completion) first. External and builtin producers both.
+    for (src, want) in [
+        ("{ yes; } | head -n1", "y\n"),
+        ("(yes) | head -n1", "y\n"),
+        ("while true; do echo x; done | head -n1", "x\n"),
+        (
+            "for i in $(seq 1 100000); do echo $i; done | head -n1",
+            "1\n",
+        ),
+    ] {
+        let out = agsh_c_timeout(src, 20)
+            .unwrap_or_else(|| panic!("{src:?} did not terminate (backpressure regression)"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            want,
+            "wrong output for {src:?}"
+        );
+    }
+}
+
+#[test]
+fn pipeline_compound_producer_streams_in_order() {
+    // The backpressure fix must not disturb normal streaming/ordering when the
+    // consumer reads everything.
+    let out = agsh_c_timeout("{ echo one; seq 2; echo three; } | cat", 20).expect("hang");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "one\n1\n2\nthree\n");
+    let out = agsh_c_timeout("{ echo a; echo b; echo c; } | grep b", 20).expect("hang");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "b\n");
+}
