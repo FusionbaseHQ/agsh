@@ -1521,3 +1521,28 @@ fn type_and_command_v_report_all_builtins_truthfully() {
         assert_eq!(c.status.code(), Some(0), "`command -v {name}` exit");
     }
 }
+
+#[test]
+fn capturing_mode_bounds_large_output() {
+    // SHIP_READINESS_PLAN P0-9: a capturing mode must drain + bound huge output
+    // instead of buffering it all. 200 MB (>> the 2 MiB cap) must complete and
+    // preserve the exit code — not hang or OOM — and agsh's emitted output stays
+    // bounded, nowhere near 200 MB. (The head+tail retention is unit-tested in
+    // `read_capped`; this is the end-to-end no-OOM/no-hang guard.)
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args([
+            "--output",
+            "compact",
+            "-c",
+            "head -c 200000000 /dev/zero; exit 4",
+        ])
+        .output()
+        .expect("run agsh");
+    assert!(out.status.code().is_some(), "killed by signal (hang/OOM?)");
+    assert_eq!(out.status.code(), Some(4), "exit code lost through capture");
+    assert!(
+        out.stdout.len() < 8 * 1024 * 1024,
+        "capture not bounded: emitted {} bytes",
+        out.stdout.len()
+    );
+}

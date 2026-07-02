@@ -4985,6 +4985,66 @@ fn exit_status_code(status: std::process::ExitStatus) -> i32 {
     }
 }
 
+/// Per-stream capture caps: keep the first [`CAPTURE_HEAD`] and last
+/// [`CAPTURE_TAIL`] bytes of a captured stream. Everything else is drained (so
+/// the child's pipe never blocks) and replaced by a one-line marker. This bounds
+/// memory in the capturing output modes (`compact`/`semantic`/…) so an agent
+/// running `cat huge.bin` or a runaway producer can't OOM the shell. Raw mode
+/// (which inherits fds) and redirections to files are unaffected — this only
+/// touches the observation-capture plane.
+const CAPTURE_HEAD: usize = 1 << 20; // 1 MiB
+const CAPTURE_TAIL: usize = 1 << 20; // 1 MiB
+
+/// Read `reader` to EOF, retaining at most the first `CAPTURE_HEAD` and last
+/// `CAPTURE_TAIL` bytes. Under the cap the bytes are returned exactly; over it, a
+/// `… [agsh: N bytes elided …] …` marker separates head from tail. Always drains
+/// the reader fully so the child isn't blocked on a full pipe.
+fn read_capped(mut reader: impl Read) -> io::Result<Vec<u8>> {
+    let mut head: Vec<u8> = Vec::new();
+    let mut tail: Vec<u8> = Vec::new();
+    let mut total: usize = 0;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+        let bytes = &chunk[..n];
+        if head.len() < CAPTURE_HEAD {
+            let take = (CAPTURE_HEAD - head.len()).min(n);
+            head.extend_from_slice(&bytes[..take]);
+            tail.extend_from_slice(&bytes[take..]);
+        } else {
+            tail.extend_from_slice(bytes);
+        }
+        // Keep the tail bounded, trimming amortized-O(1) (only past 2×).
+        if tail.len() > CAPTURE_TAIL * 2 {
+            let cut = tail.len() - CAPTURE_TAIL;
+            tail.drain(0..cut);
+        }
+    }
+    if total <= CAPTURE_HEAD + CAPTURE_TAIL {
+        // Nothing was dropped — head + tail is the exact stream.
+        head.extend_from_slice(&tail);
+        return Ok(head);
+    }
+    if tail.len() > CAPTURE_TAIL {
+        let cut = tail.len() - CAPTURE_TAIL;
+        tail.drain(0..cut);
+    }
+    let dropped = total - CAPTURE_HEAD - CAPTURE_TAIL;
+    head.extend_from_slice(
+        format!(
+            "\n… [agsh: {dropped} bytes of output elided; {total} bytes total, \
+             showing first {CAPTURE_HEAD} and last {CAPTURE_TAIL}] …\n"
+        )
+        .as_bytes(),
+    );
+    head.extend_from_slice(&tail);
+    Ok(head)
+}
+
 fn run_external(
     invocation: &ExpandedInvocation,
     state: &ShellState,
@@ -5064,24 +5124,42 @@ fn run_external(
             }
             _ => None,
         };
-        let mut output = child.wait_with_output()?;
+        // Drain stdout+stderr concurrently into *bounded* buffers (stderr on a
+        // thread, stdout here) so a huge/streaming child can't OOM us the way
+        // `wait_with_output`'s unbounded read could. Two streams still need two
+        // readers to avoid a full-pipe deadlock.
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let stderr_handle =
+            stderr_pipe.map(|reader| std::thread::spawn(move || read_capped(reader)));
+        let mut stdout = match stdout_pipe {
+            Some(reader) => read_capped(reader)?,
+            None => Vec::new(),
+        };
+        let mut stderr = match stderr_handle {
+            Some(handle) => handle
+                .join()
+                .map_err(|_| ShellError::execution("stderr reader thread panicked"))??,
+            None => Vec::new(),
+        };
         if let Some(handle) = stdin_writer {
             handle
                 .join()
                 .map_err(|_| ShellError::execution("stdin writer thread panicked"))??;
         }
+        let status = child.wait()?;
         if merge_stderr_to_stdout {
-            output.stdout.extend_from_slice(&output.stderr);
-            output.stderr.clear();
+            stdout.extend_from_slice(&stderr);
+            stderr.clear();
         }
         if merge_stdout_to_stderr {
-            output.stderr.extend_from_slice(&output.stdout);
-            output.stdout.clear();
+            stderr.extend_from_slice(&stdout);
+            stdout.clear();
         }
         Ok(CommandOutcome::captured(
-            exit_status_code(output.status),
-            output.stdout,
-            output.stderr,
+            exit_status_code(status),
+            stdout,
+            stderr,
         ))
     } else {
         let mut child = command.spawn()?;
@@ -10381,6 +10459,36 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn read_capped_returns_small_input_exactly() {
+        let out = read_capped(std::io::Cursor::new(b"hello world".to_vec())).unwrap();
+        assert_eq!(out, b"hello world");
+    }
+
+    #[test]
+    fn read_capped_bounds_large_input_keeping_head_and_tail() {
+        // SHIP_READINESS_PLAN P0-9: capture is bounded, keeping head + tail with a
+        // marker rather than the whole (potentially huge) stream.
+        let total = CAPTURE_HEAD + CAPTURE_TAIL + 3 * 1024 * 1024;
+        let mut data = vec![b'x'; total];
+        data[..5].copy_from_slice(b"START");
+        let n = data.len();
+        data[n - 3..].copy_from_slice(b"END");
+        let out = read_capped(std::io::Cursor::new(data)).unwrap();
+        assert!(out.len() < total, "not truncated: {} >= {total}", out.len());
+        assert!(
+            out.len() <= CAPTURE_HEAD + CAPTURE_TAIL + 512,
+            "over cap: {}",
+            out.len()
+        );
+        assert!(out.starts_with(b"START"), "head lost");
+        assert!(out.ends_with(b"END"), "tail lost");
+        assert!(
+            String::from_utf8_lossy(&out).contains("bytes of output elided"),
+            "missing truncation marker"
+        );
+    }
 
     #[test]
     fn brace_range_expansion() {
