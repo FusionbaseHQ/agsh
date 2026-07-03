@@ -66,6 +66,22 @@ pub fn render_observation_with(
             }
         }
         OutputMode::Compact | OutputMode::Semantic => {
+            // Tiny-output fast path (Compact only): a successful command whose
+            // whole output is a few short lines has no representation more
+            // compact than the output itself — headline/counts scaffolding
+            // would be LARGER, and path shortening can erase the entire answer
+            // (`compact pwd` used to render just "."). ANSI-stripping and
+            // secret redaction still apply. Semantic (machine-parsed JSON) and
+            // user-configured [[compactor]] rules are unaffected.
+            if mode == OutputMode::Compact && exit_code == 0 && ctx.compactor.is_none() {
+                if let Some(display) = ctx.verbatim_tiny(&stdout_text, &stderr_text) {
+                    return OutputObservation {
+                        token_estimate: estimate_tokens(&display),
+                        display,
+                        raw: raw_ref(cmd_id),
+                    };
+                }
+            }
             let out = ctx.clean_text(&stdout_text);
             let err = ctx.clean_text(&stderr_text);
             let cx = CommandContext {
@@ -284,7 +300,12 @@ mod tests {
     #[test]
     fn json_array_of_objects_becomes_a_header_once_table() {
         let id = CommandId::new();
-        let json = r#"[{"name":"a","size":10},{"name":"b","size":20}]"#;
+        // Large enough to clear the tiny-output fast path (which would show a
+        // small JSON verbatim — already its most compact form).
+        let rows: Vec<String> = (0..24)
+            .map(|i| format!(r#"{{"name":"item-number-{i}","size":{i}}}"#))
+            .collect();
+        let json = format!("[{}]", rows.join(","));
         let obs = render_observation(
             OutputMode::Compact,
             &id,
@@ -295,7 +316,7 @@ mod tests {
         );
         assert!(
             obs.display
-                .contains("table<name:string, size:number> (2 rows)"),
+                .contains("table<name:string, size:number> (24 rows)"),
             "shape signature missing:\n{}",
             obs.display
         );
@@ -304,7 +325,75 @@ mod tests {
             "header row missing:\n{}",
             obs.display
         );
-        assert!(obs.display.contains("a\t10") && obs.display.contains("b\t20"));
+        assert!(
+            obs.display.contains("item-number-0\t0") && obs.display.contains("item-number-23\t23")
+        );
+    }
+
+    #[test]
+    fn tiny_success_output_is_shown_verbatim() {
+        // `compact pwd`: the whole output is one line — the observation IS the
+        // output. No headline, no counts, and crucially no workspace-path
+        // shortening (which used to render the path as just ".").
+        let id = CommandId::new();
+        let mut ctx = CompactionContext::defaults();
+        ctx.normalize.workspace = Some("/home/u/proj".to_string());
+        ctx.normalize.home = Some("/home/u".to_string());
+        let obs = render_observation_with(
+            &ctx,
+            OutputMode::Compact,
+            &id,
+            &["pwd".to_string()],
+            0,
+            b"/home/u/proj\n",
+            b"",
+        );
+        assert_eq!(obs.display, "/home/u/proj\n");
+
+        // Failures keep the full observation (status, digest, counts).
+        let obs = render_observation_with(
+            &ctx,
+            OutputMode::Compact,
+            &id,
+            &["pwd".to_string()],
+            1,
+            b"/home/u/proj\n",
+            b"",
+        );
+        assert!(obs.display.contains("[failed]"), "{}", obs.display);
+
+        // Semantic stays structured JSON even for tiny outputs (machine-parsed).
+        let obs = render_observation_with(
+            &ctx,
+            OutputMode::Semantic,
+            &id,
+            &["pwd".to_string()],
+            0,
+            b"/home/u/proj\n",
+            b"",
+        );
+        assert!(obs.display.contains("\"exit_code\": 0"), "{}", obs.display);
+    }
+
+    #[test]
+    fn tiny_fast_path_still_redacts_and_strips_ansi() {
+        let id = CommandId::new();
+        let obs = render_observation(
+            OutputMode::Compact,
+            &id,
+            &["printenv".to_string()],
+            0,
+            b"\x1b[32mtoken=ghp_abcdefghijklmnopqrstuvwxyz0123\x1b[0m\n",
+            b"",
+        );
+        assert!(!obs.display.contains('\x1b'), "{}", obs.display);
+        assert!(obs.display.contains("[REDACTED]"), "{}", obs.display);
+        assert!(!obs.display.contains("ghp_"), "{}", obs.display);
+        assert!(
+            !obs.display.contains("counts:"),
+            "tiny output must skip scaffolding:\n{}",
+            obs.display
+        );
     }
 
     #[test]

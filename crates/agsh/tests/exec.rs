@@ -1127,10 +1127,13 @@ fn deep_intercept_catches_absolute_path_shell() {
     let tmp = std::env::temp_dir().join(format!("agsh_deep_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let src = tmp.join("h.c");
+    // The payload prints several lines: a tiny (≤3-line) success is shown
+    // verbatim by compact mode's fast path, which would hide the [ok] framing
+    // this test uses as proof of interception.
     std::fs::write(
         &src,
         r#"#include <unistd.h>
-int main(void){char*a[]={"/bin/bash","-c","echo DEEP-TEST-HIT",0};execv("/bin/bash",a);return 1;}"#,
+int main(void){char*a[]={"/bin/bash","-c","echo DEEP-TEST-HIT && seq 1 6",0};execv("/bin/bash",a);return 1;}"#,
     )
     .unwrap();
     let bin = tmp.join("h");
@@ -1766,4 +1769,24 @@ fn resume_restores_a_dead_sessions_state_and_consumes_the_journal() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("nothing to restore"));
 
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn compact_pwd_matches_raw_pwd() {
+    // A successful tiny output IS its most compact form: `compact pwd` must
+    // print exactly what `pwd` prints — no [ok] header, no counts scaffolding,
+    // and no workspace shortening of the answer to "." (user report).
+    let raw = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["-c", "pwd"])
+        .output()
+        .expect("run agsh");
+    let compact = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["--output", "compact", "-c", "pwd"])
+        .output()
+        .expect("run agsh");
+    assert_eq!(
+        String::from_utf8_lossy(&compact.stdout),
+        String::from_utf8_lossy(&raw.stdout),
+        "compact pwd must equal raw pwd"
+    );
 }

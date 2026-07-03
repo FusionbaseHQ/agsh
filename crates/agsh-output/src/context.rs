@@ -31,4 +31,30 @@ impl CompactionContext {
     pub fn clean_text(&self, input: &str) -> String {
         redact(&normalize::normalize(input, &self.normalize), &self.redact)
     }
+
+    /// The tiny-output fast path: when a command's combined output is at most
+    /// [`TINY_LINES`] short lines, no observation is more compact than the
+    /// output itself, so return it verbatim — cleaned (ANSI strip, control
+    /// sanitization, redaction) but WITHOUT home/workspace path shortening,
+    /// which can erase the entire answer of commands like `pwd` (whose output
+    /// literally IS the workspace path, previously rendered as just `.`).
+    /// `None` when the output is too large for the fast path.
+    pub fn verbatim_tiny(&self, stdout: &str, stderr: &str) -> Option<String> {
+        let mut options = self.normalize.clone();
+        options.shorten_home = false;
+        options.shorten_workspace = false;
+        let combined = format!("{stdout}{stderr}");
+        let cleaned = redact(&normalize::normalize(&combined, &options), &self.redact);
+        let content = cleaned.trim_end_matches('\n');
+        if content.lines().count() <= TINY_LINES && content.chars().count() <= TINY_CHARS {
+            Some(cleaned)
+        } else {
+            None
+        }
+    }
 }
+
+/// Bounds for [`CompactionContext::verbatim_tiny`]: an output this small is its
+/// own most-compact representation (scaffolding would be larger than it).
+const TINY_LINES: usize = 3;
+const TINY_CHARS: usize = 400;
