@@ -68,6 +68,80 @@ jobs:
           key: ${{ matrix.target }}
       - name: Build
         run: cargo build --release --locked -p agsh --target ${{ matrix.target }}
+
+      # ---- macOS: Developer ID signing + notarization --------------------
+      # Required for tagged releases (a tag build FAILS without the secrets,
+      # so an unsigned release can never slip out); dry runs skip gracefully.
+      - name: Import Developer ID certificate
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          if [ -z "$MACOS_CERT_P12" ]; then
+            case "$GITHUB_REF" in
+            refs/tags/v*)
+              echo "::error::tagged release requires signing secrets (MACOS_CERT_P12, MACOS_CERT_PASSWORD, MACOS_SIGN_IDENTITY, APPLE_API_KEY_ID, APPLE_API_ISSUER, APPLE_API_KEY_P8) — see docs/RELEASING.md"
+              exit 1
+              ;;
+            *)
+              echo "No signing secrets available — dry-run build stays unsigned."
+              exit 0
+              ;;
+            esac
+          fi
+          KEYCHAIN="$RUNNER_TEMP/sign.keychain-db"
+          KEYCHAIN_PASS=$(openssl rand -hex 24)
+          echo "$MACOS_CERT_P12" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 1800 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm "$RUNNER_TEMP/cert.p12"
+          echo "SIGNING=1" >>"$GITHUB_ENV"
+
+      - name: Sign (hardened runtime) and notarize
+        if: runner.os == 'macOS' && env.SIGNING == '1'
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          bin="target/${{ matrix.target }}/release/agsh"
+          codesign --force --sign "$MACOS_SIGN_IDENTITY" \
+            --options runtime --timestamp "$bin"
+          codesign --verify --strict --verbose=2 "$bin"
+          # The notary service accepts zip/dmg/pkg — submit a zip of the
+          # signed binary. The ticket is keyed to the binary's cdhash, so the
+          # binary inside our .tar.gz is covered; bare Mach-O binaries can't
+          # be stapled (Gatekeeper fetches the ticket online on first run).
+          ditto -c -k "$bin" "$RUNNER_TEMP/agsh-notarize.zip"
+          printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+          xcrun notarytool submit "$RUNNER_TEMP/agsh-notarize.zip" \
+            --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait --timeout 20m \
+            --output-format json | tee "$RUNNER_TEMP/notary.json"
+          rm -f "$RUNNER_TEMP/AuthKey.p8"
+          status=$(jq -r '.status' "$RUNNER_TEMP/notary.json")
+          if [ "$status" != "Accepted" ]; then
+            echo "::error::notarization failed: status=$status (id=$(jq -r '.id' "$RUNNER_TEMP/notary.json"))"
+            exit 1
+          fi
+
+      - name: Clean up signing keychain
+        if: always() && runner.os == 'macOS'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/sign.keychain-db" 2>/dev/null || true
+          security list-keychains -d user -s login.keychain-db 2>/dev/null || true
+      # ---------------------------------------------------------------------
+
       - name: Smoke test the binary
         # Native-arch targets only; the x86_64 darwin binary is cross-built on
         # an arm64 runner (Rosetta may or may not be available — skip there).

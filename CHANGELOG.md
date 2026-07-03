@@ -6,6 +6,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- macOS release binaries are signed (Developer ID, hardened runtime) and
+  notarized by the release pipeline; tagged builds fail if signing secrets are
+  missing, so an unsigned release can't slip out. See `docs/RELEASING.md`.
+
 ## [0.2.0] - 2026-07-03
 
 The resilience release: agsh now separates the three lifetimes every other
