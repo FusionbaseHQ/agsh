@@ -227,13 +227,26 @@ impl<'a> Editor<'a> {
         // matching history command, truncated to a single line — multiline
         // history entries (e.g. heredocs) must not inject newlines into the
         // single-line render.
-        let ghost = if self.completion.is_none() && self.buffer.at_end() && !buffer_text.is_empty()
-        {
-            self.state
-                .history_suggest(&buffer_text)
-                .and_then(|full| single_line_ghost(&full, buffer_text.len()))
-        } else {
-            None
+        let prompt_w = visible_width(&self.prompt);
+        let buf_w = buffer_text.chars().count();
+        let ghost_full =
+            if self.completion.is_none() && self.buffer.at_end() && !buffer_text.is_empty() {
+                self.state
+                    .history_suggest(&buffer_text)
+                    .and_then(|full| single_line_ghost(&full, buffer_text.len()))
+            } else {
+                None
+            };
+        // Display-clip the ghost to the space left on the current visual line:
+        // a pathological history entry (thousands of chars) must hint, not
+        // flood the screen. Acceptance (→) still inserts the FULL suggestion —
+        // but only while a hint is actually visible.
+        let (ghost_display, ghost_accept) = match ghost_full {
+            Some(full) => match clip_ghost(&full, prompt_w + buf_w, self.cols) {
+                Some(display) => (Some(display), Some(full)),
+                None => (None, None),
+            },
+            None => (None, None),
         };
 
         let theme = self.state.theme();
@@ -241,13 +254,14 @@ impl<'a> Editor<'a> {
         let mut content = String::with_capacity(self.prompt.len() + highlighted.len() + 16);
         content.push_str(&self.prompt);
         content.push_str(&highlighted);
-        if let Some(g) = &ghost {
+        if let Some(g) = &ghost_display {
             content.push_str(&theme.paint(Role::Muted, g));
         }
 
-        let prompt_w = visible_width(&self.prompt);
-        let buf_w = buffer_text.chars().count();
-        let ghost_w = ghost.as_ref().map(|g| g.chars().count()).unwrap_or(0);
+        let ghost_w = ghost_display
+            .as_ref()
+            .map(|g| g.chars().count())
+            .unwrap_or(0);
         let total_visible = prompt_w + buf_w + ghost_w;
         let cursor_visible = prompt_w + self.buffer.cursor();
 
@@ -267,7 +281,7 @@ impl<'a> Editor<'a> {
         );
         self.rendered_rows = rows;
         self.cursor_rpos = rpos;
-        self.current_ghost = ghost;
+        self.current_ghost = ghost_accept;
         write_all(seq.as_bytes())
     }
 
@@ -776,6 +790,28 @@ fn single_line_ghost(full: &str, prefix_len: usize) -> Option<String> {
     (!line.is_empty()).then(|| line.to_string())
 }
 
+/// Clip a ghost for display so it never wraps: it may only use what remains of
+/// the visual line the cursor is on (after `used` columns of prompt + typed
+/// text, which may themselves wrap), with a trailing `…` when cut. `None` when
+/// there's no room for even a hint. Display only — the caller keeps the full
+/// text for acceptance.
+fn clip_ghost(ghost: &str, used: usize, cols: usize) -> Option<String> {
+    let cols = cols.max(2);
+    // Columns left on the cursor's line, keeping the last cell free so the
+    // ghost can't push the cursor onto the next row.
+    let avail = (cols - used % cols).saturating_sub(1);
+    let width = ghost.chars().count();
+    if width <= avail {
+        return Some(ghost.to_string());
+    }
+    if avail < 2 {
+        return None;
+    }
+    let mut clipped: String = ghost.chars().take(avail - 1).collect();
+    clipped.push('…');
+    Some(clipped)
+}
+
 /// Whether stdin has data ready within `ms` milliseconds. Used to disambiguate a
 /// lone Escape from an escape sequence. On any poll error, assume readable so we
 /// fall through to a blocking read rather than dropping input.
@@ -801,6 +837,26 @@ mod tests {
     fn lcp_of_candidates() {
         let items = vec!["cargo".to_string(), "case".to_string(), "cat".to_string()];
         assert_eq!(longest_common_prefix(&items), "ca");
+    }
+
+    #[test]
+    fn ghost_display_never_wraps() {
+        // Fits: returned whole.
+        assert_eq!(
+            clip_ghost("ath '2+2'", 10, 80),
+            Some("ath '2+2'".to_string())
+        );
+        // A monster suggestion (the `agmath '((((…` history case) is clipped
+        // to the space left on the cursor's line, ellipsized — never a flood.
+        let monster = "(".repeat(3000);
+        let clipped = clip_ghost(&monster, 10, 80).expect("hint shown");
+        assert!(clipped.chars().count() <= 69, "{}", clipped.chars().count());
+        assert!(clipped.ends_with('…'));
+        // Cursor mid-wrapped-line: only the CURRENT line's remainder is used.
+        let clipped = clip_ghost(&monster, 165, 80).expect("hint shown"); // col 5 of row 3
+        assert!(clipped.chars().count() <= 74);
+        // Almost no room: no hint at all rather than a useless sliver.
+        assert_eq!(clip_ghost(&monster, 78, 80), None);
     }
 
     #[test]

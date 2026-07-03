@@ -175,6 +175,35 @@ def scenario_autosuggestion_accept():
         s.close()
 
 
+def scenario_huge_history_ghost_is_clipped():
+    # Regression: a pathological history entry (e.g. `agmath '((((…'` with
+    # thousands of chars from arithmetic fuzzing) must show as a clipped
+    # one-line hint, not flood the screen with parens. Accepting with → must
+    # still insert the FULL command, not the clipped display text.
+    hist = "/tmp/agsh-pty-monster.jsonl"
+    monster = "agmath '" + "(" * 2000 + "1" + ")" * 2000 + "'"
+    _seed_history(hist, ["echo before", monster])
+    s = Session(history=hist)
+    try:
+        s.send("agm", 0.5)
+        scr = s.screen()
+        check("ghost is clipped, no paren flood", scr.count("(") < 100, scr)
+        check("clip is marked with an ellipsis", "…" in scr, scr)
+        prompts = scr.count("❯")
+        check("prompt still on one line", prompts <= 1, f"{prompts} prompts:\n{scr}")
+        # Accept the full suggestion and run it: the real agmath evaluates the
+        # whole 2000-deep expression (the depth guard errors politely if not —
+        # either way the FULL text was inserted, since the clipped text with a
+        # literal `…` would be a parse error mentioning "…").
+        s.send(RIGHT, 0.3)
+        s.send(ENTER, 0.8)
+        scr = s.screen()
+        check("accepted full text, not the clipped display", "…'" not in scr, scr)
+    finally:
+        s.close()
+        os.unlink(hist)
+
+
 def scenario_completion_accept_and_run():
     s = Session()
     try:
@@ -636,6 +665,7 @@ SCENARIOS = [
     scenario_hooks_precmd_preexec_chpwd,
     scenario_programmable_completion,
     scenario_sequential_commands,
+    scenario_huge_history_ghost_is_clipped,
     scenario_basic_echo,
     scenario_line_editing,
     scenario_completion_dropdown,
