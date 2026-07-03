@@ -20,17 +20,43 @@ secrets).
 
 ## macOS signing & notarization (one-time setup)
 
-Tagged builds **fail** unless these six repository secrets exist — an unsigned
-release cannot slip out silently. Dry runs skip signing.
+Tagged builds **fail** unless the signing secrets exist — an unsigned release
+cannot slip out silently. Dry runs skip signing.
+
+Always required:
 
 | Secret | Contents |
 | --- | --- |
 | `MACOS_CERT_P12` | base64 of the *Developer ID Application* certificate + private key (.p12) |
 | `MACOS_CERT_PASSWORD` | the .p12 export password |
 | `MACOS_SIGN_IDENTITY` | e.g. `Developer ID Application: <Your Org> (<TEAMID>)` |
-| `APPLE_API_KEY_ID` | App Store Connect API key ID (e.g. `<KEYID>`) |
-| `APPLE_API_ISSUER` | App Store Connect API issuer ID (UUID) |
+
+Plus **one** of the two notary credential sets:
+
+| Option A — Apple ID + app-specific password | Contents |
+| --- | --- |
+| `APPLE_ID` | the Apple ID email of a team member |
+| `APPLE_TEAM_ID` | the 10-char team ID (e.g. `<TEAMID>`) |
+| `APPLE_APP_PASSWORD` | an app-specific password ([account.apple.com](https://account.apple.com) → Sign-In and Security → App-Specific Passwords) |
+
+| Option B — App Store Connect API key | Contents |
+| --- | --- |
+| `APPLE_API_KEY_ID` | API key ID (e.g. `<KEYID>`) |
+| `APPLE_API_ISSUER` | issuer ID (UUID) |
 | `APPLE_API_KEY_P8` | contents of the downloaded `AuthKey_<KEYID>.p8` |
+
+The pipeline prefers the API key when both are configured. Trade-off: the
+app-specific password is tied to a *person's* Apple ID (leaves the team or
+rotates their password → releases break, and the password grants broad
+account-API access), while an API key is team-scoped and least-privilege —
+fine to start with A, consider migrating to B later.
+
+```sh
+# Option A setup:
+gh secret set APPLE_ID -R FusionbaseHQ/agsh            # you@example.com
+gh secret set APPLE_TEAM_ID -R FusionbaseHQ/agsh --body "<TEAMID>"
+gh secret set APPLE_APP_PASSWORD -R FusionbaseHQ/agsh  # xxxx-xxxx-xxxx-xxxx
+```
 
 ### 1. Export the Developer ID certificate as .p12
 
@@ -46,7 +72,7 @@ gh secret set MACOS_SIGN_IDENTITY -R FusionbaseHQ/agsh \
   --body "Developer ID Application: <Your Org> (<TEAMID>)"
 ```
 
-### 2. Create an App Store Connect API key (for `notarytool`)
+### 2. (Option B only) Create an App Store Connect API key
 
 [appstoreconnect.apple.com → Users and Access → Integrations → App Store
 Connect API](https://appstoreconnect.apple.com/access/integrations/api) →
@@ -91,7 +117,9 @@ For re-signing an already-published release by hand:
 codesign --force --sign "Developer ID Application: <Your Org> (<TEAMID>)" \
   --options runtime --timestamp agsh
 ditto -c -k agsh agsh.zip
+# store credentials once — Apple ID + app-specific password…
 xcrun notarytool store-credentials agsh-notary \
-  --key AuthKey_XXX.p8 --key-id KEYID --issuer ISSUER   # once
+  --apple-id you@example.com --team-id <TEAMID> --password xxxx-xxxx-xxxx-xxxx
+# …or API key: --key AuthKey_XXX.p8 --key-id KEYID --issuer ISSUER
 xcrun notarytool submit agsh.zip --keychain-profile agsh-notary --wait
 ```

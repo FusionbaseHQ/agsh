@@ -81,7 +81,7 @@ jobs:
           if [ -z "$MACOS_CERT_P12" ]; then
             case "$GITHUB_REF" in
             refs/tags/v*)
-              echo "::error::tagged release requires signing secrets (MACOS_CERT_P12, MACOS_CERT_PASSWORD, MACOS_SIGN_IDENTITY, APPLE_API_KEY_ID, APPLE_API_ISSUER, APPLE_API_KEY_P8) — see docs/RELEASING.md"
+              echo "::error::tagged release requires signing secrets: MACOS_CERT_P12, MACOS_CERT_PASSWORD, MACOS_SIGN_IDENTITY, plus notary credentials (either APPLE_API_KEY_ID/APPLE_API_ISSUER/APPLE_API_KEY_P8 or APPLE_ID/APPLE_TEAM_ID/APPLE_APP_PASSWORD) — see docs/RELEASING.md"
               exit 1
               ;;
             *)
@@ -108,24 +108,43 @@ jobs:
         if: runner.os == 'macOS' && env.SIGNING == '1'
         env:
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          # Notary auth, option A: App Store Connect API key.
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          # Notary auth, option B: Apple ID + app-specific password.
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           bin="target/${{ matrix.target }}/release/agsh"
           codesign --force --sign "$MACOS_SIGN_IDENTITY" \
             --options runtime --timestamp "$bin"
           codesign --verify --strict --verbose=2 "$bin"
+
+          # Pick notary credentials: API key if present, else Apple ID +
+          # app-specific password.
+          if [ -n "$APPLE_API_KEY_P8" ]; then
+            printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+            auth=(--key "$RUNNER_TEMP/AuthKey.p8"
+                  --key-id "$APPLE_API_KEY_ID"
+                  --issuer "$APPLE_API_ISSUER")
+          elif [ -n "$APPLE_APP_PASSWORD" ]; then
+            auth=(--apple-id "$APPLE_ID"
+                  --team-id "$APPLE_TEAM_ID"
+                  --password "$APPLE_APP_PASSWORD")
+          else
+            echo "::error::no notary credentials: set APPLE_API_KEY_ID/APPLE_API_ISSUER/APPLE_API_KEY_P8 or APPLE_ID/APPLE_TEAM_ID/APPLE_APP_PASSWORD"
+            exit 1
+          fi
+
           # The notary service accepts zip/dmg/pkg — submit a zip of the
           # signed binary. The ticket is keyed to the binary's cdhash, so the
           # binary inside our .tar.gz is covered; bare Mach-O binaries can't
           # be stapled (Gatekeeper fetches the ticket online on first run).
           ditto -c -k "$bin" "$RUNNER_TEMP/agsh-notarize.zip"
-          printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
           xcrun notarytool submit "$RUNNER_TEMP/agsh-notarize.zip" \
-            --key "$RUNNER_TEMP/AuthKey.p8" \
-            --key-id "$APPLE_API_KEY_ID" \
-            --issuer "$APPLE_API_ISSUER" \
+            "${auth[@]}" \
             --wait --timeout 20m \
             --output-format json | tee "$RUNNER_TEMP/notary.json"
           rm -f "$RUNNER_TEMP/AuthKey.p8"
