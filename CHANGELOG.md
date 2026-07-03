@@ -6,11 +6,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
-- macOS release binaries are signed (Developer ID, hardened runtime) and
-  notarized by the release pipeline; tagged builds fail if signing secrets are
-  missing, so an unsigned release can't slip out. See `docs/RELEASING.md`.
-
 ## [0.2.0] - 2026-07-03
 
 The resilience release: agsh now separates the three lifetimes every other
@@ -50,7 +45,10 @@ Sessions survive closed windows, dropped SSH, crashes, and reboots.
   interrupts anyone.
 - **Release channel** — prebuilt binaries (macOS arm64/x86_64, Linux
   x86_64/aarch64 musl) with checksums on GitHub Releases, and a hosted
-  `install.sh` with platform detection + sha256 verification.
+  `install.sh` with platform detection + sha256 verification. The macOS
+  binaries are signed (Developer ID, hardened runtime) and notarized by the
+  release pipeline; tagged builds fail if signing secrets are missing, so an
+  unsigned release can't slip out. See `docs/RELEASING.md`.
 
 ### Added — earlier unreleased work
 - **Startup rc file** — interactive sessions source `~/.config/agsh/agshrc`
