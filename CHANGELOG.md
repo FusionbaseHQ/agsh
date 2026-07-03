@@ -6,24 +6,98 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
-- **Startup rc file** — interactive sessions source `~/.config/agsh/agshrc` (aliases,
-  functions, exports, prompt hooks, `mode:…`); `--norc` / `--rcfile` / `$AGSH_RC`.
+## [0.2.0] - 2026-07-03
+
+The resilience release: agsh now separates the three lifetimes every other
+shell welds together — the terminal, the shell state, and the processes.
+Sessions survive closed windows, dropped SSH, crashes, and reboots.
+
+### Added — session resilience
+- **The keep broker** (`agshd`, new `agsh-broker` crate) — a per-user daemon
+  that owns pseudo-terminals, so kept processes belong to it rather than to the
+  window that started them. One PTY per job; output journaled to rotating logs
+  plus a scrollback ring replayed on attach; jobs get a real controlling
+  terminal (Ctrl-C works) via a safe-Rust `setsid`+`TIOCSCTTY` supervisor shim.
+  Auto-started on first use; socket and state are 0700/0600.
+- **`keep` builtin** — `keep -- CMD` runs a command that survives the terminal;
+  `keep list / attach / tail / kill / rm / stop`. On a TTY it attaches
+  immediately (Ctrl-] detaches); without one (agents, scripts) it spawns
+  detached and reports id + hints as a captured observation.
+- **Full-session keep** — `agsh --keep` runs the whole interactive session
+  under the broker: closing the terminal or losing SSH only *detaches* it;
+  `agsh --attach [ID]` resumes it exactly where it was, scrollback replayed.
+  Plain interactive startup shows a breadcrumb when detached sessions exist.
+- **Session journal + `resume`** — interactive sessions append state deltas
+  (cwd, exports, vars, aliases, abbreviations, functions, set/shopt options,
+  running jobs) to a crash-safe per-session JSONL journal as they happen —
+  crash-only design, nothing is "saved at exit". `resume` / `resume list` /
+  `resume N` replay a dead session's deltas onto a new shell (never re-running
+  commands). Background jobs that survived are rediscovered with a
+  pid-reuse-safe liveness check; a `claude`/`codex` agent that died with the
+  session gets its true resume path (`sessions`). Confinement replays
+  narrow-only, so a confined session can't come back widened.
+- **Wake-from-standby detection** — after sleep, agsh prints
+  "system was asleep ~2h — 1 background job still running" instead of silently
+  pretending time didn't pass.
+- **`[session]` config** — `restore_banner = true` (or `AGSH_RESUME_BANNER=1`)
+  opts into a startup banner for dead sessions that likely lost work. Off by
+  default: a hangup at an idle prompt (how most people close windows) never
+  interrupts anyone.
+- **Release channel** — prebuilt binaries (macOS arm64/x86_64, Linux
+  x86_64/aarch64 musl) with checksums on GitHub Releases, and a hosted
+  `install.sh` with platform detection + sha256 verification.
+
+### Added — earlier unreleased work
+- **Startup rc file** — interactive sessions source `~/.config/agsh/agshrc`
+  (aliases, functions, exports, prompt hooks, `mode:…`); `--norc` /
+  `--rcfile` / `$AGSH_RC`.
 - **Shell interception** (opt-in via `AGSH_INTERCEPT`) — route an agent's own
-  `bash -c …` through agsh so its output is compacted/observed instead of bypassing
-  it. Proxy (default, runs the real shell), native-interpret (`:native`), and a deep
-  exec-interposition layer (`:deep`) that also catches absolute-path `/bin/bash` and
-  `posix_spawn` via `DYLD_INSERT_LIBRARIES`/`LD_PRELOAD`. The deep layer is the new,
-  isolated `agsh-intercept` crate — the single first-party `unsafe` exception.
-- **`sessions`** now shows each session's folder; namespaced `mode:<aspect>` builtin.
+  `bash -c …` through agsh so its output is compacted/observed instead of
+  bypassing it. Proxy (default, runs the real shell), native-interpret
+  (`:native`), and a deep exec-interposition layer (`:deep`) that also catches
+  absolute-path `/bin/bash` and `posix_spawn` via
+  `DYLD_INSERT_LIBRARIES`/`LD_PRELOAD`. The deep layer is the new, isolated
+  `agsh-intercept` crate — the single first-party `unsafe` exception.
+- **`sessions`** now shows each session's folder; namespaced `mode:<aspect>`
+  builtin.
 
 ### Changed
-- **`raw:` references are now useful.** They are emitted only when the compact view
-  actually elides output (no more redundant pointer under fully-shown results), and
-  under interception (`$AGSH_TRACE_DIR`) they are **catable file paths** backed by
-  on-disk persistence — so an agent can `grep`/`cat` the full raw output from plain
-  bash, instead of a dangling in-memory `trace://` id that died with the one-shot
-  process.
+- **Compact mode never anti-compacts.** A successful command whose whole output
+  is at most 3 short lines is shown verbatim — no headline/counts scaffolding,
+  and no home/workspace path shortening (which used to render `compact pwd` as
+  a lone `.`). ANSI-stripping and secret redaction still apply; semantic mode
+  and user `[[compactor]]` rules are unaffected.
+- **`raw:` references are now useful.** Emitted only when the compact view
+  actually elides output (no more redundant pointer under fully-shown results),
+  and under interception (`$AGSH_TRACE_DIR`) they are **catable file paths**
+  backed by on-disk persistence — so an agent can `grep`/`cat` the full raw
+  output from plain bash.
+- **Inline autosuggestions are display-clipped** to the current line — a
+  pathological multi-thousand-character history entry hints with `…` instead of
+  flooding the screen; accepting with `→` still inserts the full command.
+- The generic compact reducer credits its baseline: ported and extended from
+  [rtk](https://github.com/rtk-ai/rtk), natively integrated into the shell.
+
+### Fixed
+- **PTY controller fd leak** — spawned jobs inherited their own PTY controller
+  (rustix, unlike std, does not set CLOEXEC), so broker shutdown could never
+  hang them up, silently orphaning shells. Also fixed in the `pty` builtin.
+- **Attach handshake/install race** — the daemon confirmed an attach before
+  installing it, so two back-to-back attaches could invert on a slow machine
+  and hang up the newer client. Handshake, takeover, replay, and install are
+  now one atomic section under the output lock.
+- **Honest takeover reporting** — a client whose attach is taken over now says
+  "taken over by another client — keeps running" instead of falsely reporting
+  the job exited.
+
+### Known limitations (first release of the new subsystems)
+- The keep broker is new. Reattach is byte-replay, not screen reconstruction —
+  full-screen TUIs may be momentarily garbled until they repaint on the resize
+  signal. One attached client per job (last attach wins). A frozen attached
+  client can stall its job's output pump until it detaches; hardening planned.
+- `resume` does not journal arrays/associative arrays yet.
+- `confine` is kernel-enforced on macOS only; elsewhere it fails closed
+  (Linux Landlock planned).
 
 ## [0.1.0] - 2026-06-30
 

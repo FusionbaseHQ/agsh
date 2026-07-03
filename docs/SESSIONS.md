@@ -165,4 +165,9 @@ retroactively — a command you didn't `keep` (or a session not under `--keep`)
 still dies with its terminal, and the journal's flight recorder + resume
 recipes are the fallback. The broker holds one attached client per job (last
 attach wins), and killing the daemon degrades kept jobs to orphans (alive but
-unreachable) — they are their own sessions, so they keep running.
+unreachable) — they are their own sessions, so they keep running. Reattach is
+byte-replay, not screen reconstruction: a full-screen TUI may look garbled for
+a moment until it repaints on the resize signal. And a *frozen* attached
+client (e.g. a SIGSTOP'd terminal) currently stalls its job's output pump
+until it detaches — hardening (non-blocking writes, detach-on-stall) is
+planned.

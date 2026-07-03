@@ -140,8 +140,18 @@ autosuggestions, reverse search.
 
 ## Install in 60 seconds
 
-Requires a stable [Rust toolchain](https://rustup.rs) (pinned via
-`rust-toolchain.toml`).
+**Prebuilt binary** (macOS arm64/x86_64, Linux x86_64/arm64 — static musl;
+verifies checksums, no sudo, installs to `~/.local/bin`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/FusionbaseHQ/agsh/main/install.sh | sh
+```
+
+Prefer to read before you run? `curl -fsSLO …/install.sh && less install.sh &&
+sh install.sh`. Pin a version with `AGSH_VERSION=v0.2.0`, change the target dir
+with `AGSH_INSTALL_DIR`.
+
+**From source** (stable [Rust toolchain](https://rustup.rs)):
 
 ```sh
 git clone https://github.com/FusionbaseHQ/agsh.git && cd agsh

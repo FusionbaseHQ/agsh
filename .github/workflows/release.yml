@@ -1,0 +1,130 @@
+name: Release
+
+# Tag-triggered releases (v*), plus workflow_dispatch to dry-run the whole
+# build matrix without publishing anything.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write # create the release + upload assets
+
+jobs:
+  # Gate: the tagged commit must pass the workspace tests on both platforms.
+  # (Full behavioral suites run in ci.yml on every push to main.)
+  test:
+    name: test gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          # musl: fully static Linux binaries that run on any distro.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + target)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER=musl-gcc" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p agsh --target ${{ matrix.target }}
+      - name: Smoke test the binary
+        # Native-arch targets only; the x86_64 darwin binary is cross-built on
+        # an arm64 runner (Rosetta may or may not be available — skip there).
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: |
+          bin="target/${{ matrix.target }}/release/agsh"
+          "$bin" --version
+          test "$("$bin" -c 'echo release-smoke')" = "release-smoke"
+      - name: Package
+        run: |
+          VERSION="$GITHUB_REF_NAME"
+          case "$VERSION" in v*) ;; *) VERSION="dry-run" ;; esac
+          NAME="agsh-$VERSION-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+          cp "target/${{ matrix.target }}/release/agsh" "dist/$NAME/"
+          cp LICENSE README.md CHANGELOG.md "dist/$NAME/"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          rm -r "dist/$NAME"
+          (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agsh-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Assemble checksums.txt
+        run: |
+          cd dist
+          cat ./*.sha256 > checksums.txt
+          rm ./*.sha256
+          ls -la
+      - name: Extract this version's notes from CHANGELOG.md
+        run: |
+          awk -v ver="${GITHUB_REF_NAME#v}" '
+            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "See CHANGELOG.md for details." > notes.md
+          fi
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "agsh $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --verify-tag

@@ -21,7 +21,7 @@ members = [
 edition = "2021"
 rust-version = "1.96"
 license = "AGPL-3.0-only"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Fusionbase and the agsh contributors"]
 description = "A modern, from-scratch POSIX-style shell in Rust — for humans and AI coding agents."
 repository = "https://github.com/FusionbaseHQ/agsh"
@@ -32,3 +32,7 @@ categories = ["command-line-utilities", "development-tools"]
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+
+[profile.release]
+strip = "symbols"
+lto = "thin"

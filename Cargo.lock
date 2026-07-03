@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agsh"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agsh-broker",
  "agsh-core",
@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "agsh-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agsh-core",
  "agsh-output",
@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "agsh-broker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rustix",
  "serde",
@@ -40,18 +40,18 @@ dependencies = [
 
 [[package]]
 name = "agsh-compat"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agsh-core",
 ]
 
 [[package]]
 name = "agsh-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "agsh-exec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agsh-broker",
  "agsh-compat",
@@ -70,18 +70,18 @@ dependencies = [
 
 [[package]]
 name = "agsh-index"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "agsh-intercept"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "agsh-output"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agsh-core",
  "regex",
@@ -92,14 +92,14 @@ dependencies = [
 
 [[package]]
 name = "agsh-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agsh-core",
 ]
 
 [[package]]
 name = "agsh-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agsh-style",
  "base64",
@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "agsh-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agsh-core",
  "agsh-output",
@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "agsh-style"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "toml",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "agsh-tty"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agsh-core",
  "agsh-exec",
