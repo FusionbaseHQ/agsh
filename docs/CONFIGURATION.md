@@ -79,6 +79,18 @@ mode                  # show all aspects
 mode:output off       # reset to the startup default
 ```
 
+## Session resilience (`[session]`)
+
+```toml
+# ~/.config/agsh/token.toml
+[session]
+restore_banner = true   # startup banner for dead sessions with lost work
+                        # (off by default; AGSH_RESUME_BANNER=1|0 overrides)
+```
+
+`resume`, `resume list`, and the keep broker need no configuration; see
+[SESSIONS.md](SESSIONS.md).
+
 ## Shell interception (for agents)
 
 Coding agents often run commands as their own `bash -c '…'` subprocess, which

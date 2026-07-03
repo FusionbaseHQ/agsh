@@ -33,18 +33,27 @@ sessions never journal, so non-interactive behavior is byte-identical.
 
 ## `resume` — restore a dead session
 
-At interactive startup, a muted one-line banner appears when a dead session
+An optional muted one-line startup banner can point at a dead session that
 likely *lost work*:
 
 ```
 agsh: a session hung up 12m ago (cwd ~/dev/api, 3 changes, `claude` was running) — `resume` restores it
 ```
 
-The banner is deliberately conservative: it fires only for a crash (no `hup`
-record — SIGKILL, panic, reboot) or a hangup while something was still running
-(foreground command or background jobs), and only for deaths in the last 48
-hours. A hangup at an idle prompt is how most people close a terminal window —
-those sessions never banner, but stay quietly available:
+The banner is **off by default** — even a good heuristic interrupts people who
+end sessions by closing windows all day. Opt in via `token.toml`:
+
+```toml
+[session]
+restore_banner = true
+```
+
+(or `AGSH_RESUME_BANNER=1`, which also overrides the config; `=0` force-quiets
+it.) Even when enabled it is conservative: it fires only for a crash (no `hup`
+record — SIGKILL, panic, power loss) or a hangup/termination while something
+was still running, and only for deaths in the last 48 hours. A hangup at an
+idle prompt is how most people close a terminal window — those sessions never
+banner. Banner or no banner, everything stays available:
 
 ```sh
 resume          # restore the most recent dead session

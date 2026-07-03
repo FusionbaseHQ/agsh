@@ -626,9 +626,26 @@ fn banner_worthy(s: &RestorableSession) -> bool {
 /// Only recent deaths banner; older ones stay in `resume list`.
 const BANNER_MAX_AGE_SECS: u64 = 48 * 3600;
 
+/// Whether the restore banner is enabled: `AGSH_RESUME_BANNER` env (1/0,
+/// on/off, true/false) beats `token.toml [session] restore_banner`, which
+/// defaults to OFF — the banner interrupts, so it is strictly opt-in.
+fn banner_enabled(state: &ShellState) -> bool {
+    if let Ok(value) = std::env::var("AGSH_RESUME_BANNER") {
+        match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => return true,
+            "0" | "false" | "off" | "no" => return false,
+            _ => {}
+        }
+    }
+    state.output_config().session.restore_banner
+}
+
 /// One-line interactive-startup banner when a dead session likely lost work,
-/// or `None`. Muted styling; never blocks (one directory scan of small files).
+/// or `None`. Opt-in (see [`banner_enabled`]); muted styling; never blocks.
 pub fn restore_banner(state: &ShellState) -> Option<String> {
+    if !banner_enabled(state) {
+        return None;
+    }
     let sessions = restorable_sessions();
     let info = sessions.iter().find(|info| {
         banner_worthy(&info.session)

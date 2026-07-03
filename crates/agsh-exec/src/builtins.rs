@@ -658,9 +658,11 @@ without one.
   resume list     show restorable sessions (age, cwd, changes, what was running)
   resume N        restore the Nth listed session
 
-The startup banner only appears for likely LOST WORK — a crash, or a hangup
-while something was running. Closing a terminal window at an idle prompt never
-banners; those sessions stay quietly available in `resume list`.
+A startup banner pointing at restorable sessions is OFF by default; opt in
+with `[session] restore_banner = true` in ~/.config/agsh/token.toml (or
+AGSH_RESUME_BANNER=1). Even enabled, it only fires for likely lost work — a
+crash, or a hangup while something was running — never for a terminal window
+closed at an idle prompt.
 
 Restores cwd, exported vars, shell vars, aliases, abbreviations, functions, and
 set/shopt options by replaying journaled deltas — commands are never re-run. If

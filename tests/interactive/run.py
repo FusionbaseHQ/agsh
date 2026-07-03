@@ -437,8 +437,9 @@ def scenario_session_resume_after_kill():
     import tempfile
 
     sess_dir = tempfile.mkdtemp(prefix="agsh-pty-resume-")
+    banner_on = {"AGSH_RESUME_BANNER": "1"}
     try:
-        s = Session(session_dir=sess_dir)
+        s = Session(session_dir=sess_dir, extra_env=banner_on)
         try:
             s.send("export RESUME_PROBE=alive-42" + ENTER, 0.5)
             s.send("alias rgs='git status'" + ENTER, 0.5)
@@ -450,7 +451,7 @@ def scenario_session_resume_after_kill():
             except OSError:
                 pass
 
-        s2 = Session(session_dir=sess_dir)
+        s2 = Session(session_dir=sess_dir, extra_env=banner_on)
         try:
             scr = s2.screen()
             check("restore banner offers resume", "resume" in scr and "2 changes" in scr, scr)
@@ -460,7 +461,7 @@ def scenario_session_resume_after_kill():
             check("export restored", "probe=alive-42" in s2.screen(), s2.screen())
             # A third session sees nothing: the journal was consumed and the
             # second session is still alive (its own journal is not offered).
-            s3 = Session(session_dir=sess_dir)
+            s3 = Session(session_dir=sess_dir, extra_env=banner_on)
             try:
                 check("consumed journal not re-offered", "resume" not in s3.screen(), s3.screen())
             finally:

@@ -22,8 +22,20 @@ pub struct CompactorConfig {
     pub budget: BudgetConfig,
     pub normalization: NormalizationConfig,
     pub security: SecurityConfig,
+    pub session: SessionConfig,
     #[serde(rename = "compactor")]
     pub compactors: Vec<CompactorRuleSet>,
+}
+
+/// `[session]` — session-resilience knobs.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Show the startup banner when a dead session likely lost work. Off by
+    /// default — even a good heuristic interrupts people who end sessions by
+    /// closing windows all day; `resume list` always works regardless.
+    /// `AGSH_RESUME_BANNER=1|0` overrides this at runtime.
+    pub restore_banner: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -281,9 +293,9 @@ impl CompactorConfig {
 
     /// Parse resiliently: if the whole document is valid, use it; otherwise salvage
     /// each recognized section (`[mode]`, `[storage]`, `[budget]`, `[normalization]`,
-    /// `[security]`) and each `[[compactor]]` entry independently, dropping only the
-    /// malformed ones and returning a named warning for each. Preserves compactor
-    /// order (and thus the user-rules-beat-presets precedence).
+    /// `[security]`, `[session]`) and each `[[compactor]]` entry independently,
+    /// dropping only the malformed ones and returning a named warning for each.
+    /// Preserves compactor order (and thus the user-rules-beat-presets precedence).
     pub fn parse_resilient(text: &str) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
         // Fast path: a fully valid document.
@@ -329,6 +341,9 @@ impl CompactorConfig {
         }
         if let Some(v) = section(&table, "security", &mut warnings) {
             cfg.security = v;
+        }
+        if let Some(v) = section(&table, "session", &mut warnings) {
+            cfg.session = v;
         }
         if let Some(array) = table.get("compactor").and_then(|v| v.as_array()) {
             for (i, entry) in array.iter().enumerate() {
@@ -460,6 +475,16 @@ mod tests {
         assert_eq!(cfg.budget.default_tokens, 2000);
         assert_eq!(cfg.mode.agent_default, "semantic");
         assert!(cfg.security.redact_secrets);
+        assert!(
+            !cfg.session.restore_banner,
+            "restore banner must be OPT-IN (it interrupts every new shell)"
+        );
+    }
+
+    #[test]
+    fn session_section_enables_the_restore_banner() {
+        let cfg = CompactorConfig::from_toml("[session]\nrestore_banner = true\n");
+        assert!(cfg.session.restore_banner);
     }
 
     #[test]
