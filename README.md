@@ -98,6 +98,13 @@ Six modes (`raw` · `clean` · `compact` · `semantic` · `lossless-ref` ·
 every raw byte stays recoverable via `trace://` references. Small outputs pass
 through verbatim — compaction never costs you information.
 
+The generic line reducer is ported and extended from the excellent
+[**rtk** (Rust Token Killer)](https://github.com/rtk-ai/rtk) — but **natively
+integrated into the shell** instead of a proxy you remember to prefix: it
+applies to every command in any capturing mode, composes with the family
+compactors and `trace://` recovery, and stays configurable through the same
+`[[compactor]]` TOML rules.
+
 ### 🛡️ A sandbox you can actually enforce
 
 ```sh
