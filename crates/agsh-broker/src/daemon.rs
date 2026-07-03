@@ -561,9 +561,16 @@ fn attach_conn(
         return write_line(&mut writer, &Response::err(format!("job {id} has exited")));
     }
     job.set_winsize(rows, cols);
-    write_line(&mut writer, &Response::Attached { info: job.info() })?;
+    // Computed before taking the output lock — job.info() reads it too.
+    let info = job.info();
 
-    // Install under the output lock: replay and live output can't interleave.
+    // Handshake + takeover + replay + install are ONE atomic section under the
+    // output lock, so "the client received its handshake" implies "the client
+    // holds the attach slot". With the handshake outside the lock, two attaches
+    // could invert on a slow machine: the newer one finds the slot still empty,
+    // installs itself, and then the OLDER one's delayed install hangs up the
+    // newer client and squats on the slot (caught by CI as a takeover test
+    // timing failure on a loaded runner).
     let generation = {
         let Ok(mut output) = job.output.lock() else {
             return Ok(());
@@ -572,6 +579,7 @@ fn attach_conn(
         if let Some((_, old)) = output.attach.take() {
             let _ = old.shutdown(std::net::Shutdown::Both);
         }
+        write_line(&mut writer, &Response::Attached { info })?;
         let ring = &output.ring;
         let take = (replay as usize).min(ring.len());
         let start = ring.len() - take;
