@@ -1129,11 +1129,13 @@ fn deep_intercept_catches_absolute_path_shell() {
     let src = tmp.join("h.c");
     // The payload prints several lines: a tiny (≤3-line) success is shown
     // verbatim by compact mode's fast path, which would hide the [ok] framing
-    // this test uses as proof of interception.
+    // this test uses as proof of interception. Builtins only — an external
+    // child (e.g. seq) inherits DYLD_INSERT_LIBRARIES and can abort on some
+    // macOS CI images.
     std::fs::write(
         &src,
         r#"#include <unistd.h>
-int main(void){char*a[]={"/bin/bash","-c","echo DEEP-TEST-HIT && seq 1 6",0};execv("/bin/bash",a);return 1;}"#,
+int main(void){char*a[]={"/bin/bash","-c","echo DEEP-TEST-HIT;echo L2;echo L3;echo L4;echo L5",0};execv("/bin/bash",a);return 1;}"#,
     )
     .unwrap();
     let bin = tmp.join("h");
