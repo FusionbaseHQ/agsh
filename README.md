@@ -1,223 +1,229 @@
-# Aegis Shell (`agsh`)
+<div align="center">
 
-A modern, from-scratch POSIX-style shell written in Rust — built for both humans
-and AI coding agents. It runs your normal Unix commands unchanged, adds a fast
-themed interactive editor, and gives agents a structured, token-efficient view of
-the world plus a kernel-enforced command guardrail.
+# `agsh` — Aegis Shell
 
-`agsh` never silently rewrites `ls`, `git`, `python`, `cargo`, or any other
-command into a custom alternative, and pipes/redirects always receive exact bytes.
-Native accelerations and rich displays are always opt-in (`agview file.py`,
-`semantic git diff`).
+**The shell that never loses your work — and speaks fluent agent.**
 
-```sh
-agsh --output semantic -c 'cargo test'      # compact, structured agent view
-agview src/main.rs                           # syntax-highlighted source
-agview diagram.png                           # inline image (any terminal)
-confine ls,df -- ./monitor.sh                # kernel-confined to ls + df (macOS)
+[![CI](https://github.com/FusionbaseHQ/agsh/actions/workflows/ci.yml/badge.svg)](https://github.com/FusionbaseHQ/agsh/actions/workflows/ci.yml)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-8b949e.svg)](#install-in-60-seconds)
+[![Rust](https://img.shields.io/badge/built%20with-Rust%2C%20no%20unsafe-f74c00.svg)](#-safe-by-construction)
+
+A modern POSIX-style shell, written from scratch in Rust, for humans **and** AI
+coding agents. Your commands run unchanged, your sessions survive closed
+laptops, and your agents burn fewer tokens.
+
+</div>
+
+---
+
+```console
+~/api ❯ agsh --keep
+agsh: kept session [k1] — closing this terminal only detaches it
+
+~/api ❯ claude        # agent three hours into a refactor…
+
+  # …lid closes. SSH drops. Terminal app quits. Doesn't matter.
+
+  # later, in any new terminal:
+~ ❯ agsh --attach
+  # → back inside k1: claude still running, scrollback replayed,
+  #   cwd, env, and children exactly where you left them
 ```
 
-## Highlights
+## Why agsh?
 
-- **POSIX-compatible** — pipelines, lists (`;`, `&&`, `||`, `&`), compound
-  commands, functions, here-docs, redirections, and the full expansion set
-  (parameter, command, arithmetic, brace, tilde, glob). Differential-tested
-  against `bash` (198/200) and `sh` (43/43).
-- **Built for agents** — token-economy output modes (`raw`, `compact`,
-  `semantic`, `lossless-ref`, `silent`, `rich`) deliver compact structured
-  observations while keeping raw output recoverable via `trace://` references.
-- **`confine` capability sandbox** — kernel-enforced (macOS) restriction of the
-  filesystem, network, and which commands a payload may run: `confine read-only --
-  python x.py`, `confine workspace -- ./build.sh`, `confine offline -- npm test`.
-  A hard floor *beneath* an agent's own permissions.
-- **Rich `agview`** — markdown, JSON, CSV/TSV, diffs, **inline images** (iTerm2/Kitty
-  protocols with a universal truecolor half-block fallback), and **syntax
-  highlighting** for a dozen languages.
-- **Sessions that survive the terminal** — `agsh --keep` runs your session under
-  a per-user PTY broker: closing the window or losing SSH during standby only
-  *detaches* it, and `agsh --attach` resumes it exactly where it was. `keep --
-  CMD` does the same for a single command (dev server, agent). No tmux required.
-- **Crash-safe sessions** — interactive sessions journal their state deltas as
-  they happen; after a crash, closed terminal, or reboot, `resume` replays cwd,
-  exports, aliases, functions, and options onto a new shell — and tells you what
-  was running, with a real resume path for Claude/Codex sessions. The shell also
-  announces wake-from-standby instead of silently pretending time didn't pass.
-- **Modern interactive editor** — syntax highlighting, completion, history with
-  reverse search and autosuggestions, themed truecolor UI, and `precmd`/`preexec`/
-  `chpwd` hooks.
-- **Safe by construction** — `unsafe` is forbidden in every first-party crate (the
-  optional `agsh-intercept` preload shim is the single, isolated exception), the
-  shell is fuzzed for panic-freedom, and security behavior is deterministic.
+Every other shell welds three lifetimes together: the **terminal**, the
+**shell state**, and the **processes**. Close the window and all three die.
+`agsh` separates them — and adds the observation layer agents have been
+missing.
 
-## Install
+### 🔌 Your work survives the terminal
 
-Requires a stable Rust toolchain (see `rust-toolchain.toml`).
+```sh
+keep -- npm run dev   # close the terminal — the dev server keeps running
+keep list             # any later shell sees it
+keep attach k1        # reattach, scrollback replayed (Ctrl-] detaches)
+
+agsh --keep           # or keep the WHOLE session
+agsh --attach         # terminal death only detaches; this resumes it
+```
+
+A per-user PTY broker (`agshd`, auto-started) owns kept processes, so they
+belong to *it*, not to the window you happened to start them in. Real
+controlling terminal — Ctrl-C works — output journaled to disk while nobody
+watches. Lifetime and scrollback **without tmux's windows, panes, and
+prefix-key world**.
+
+### 🧯 …and even survives crashes and reboots
+
+Interactive sessions journal their state *as it changes* — crash-only design,
+nothing is "saved on exit". After a crash, kill, or reboot:
+
+```sh
+resume            # cwd, exports, aliases, functions, options — restored
+resume list       # every restorable session (age, cwd, what was running)
+```
+
+Restore replays state deltas; it never re-runs commands. If a `claude`/`codex`
+agent died with the session, agsh points at its true resume path. And after
+standby, agsh says *"system was asleep ~2h — 1 background job still running"*
+instead of pretending time didn't pass.
+
+### 🤖 Built for AI agents
+
+Agents don't need 3,000 lines of `cargo test` noise in their context window —
+they need what failed, and a pointer to the rest:
+
+```sh
+semantic git diff                        # per-command
+agsh --output compact -c 'pytest -q'     # per-invocation
+mode:output compact                      # session default, changeable live
+```
+
+```jsonc
+// what an agent sees instead of a wall of raw output:
+{
+  "command": "cargo test",
+  "exit_code": 1,
+  "status": "failed",
+  "headline": "exit 1: 2 failure-like line(s)",
+  "failures": ["test keep::attach ... FAILED", "..."],
+  "raw_stdout": "trace://cmd_42/stdout"      // full bytes, on demand
+}
+```
+
+Six modes (`raw` · `clean` · `compact` · `semantic` · `lossless-ref` ·
+`silent`), family-aware compactors for git/cargo/test-runners/docker/…, and
+every raw byte stays recoverable via `trace://` references. Small outputs pass
+through verbatim — compaction never costs you information.
+
+### 🛡️ A sandbox you can actually enforce
+
+```sh
+confine read-only  -- python analyze.py   # read+run; no writes, network, or secret reads
+confine workspace  -- ./build.sh          # writes only inside $PWD (+ scratch)
+confine offline    -- npm test            # network off
+confine convert    -- ./thumb.sh          # may exec ONLY `convert`
+```
+
+Kernel-enforced (macOS Seatbelt; Linux Landlock planned — **fails closed**, it
+never runs a payload it can't restrict). No LLM judgment calls, no prompt-level
+"please don't" — a hard floor *beneath* an agent's own permission system.
+
+### ⚡ …and it's still just a shell
+
+Pipelines, lists, functions, here-docs, redirections, the full expansion set —
+differential-tested against `bash` (198/200) and `sh` (43/43) on every commit.
+`agsh` **never** silently rewrites `ls`, `git`, or `python` into custom
+alternatives, and pipes/redirects always receive exact bytes. Plus a fast
+themed editor: syntax highlighting as you type, completion dropdown, inline
+autosuggestions, reverse search.
+
+## What that looks like day to day
+
+| You want…                                    | Elsewhere                    | In agsh                      |
+| -------------------------------------------- | ---------------------------- | ---------------------------- |
+| Dev server survives the closed laptop        | tmux/screen ceremony         | `keep -- npm run dev`        |
+| Session survives dropped SSH                 | tmux + config                | `agsh --keep` → `--attach`   |
+| cwd/env/aliases back after a crash or reboot | gone                         | `resume`                     |
+| Agent reads a test run                       | full raw dump in context     | `semantic` summary + `trace://` |
+| Run an untrusted script safely               | hope                         | `confine read-only -- ./it`  |
+| Jump back into yesterday's Claude session    | hunt for the terminal        | `sessions` → `sessions 2`    |
+
+## Install in 60 seconds
+
+Requires a stable [Rust toolchain](https://rustup.rs) (pinned via
+`rust-toolchain.toml`).
 
 ```sh
 git clone https://github.com/FusionbaseHQ/agsh.git && cd agsh
 cargo build --release
-# the binary is at target/release/agsh
 install -m755 target/release/agsh ~/.local/bin/agsh   # or anywhere on PATH
-```
-
-Run it as your interactive shell:
-
-```sh
 agsh
 ```
 
-…or run a single command and exit:
+Then take it for a spin:
 
 ```sh
-agsh -c 'echo hello'
+keep -- python3 -m http.server   # now close this terminal. open a new one:
+keep list                        # …still running
+keep attach k1                   # welcome back (Ctrl-] detaches)
+
+agview README.md                 # rendered markdown, in your terminal
+agview photo.png                 # inline images (iTerm2/Kitty/WezTerm/Ghostty,
+                                 #   truecolor half-blocks everywhere else)
+semantic git status              # what your agent would see
+sessions                         # Claude/Codex sessions in this folder — resumable
 ```
 
-## Usage
+Non-interactive use works everywhere immediately: `agsh -c 'echo hello'`.
 
-### Output modes (for agents and humans)
+## The finer print (worth knowing)
 
-Select per command, per flag, or via the environment:
+<details>
+<summary><b>Output modes — selection & precedence</b></summary>
 
-```sh
-semantic git diff                       # per-command wrapper (one command)
-agsh --output compact -c 'pytest -q'    # flag (whole invocation)
-AGSH_OUTPUT_MODE=semantic agsh -c …     # env (whole session)
-mode:output compact                     # set the session default at runtime
-```
-
-**Session default mode.** Make *every* command render in a mode — so `ls` behaves
-like `compact ls` — by setting a session default. Priority (highest first):
-per-command wrapper → `--output` → `mode` builtin → `AGSH_OUTPUT_MODE` →
-`~/.config/agsh/token.toml`. In the config:
+Priority, highest first: per-command wrapper (`semantic git diff`) →
+`--output` flag → `mode` builtin → `AGSH_OUTPUT_MODE` env →
+`~/.config/agsh/token.toml`:
 
 ```toml
 [mode]
-default = "compact"   # applies to interactive sessions
+default = "compact"   # interactive sessions only
 ```
 
-Change it live with the `mode` builtin — a namespaced family so more mode aspects
-can be added over time:
+| Mode           | Use                                                     |
+| -------------- | ------------------------------------------------------- |
+| `raw`          | default; exact bytes, streamed                          |
+| `clean`        | raw minus ANSI/control noise                            |
+| `compact`      | trimmed, deduplicated; tiny outputs pass through as-is  |
+| `semantic`     | structured JSON observation of recognized commands      |
+| `lossless-ref` | compact view + `trace://` reference to the raw stream   |
+| `silent`       | suppress display, keep exit status + trace              |
+| `rich`         | human rich rendering (see `agview`)                     |
 
-```sh
-mode:output compact   # set the output aspect (mode compact is a shorthand)
-mode:output           # show one aspect
-mode                  # show all aspects
-mode:output off       # reset to the startup default
-```
+Session defaults apply to **interactive** sessions only — `agsh -c`, scripts,
+and pipes stay `raw`, so automation is never silently transformed. Secrets are
+redacted from observations by default (`[security]` in the config).
 
-The config/`mode` default applies to **interactive** sessions only — non-interactive
-`agsh -c` and scripts stay `raw`, so piped output is never silently transformed.
+</details>
 
-| Mode           | Use                                                       |
-| -------------- | --------------------------------------------------------- |
-| `raw`          | default; exact bytes, streamed                            |
-| `compact`      | trimmed, deduplicated output                              |
-| `semantic`     | structured observation of recognized commands             |
-| `lossless-ref` | compact view + a `trace://` reference to the raw stream   |
-| `silent`       | suppress display, keep exit status + trace                |
-| `rich`         | human rich rendering (see `agview`)                       |
+<details>
+<summary><b>Session resilience — the full model</b></summary>
 
-### `agview` — rich rendering
+Three independent layers (see [docs/SESSIONS.md](docs/SESSIONS.md)):
 
-```sh
-agview README.md        # markdown
-agview data.json        # pretty JSON
-agview report.csv       # aligned table
-agview change.diff      # colored diff
-agview src/main.py      # syntax-highlighted code (py, rs, js, ts, go, c, …)
-agview photo.jpg        # inline image (crisp in iTerm2/Kitty/WezTerm/Ghostty,
-                        # truecolor half-blocks elsewhere)
-```
+1. **State journal** — every interactive session appends cwd/env/alias/function
+   deltas to a crash-safe JSONL journal; `resume` replays them. An optional
+   startup banner (`[session] restore_banner = true`, off by default) points at
+   sessions that likely lost work.
+2. **Keep broker** — `agshd` owns PTYs for kept jobs and sessions; terminals
+   only ever *detach*. Output is logged (rotated) + a scrollback ring replays
+   on attach. Last attach wins; `keep stop` shuts the broker down (and hangs up
+   its jobs — documented, deliberate).
+3. **Resume recipes** — what can't be kept alive (host death) gets recognized:
+   Claude/Codex sessions resurface via `sessions N` with their context intact.
 
-Rich rendering is human-display only and TTY-gated: piped or redirected output
-always remains the raw bytes.
+The layers compose: a kept session still journals, so even broker/host death
+degrades to `resume`, not to nothing.
 
-> **Naming.** agsh's own tools are `ag`-prefixed *only where a bare name would
-> shadow a common CLI* (`agview` vs vim's `view`, `agpatch` vs `patch`, `agmath`,
-> `agz`, `agjump`, `agtrust`, `agcontext`, `agtrace`). The bare names are left to
-> the real tools. Conflict-free tools keep the clean bare name (`confine`, `peek`,
-> `risk`, `snapshot`, `pty`), and each also has an `ag…` alias for consistency.
+</details>
 
-### `confine` — capability sandbox for any tool or script
+<details>
+<summary><b>Naming — why <code>agview</code> and not <code>view</code></b></summary>
 
-A composable, kernel-enforced sandbox (macOS Seatbelt). Restrict the filesystem,
-network, and which commands a payload may run:
+agsh's own tools are `ag`-prefixed *only where a bare name would shadow a real
+CLI* (`agview` vs vim's `view`, `agpatch` vs `patch`, `agmath`, `agz`,
+`agjump`, `agtrust`, `agcontext`, `agtrace`). Conflict-free tools keep the
+clean bare name (`confine`, `peek`, `risk`, `snapshot`, `pty`, `keep`,
+`resume`, `sessions`) and also accept an `ag…` alias. Your muscle memory for
+real tools always wins.
 
-```sh
-confine read-only -- python analyze.py   # read+run; no writes, no network, no secret reads
-confine workspace -- ./build.sh          # writes only within the project ($PWD) + scratch
-confine offline -- npm test              # network off; filesystem unchanged
-confine convert,identify -- ./thumb.sh   # exec-allowlist: may only run convert/identify
-confine read-only --rw ./out -- ./tool   # read-only except ./out is writable
-confine --explain read-only -- foo       # print the granted/denied capabilities
-```
+</details>
 
-`read-only`/`workspace` are no-network and secret-reads-denied by default (so a
-script can't read `~/.ssh` *and* exfiltrate); a private scratch dir keeps tools
-that need temp files working. The bare exec-allowlist form
-(`confine ls,df -- monitor.sh`) and the launch form (`agsh --allow ls,df --run …`)
-still work.
-
-Self-managing agents (e.g. `claude`) are refused with guidance to use their own
-permission systems — their broad runtime can't be reduced to a small allowlist.
-`--force` overrides; `--best-effort` falls back to the shim layer. `confine`
-currently requires **macOS** (Seatbelt); on Linux (Landlock is planned) and
-elsewhere it **fails closed** rather than running unconfined. See
-[`docs/CONFINE.md`](docs/CONFINE.md).
-
-### `sessions` — resume Claude / Codex sessions
-
-Find the Claude Code and Codex (OpenAI) sessions that ran in this folder (and its
-subfolders) and jump back into one:
-
-```sh
-sessions          # list sessions here, newest first (agent, age, id, summary)
-sessions 2        # resume the 2nd listed session
-sessions --all    # every folder, not just this one
-```
-
-Resume runs `claude --resume <id>` / `codex resume <id>` from the session's
-directory. In a hyperlink-aware terminal each row is clickable (opens the
-transcript). Sessions are matched by the real `cwd` recorded inside each one.
-
-### `resume` — survive crashes, hangups, and reboots
-
-Interactive sessions journal their state deltas (cwd, exports, vars, aliases,
-functions, options, running jobs) as they happen — crash-only design, nothing
-is saved "at exit". When a session dies without a clean exit (crash, closed
-terminal, dropped SSH, reboot), the next interactive shell offers it back:
-
-```sh
-resume          # restore the most recent dead session's state
-resume list     # show restorable sessions (age, cwd, changes, what ran)
-resume 2        # restore the 2nd listed one
-```
-
-Restore replays state deltas — it never re-runs commands. If an agent
-(`claude`/`codex`) was running when the session died, agsh points at the real
-resume path (`sessions`); surviving background jobs are rediscovered with a
-pid-reuse-safe liveness check. See [docs/SESSIONS.md](docs/SESSIONS.md).
-
-### `keep` — processes that survive the terminal
-
-The `agshd` broker (auto-started, per user) owns pseudo-terminals, so kept
-processes belong to it — not to the window you happened to start them in:
-
-```sh
-keep -- npm run dev   # kept job: close the terminal, it keeps running
-keep list             # id, state, age, command
-keep attach k1        # reattach with scrollback replay (Ctrl-] detaches)
-
-agsh --keep           # keep the WHOLE session: terminal death only detaches
-agsh --attach         # ...and this resumes it, exactly where it was
-```
-
-One PTY per job, output journaled, real controlling terminal (Ctrl-C works) —
-lifetime and scrollback without tmux's windows/panes/prefix-key world. Kept
-sessions still journal their state, so even a reboot degrades gracefully to
-`resume`. See [docs/SESSIONS.md](docs/SESSIONS.md).
-
-## Repository layout
+<details>
+<summary><b>Repository layout</b></summary>
 
 ```text
 crates/
@@ -235,18 +241,14 @@ crates/
   agsh-index/    project/filesystem indexer
   agsh-compat/   command resolution / POSIX compatibility
 
-docs/            architecture, confine sandbox, configuration
+docs/            architecture, confine sandbox, configuration, sessions
 tests/           golden checks, differential (vs bash/sh), interactive (PTY)
 ```
 
-## Documentation
+</details>
 
-- [Architecture](docs/ARCHITECTURE.md) — crates, execution pipeline, design contract
-- [`confine` sandbox](docs/CONFINE.md) — capability sandbox, presets, guarantees
-- [Configuration](docs/CONFIGURATION.md) — output modes, config files, environment
-- [Session resilience](docs/SESSIONS.md) — crash-safe journaling, `resume`, the keep broker, wake detection
-
-## Development
+<details>
+<summary><b>Development & test suites</b></summary>
 
 ```sh
 cargo fmt --all
@@ -260,22 +262,42 @@ python3 tests/differential/posix.py               # parity vs sh
 python3 tests/interactive/run.py                  # PTY editor/completion/render
 ```
 
-CI runs all of the above on Linux and macOS (`.github/workflows/ci.yml`).
+CI runs all of the above on Linux and macOS
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
-## Design contract
+</details>
 
-- Developers type normal commands; external commands execute normally.
-- Environment variables, pipes, and redirects behave normally and receive exact
-  bytes.
-- Agents receive compact structured observations; raw output stays recoverable.
-- The shell never silently rewrites standard commands into custom alternatives.
+## 🦀 Safe by construction
+
+`unsafe` is **forbidden** in every first-party crate — including the PTY
+broker daemon (the optional `agsh-intercept` preload shim is the single,
+isolated exception, and it's never linked into the shell). The parser and
+executor are fuzzed for panic-freedom, and security behavior is deterministic
+by design: no LLM ever makes a sandboxing decision.
+
+## The promises
+
+1. **Normal commands run normally.** No silent rewrites, ever.
+2. **Pipes and redirects receive exact bytes.** Rich rendering and compaction
+   are display-only and TTY-gated.
+3. **Agents get structure; raw stays recoverable.** Every observation can point
+   back to the exact bytes.
+4. **Security is enforced, not suggested.** Kernel sandboxing that fails
+   closed, deterministic risk analysis.
+
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md) — crates, execution pipeline, design contract
+- [Session resilience](docs/SESSIONS.md) — journaling, `resume`, the keep broker, wake detection
+- [`confine` sandbox](docs/CONFINE.md) — capability sandbox, presets, guarantees
+- [Configuration](docs/CONFIGURATION.md) — output modes, config files, environment
 
 ## License
 
 Copyright © 2026 Fusionbase and the `agsh` contributors.
 
-Licensed under the **GNU Affero General Public License v3.0** — see [`LICENSE`](LICENSE).
-
-The AGPL's network-use clause (section 13) applies: if you run a modified version of
-`agsh` and let users interact with it over a network, you must offer them the
-corresponding source. Contributions are accepted under the same license.
+Licensed under the **GNU Affero General Public License v3.0** — see
+[`LICENSE`](LICENSE). The AGPL's network-use clause (section 13) applies: if
+you run a modified version of `agsh` and let users interact with it over a
+network, you must offer them the corresponding source. Contributions are
+accepted under the same license.
