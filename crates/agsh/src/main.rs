@@ -6,7 +6,7 @@ use agsh_core::parse_line;
 use agsh_exec::{print_captured_if_needed, ExecutionOptions, Executor, ShellState};
 use agsh_output::OutputMode;
 use agsh_policy::{analyze_graph, RiskLevel};
-use agsh_tty::{read_line, render_prompt};
+use agsh_tty::{pick_history, read_line, read_line_with_initial, render_prompt, HistorySelection};
 
 #[derive(Debug, Default)]
 struct CliOptions {
@@ -375,7 +375,7 @@ fn main() {
         if integrate {
             prompt.push_str("\x1b]133;B\x07");
         }
-        let line = match read_line(&prompt, &state) {
+        let mut line = match read_line(&prompt, &state) {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(error) => {
@@ -383,6 +383,13 @@ fn main() {
                 break;
             }
         };
+
+        if line.trim() == "history tui" {
+            let Some(selected) = resolve_history_tui_line(&state, integrate) else {
+                continue;
+            };
+            line = selected;
+        }
 
         if line.trim().is_empty() {
             continue;
@@ -445,6 +452,34 @@ fn main() {
     // Clean end: mark the journal so this session is never offered for restore.
     if let Some(recorder) = &session_recorder {
         recorder.finish(state.last_status());
+    }
+}
+
+fn resolve_history_tui_line(state: &ShellState, integrate: bool) -> Option<String> {
+    match pick_history(state) {
+        Ok(Some(HistorySelection::Run(command))) => Some(command),
+        Ok(Some(HistorySelection::Edit(command))) => {
+            if integrate {
+                shell_integration_prompt(state);
+            }
+            let mut prompt = render_prompt(state);
+            if integrate {
+                prompt.push_str("\x1b]133;B\x07");
+            }
+            match read_line_with_initial(&prompt, state, &command) {
+                Ok(Some(line)) if !line.trim().is_empty() => Some(line),
+                Ok(_) => None,
+                Err(error) => {
+                    eprintln!("agsh: read error: {error}");
+                    None
+                }
+            }
+        }
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!("agsh: history tui: {error}");
+            None
+        }
     }
 }
 
@@ -816,7 +851,7 @@ fn run_one(
     state: &mut ShellState,
     options: &ExecutionOptions,
 ) -> Result<i32, agsh_core::ShellError> {
-    state.record_history(line);
+    state.record_history_with_mode(line, Some(options.output_mode));
     let started = std::time::Instant::now();
     let result = run_one_inner(line, executor, state, options);
     // Remove any temp files created for process substitutions on this line.

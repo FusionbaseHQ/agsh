@@ -8,6 +8,7 @@ pub mod raw;
 pub mod readline;
 pub mod render;
 
+pub use editor::{pick_history, HistorySelection};
 pub use prompt::render_prompt;
 pub use raw::{arm_terminal_restore_on_signals, arm_terminal_restore_on_signals_with};
-pub use readline::read_line;
+pub use readline::{read_line, read_line_with_initial};

@@ -17,7 +17,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pty_helper import Session, ENTER, TAB, ESC, CTRL_C, CTRL_U, CTRL_A, CTRL_E, RIGHT  # noqa: E402
+from pty_helper import Session, ENTER, TAB, ESC, CTRL_C, CTRL_U, CTRL_A, CTRL_E, CTRL_R, RIGHT  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -186,15 +186,48 @@ def _seed_history(path, commands):
 def scenario_reverse_search():
     hist = "/tmp/agsh-pty-rsearch.jsonl"
     _seed_history(hist, ["echo apple", "echo banana", "echo cherry"])
-    from pty_helper import CTRL_R
     s = Session(history=hist)
     try:
         s.send(CTRL_R, 0.3)
         scr = s.screen()
-        check("reverse-search prompt opens", "search" in scr.lower() or "`" in scr or ":" in scr, scr)
+        check("history picker opens", "history [" in scr and "fuzzy" in scr, scr)
         s.send("banana", 0.3)
         s.send(ENTER, 0.4)
         check("reverse-search runs the matched command", "banana" in s.screen(), s.screen())
+    finally:
+        s.close()
+
+
+def scenario_history_picker_tab_edits_and_mode_cycles():
+    hist = "/tmp/agsh-pty-history-picker.jsonl"
+    _seed_history(hist, ["echo picker-run", "echo picker-edit", "git status"])
+    s = Session(history=hist)
+    try:
+        s.send(CTRL_R, 0.3)
+        s.send("\x13", 0.2)  # Ctrl-S: fuzzy -> prefix
+        scr = s.screen()
+        check("history picker cycles search mode", "prefix" in scr, scr)
+        s.send("echo picker-e", 0.3)
+        s.send(TAB, 0.3)
+        scr = s.screen()
+        check("tab inserts selected history command for editing", "echo picker-edit" in scr, scr)
+        s.send(ENTER, 0.5)
+        check("edited history command runs", "picker-edit" in s.screen(), s.screen())
+    finally:
+        s.close()
+
+
+def scenario_history_tui_command_opens_picker():
+    hist = "/tmp/agsh-pty-history-tui.jsonl"
+    _seed_history(hist, ["echo tui-command", "echo other"])
+    s = Session(history=hist)
+    try:
+        s.send("history tui" + ENTER, 0.4)
+        scr = s.screen()
+        check("history tui opens picker", "history [" in scr and "tui-command" in scr, scr)
+        s.send("tui", 0.3)
+        s.send(ENTER, 0.5)
+        check("history tui selection runs", "tui-command" in s.screen(), s.screen())
     finally:
         s.close()
 
@@ -727,6 +760,8 @@ SCENARIOS = [
     scenario_ctrl_c_aborts_line,
     scenario_heredoc_continuation,
     scenario_reverse_search,
+    scenario_history_picker_tab_edits_and_mode_cycles,
+    scenario_history_tui_command_opens_picker,
     scenario_autosuggestion_accept,
     scenario_completion_accept_and_run,
 ]

@@ -36,6 +36,10 @@ pub enum Key {
     Clear,
     /// Ctrl-R — reverse history search.
     ReverseSearch,
+    /// Ctrl-S — cycle search mode inside the history picker.
+    SearchMode,
+    /// Alt-1..9 — quick-select a visible history result.
+    AltDigit(u8),
     /// Ctrl-C — abort the current line.
     Interrupt,
     /// Ctrl-D — EOF on empty line / delete char otherwise.
@@ -76,6 +80,7 @@ pub fn decode(buf: &[u8]) -> Decoded {
         0x0e => Decoded::Key(Key::Down, 1), // Ctrl-N
         0x10 => Decoded::Key(Key::Up, 1),   // Ctrl-P
         0x12 => Decoded::Key(Key::ReverseSearch, 1),
+        0x13 => Decoded::Key(Key::SearchMode, 1),
         0x15 => Decoded::Key(Key::KillToStart, 1),
         0x17 => Decoded::Key(Key::KillWord, 1),
         0x1b => decode_escape(buf),
@@ -93,6 +98,7 @@ fn decode_escape(buf: &[u8]) -> Decoded {
         Some(b'f') => Decoded::Key(Key::WordRight, 2),
         Some(b'd') => Decoded::Key(Key::DeleteWord, 2),
         Some(0x7f) => Decoded::Key(Key::KillWord, 2),
+        Some(d @ b'1'..=b'9') => Decoded::Key(Key::AltDigit(d - b'0'), 2),
         // A lone ESC (no following byte yet would be Incomplete above); treat a
         // standalone ESC followed by a non-sequence byte as Escape consuming 1.
         Some(_) => Decoded::Key(Key::Escape, 1),
@@ -214,6 +220,7 @@ mod tests {
         assert_eq!(decode(b"\x7f"), Decoded::Key(Key::Backspace, 1));
         assert_eq!(decode(b"\x01"), Decoded::Key(Key::LineStart, 1));
         assert_eq!(decode(b"\x12"), Decoded::Key(Key::ReverseSearch, 1));
+        assert_eq!(decode(b"\x13"), Decoded::Key(Key::SearchMode, 1));
         assert_eq!(decode(b"\x03"), Decoded::Key(Key::Interrupt, 1));
     }
 
@@ -224,6 +231,7 @@ mod tests {
         assert_eq!(decode(b"\x1b[3~"), Decoded::Key(Key::Delete, 4));
         assert_eq!(decode(b"\x1b[1;5C"), Decoded::Key(Key::WordRight, 6));
         assert_eq!(decode(b"\x1bOH"), Decoded::Key(Key::Home, 3));
+        assert_eq!(decode(b"\x1b3"), Decoded::Key(Key::AltDigit(3), 2));
     }
 
     #[test]

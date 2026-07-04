@@ -12621,6 +12621,97 @@ mod tests {
     }
 
     #[test]
+    fn history_search_list_and_stats_are_richer() {
+        let mut state = ShellState::from_current_process();
+        state.record_history("cargo check");
+        state.finalize_history(0, 1200);
+        state.record_history("cargo test parser");
+        state.finalize_history(101, 3400);
+        state.record_history("git status");
+        state.finalize_history(0, 20);
+        let mut executor = Executor::new();
+
+        let list = executor
+            .run_graph(
+                &parse_line("history list --limit 2").unwrap(),
+                &mut state,
+                &ExecutionOptions::default(),
+            )
+            .unwrap();
+        let list_text = String::from_utf8_lossy(&list.stdout);
+        assert!(list_text.contains("git status"), "list: {list_text}");
+        assert!(list_text.contains("ok"), "list: {list_text}");
+
+        let search = executor
+            .run_graph(
+                &parse_line("history search --mode family cargo").unwrap(),
+                &mut state,
+                &ExecutionOptions::default(),
+            )
+            .unwrap();
+        let search_text = String::from_utf8_lossy(&search.stdout);
+        assert!(search_text.contains("cargo check"), "search: {search_text}");
+        assert!(
+            search_text.contains("cargo test parser"),
+            "search: {search_text}"
+        );
+        assert!(!search_text.contains("git status"), "search: {search_text}");
+
+        let failed = executor
+            .run_graph(
+                &parse_line("history search --failed").unwrap(),
+                &mut state,
+                &ExecutionOptions::default(),
+            )
+            .unwrap();
+        let failed_text = String::from_utf8_lossy(&failed.stdout);
+        assert!(
+            failed_text.contains("cargo test parser"),
+            "failed: {failed_text}"
+        );
+        assert!(!failed_text.contains("git status"), "failed: {failed_text}");
+
+        let json = executor
+            .run_graph(
+                &parse_line("history search --json cargo").unwrap(),
+                &mut state,
+                &ExecutionOptions::default(),
+            )
+            .unwrap();
+        let json_text = String::from_utf8_lossy(&json.stdout);
+        assert!(json_text.contains("\"command\""), "json: {json_text}");
+        assert!(json_text.contains("\"family\""), "json: {json_text}");
+
+        let stats = executor
+            .run_graph(
+                &parse_line("history stats").unwrap(),
+                &mut state,
+                &ExecutionOptions::default(),
+            )
+            .unwrap();
+        let stats_text = String::from_utf8_lossy(&stats.stdout);
+        assert!(stats_text.contains("commands: 3"), "stats: {stats_text}");
+        assert!(stats_text.contains("cargo"), "stats: {stats_text}");
+    }
+
+    #[test]
+    fn history_records_session_output_mode_and_family_metadata() {
+        let mut state = ShellState::from_current_process();
+        state.export_var("AGSH_SESSION", "session-test");
+        state.record_history_with_mode(
+            "semantic cargo check",
+            Some(agsh_output::OutputMode::Semantic),
+        );
+        state.finalize_history(0, 42);
+
+        let entries = state.history_entries();
+        let entry = entries.last().expect("history entry");
+        assert_eq!(entry.session_id.as_deref(), Some("session-test"));
+        assert_eq!(entry.output_mode.as_deref(), Some("semantic"));
+        assert_eq!(entry.command_family.as_deref(), Some("cargo"));
+    }
+
+    #[test]
     fn test_builtin_evaluates_strings_numbers_and_brackets() {
         let mut state = ShellState::from_current_process();
         let mut executor = Executor::new();

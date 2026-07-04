@@ -10,7 +10,7 @@
 use std::io::{self, Read, Write};
 
 use agsh_core::is_incomplete;
-use agsh_exec::ShellState;
+use agsh_exec::{HistoryEntry, HistoryQuery, HistoryScope, SearchMode, ShellState};
 use agsh_style::Role;
 
 use crate::buffer::LineBuffer;
@@ -31,16 +31,48 @@ struct CompletionMenu {
     selected: usize,
 }
 
+enum HistoryPick {
+    Run(String),
+    Edit(String),
+    Cancel,
+}
+
+pub enum HistorySelection {
+    Run(String),
+    Edit(String),
+}
+
 /// Read one complete command using the raw-mode editor. Restores the terminal
 /// on return (including on error/panic via the `RawGuard`'s `Drop`).
 pub fn read_line_raw(prompt: &str, state: &ShellState) -> io::Result<Option<String>> {
+    read_line_raw_with_initial(prompt, state, "")
+}
+
+pub fn read_line_raw_with_initial(
+    prompt: &str,
+    state: &ShellState,
+    initial: &str,
+) -> io::Result<Option<String>> {
     let _raw = RawGuard::new()?;
-    let mut editor = Editor::new(prompt.to_string(), state);
+    let mut editor = Editor::new_with_initial(prompt.to_string(), state, initial);
     let result = editor.run();
     // Leave the cursor on a fresh line regardless of how we exited.
     let mut out = io::stdout();
     let _ = out.flush();
     result
+}
+
+pub fn pick_history(state: &ShellState) -> io::Result<Option<HistorySelection>> {
+    let _raw = RawGuard::new()?;
+    let mut editor = Editor::new(String::new(), state);
+    let pick = editor.history_picker()?;
+    editor.move_to_end()?;
+    write_all(b"\r\n")?;
+    Ok(match pick {
+        HistoryPick::Run(command) => Some(HistorySelection::Run(command)),
+        HistoryPick::Edit(command) => Some(HistorySelection::Edit(command)),
+        HistoryPick::Cancel => None,
+    })
 }
 
 struct Editor<'a> {
@@ -64,11 +96,19 @@ struct Editor<'a> {
 
 impl<'a> Editor<'a> {
     fn new(prompt: String, state: &'a ShellState) -> Self {
+        Self::new_with_initial(prompt, state, "")
+    }
+
+    fn new_with_initial(prompt: String, state: &'a ShellState, initial: &str) -> Self {
         let (rows, cols) = term_size();
+        let mut buffer = LineBuffer::new();
+        if !initial.is_empty() {
+            buffer.insert_str(initial);
+        }
         Self {
             state,
             prompt,
-            buffer: LineBuffer::new(),
+            buffer,
             accumulated: String::new(),
             rendered_rows: 0,
             cursor_rpos: 0,
@@ -190,14 +230,25 @@ impl<'a> Editor<'a> {
                     self.cursor_rpos = 0;
                     self.render()?;
                 }
-                Key::ReverseSearch => {
-                    self.reverse_search()?;
-                }
+                Key::ReverseSearch => match self.history_picker()? {
+                    HistoryPick::Run(command) => {
+                        self.move_to_end()?;
+                        write_all(b"\r\n")?;
+                        return Ok(Some(command));
+                    }
+                    HistoryPick::Edit(command) => {
+                        self.buffer.set(&command);
+                        self.render()?;
+                    }
+                    HistoryPick::Cancel => {
+                        self.render()?;
+                    }
+                },
                 Key::Tab => {
                     self.open_completion();
                     self.render()?;
                 }
-                Key::BackTab | Key::Escape | Key::Unknown => {}
+                Key::SearchMode | Key::AltDigit(_) | Key::BackTab | Key::Escape | Key::Unknown => {}
             }
         }
     }
@@ -342,62 +393,171 @@ impl<'a> Editor<'a> {
         }
     }
 
-    /// Incremental reverse history search (Ctrl-R). Typing refines the query;
-    /// Ctrl-R cycles to the next match; Enter accepts; Esc/Ctrl-C cancels.
-    fn reverse_search(&mut self) -> io::Result<()> {
-        let mut query = String::new();
-        let mut match_index = 0usize;
+    /// Native history picker (Ctrl-R): fuzzy/prefix/fulltext/family modes,
+    /// scoped search, metadata rows, Enter-to-run, and Tab-to-edit.
+    fn history_picker(&mut self) -> io::Result<HistoryPick> {
+        let mut query = self.buffer.text();
+        let mut selected = 0usize;
+        let mut scope = 0usize;
+        let mut mode = SearchMode::Fuzzy;
+
         loop {
-            let matches = if query.is_empty() {
-                Vec::new()
-            } else {
-                self.state.history_search(&query, 50)
-            };
-            let current = matches.get(match_index).map(|e| e.command.clone());
-            self.render_search(&query, current.as_deref())?;
+            let rows = self.history_picker_rows(&query, scope, mode);
+            if selected >= rows.len() {
+                selected = rows.len().saturating_sub(1);
+            }
+            self.render_history_picker(&query, scope, mode, selected, &rows)?;
 
             match self.reader.next_key()? {
                 Key::Enter => {
-                    if let Some(cmd) = current {
-                        self.buffer.set(&cmd);
+                    if let Some(row) = rows.get(selected) {
+                        return Ok(HistoryPick::Run(row.command.clone()));
                     }
-                    break;
+                    return Ok(HistoryPick::Cancel);
+                }
+                Key::Tab => {
+                    if let Some(row) = rows.get(selected) {
+                        return Ok(HistoryPick::Edit(row.command.clone()));
+                    }
+                }
+                Key::AltDigit(n) => {
+                    let idx = n.saturating_sub(1) as usize;
+                    if let Some(row) = rows.get(idx) {
+                        return Ok(HistoryPick::Run(row.command.clone()));
+                    }
+                }
+                Key::Up => selected = selected.saturating_sub(1),
+                Key::Down => {
+                    if selected + 1 < rows.len() {
+                        selected += 1;
+                    }
                 }
                 Key::ReverseSearch => {
-                    if match_index + 1 < matches.len() {
-                        match_index += 1;
-                    }
+                    scope = (scope + 1) % HISTORY_SCOPES.len();
+                    selected = 0;
+                }
+                Key::SearchMode => {
+                    mode = next_history_mode(mode);
+                    selected = 0;
                 }
                 Key::Backspace => {
                     query.pop();
-                    match_index = 0;
+                    selected = 0;
+                }
+                Key::KillToStart => {
+                    query.clear();
+                    selected = 0;
                 }
                 Key::Char(c) => {
                     query.push(c);
-                    match_index = 0;
+                    selected = 0;
                 }
-                Key::Interrupt | Key::Escape => break,
-                _ => break,
+                Key::Interrupt | Key::Escape => return Ok(HistoryPick::Cancel),
+                _ => {}
             }
         }
-        self.render()
     }
 
-    fn render_search(&mut self, query: &str, current: Option<&str>) -> io::Result<()> {
-        let shown = current.unwrap_or("");
-        let line = format!("(reverse-i-search)`{query}': {shown}");
-        let total = line.chars().count();
-        let cursor = "(reverse-i-search)`".chars().count() + query.chars().count();
-        let (seq, rows, rpos) = render_block(
-            &line,
+    fn history_picker_rows(
+        &self,
+        query: &str,
+        scope_index: usize,
+        mode: SearchMode,
+    ) -> Vec<HistoryEntry> {
+        let (scope, _) = history_scope(self.state, scope_index);
+        let q = HistoryQuery {
+            text: query.to_string(),
+            mode,
+            scope,
+            limit: MENU_ROWS,
+            dedupe: true,
+            ..HistoryQuery::default()
+        };
+        self.state
+            .history_query(&q)
+            .into_iter()
+            .map(|row| row.entry)
+            .collect()
+    }
+
+    fn render_history_picker(
+        &mut self,
+        query: &str,
+        scope_index: usize,
+        mode: SearchMode,
+        selected: usize,
+        rows: &[HistoryEntry],
+    ) -> io::Result<()> {
+        let theme = self.state.theme();
+        let (_, scope_label) = history_scope(self.state, scope_index);
+        let mode_label = history_mode_label(mode);
+        let prefix = format!("history [{scope_label}/{mode_label}] ");
+        let content = format!(
+            "{}{}",
+            theme.paint(Role::ModeKeyword, &prefix),
+            theme.paint(Role::Match, query)
+        );
+        let total = visible_width(&content);
+        let cursor = total;
+
+        let mut menu = Vec::new();
+        if rows.is_empty() {
+            menu.push(theme.paint(Role::Muted, "  no matches"));
+        } else {
+            for (i, row) in rows.iter().enumerate() {
+                let index = format!("{}", i + 1);
+                let status = match row.exit_code {
+                    Some(0) => theme.paint(Role::Ok, "ok"),
+                    Some(_) => theme.paint(Role::Error, "!!"),
+                    None => theme.paint(Role::Muted, "--"),
+                };
+                let duration = theme.paint(Role::Muted, &history_duration(row.duration_ms));
+                let cwd = short_path(&row.cwd);
+                let branch = row
+                    .git_branch
+                    .as_deref()
+                    .map(|b| format!(" {b}"))
+                    .unwrap_or_default();
+                let mut line = format!(
+                    " {index:>1}  {status} {duration:>7}  {}",
+                    truncate_one_line(&row.command, self.cols.saturating_sub(24).max(24)),
+                );
+                if !cwd.is_empty() || !branch.is_empty() {
+                    line.push_str(&theme.paint(
+                        Role::Muted,
+                        &format!("  {}{}", truncate_one_line(&cwd, 28), branch),
+                    ));
+                }
+                if i == selected {
+                    menu.push(theme.paint(Role::Selected, &line));
+                } else {
+                    menu.push(line);
+                }
+            }
+            if let Some(row) = rows.get(selected) {
+                menu.push(theme.paint(
+                    Role::Muted,
+                    &format!(
+                        " enter run  tab edit  ctrl-r scope  ctrl-s mode  cwd {}",
+                        truncate_one_line(
+                            &short_path(&row.cwd),
+                            self.cols.saturating_sub(52).max(12)
+                        )
+                    ),
+                ));
+            }
+        }
+
+        let (seq, rows_count, rpos) = render_block(
+            &content,
             total,
             cursor,
-            &[],
+            &menu,
             self.cols,
             self.rendered_rows,
             self.cursor_rpos,
         );
-        self.rendered_rows = rows;
+        self.rendered_rows = rows_count;
         self.cursor_rpos = rpos;
         write_all(seq.as_bytes())
     }
@@ -647,6 +807,87 @@ impl<'a> Editor<'a> {
             CandidateKind::History => icons.history(),
             _ => "",
         }
+    }
+}
+
+const HISTORY_SCOPES: &[&str] = &["global", "directory", "workspace", "session", "failures"];
+
+fn history_scope(state: &ShellState, index: usize) -> (HistoryScope, &'static str) {
+    match HISTORY_SCOPES[index % HISTORY_SCOPES.len()] {
+        "directory" => (
+            HistoryScope::Cwd(state.cwd().display().to_string()),
+            "directory",
+        ),
+        "workspace" => state
+            .git_context()
+            .map(|g| {
+                (
+                    HistoryScope::Project(g.root.display().to_string()),
+                    "workspace",
+                )
+            })
+            .unwrap_or((
+                HistoryScope::Cwd(state.cwd().display().to_string()),
+                "directory",
+            )),
+        "session" => state
+            .lookup("AGSH_SESSION")
+            .map(|s| (HistoryScope::Session(s.to_string()), "session"))
+            .unwrap_or((HistoryScope::Global, "global")),
+        "failures" => (HistoryScope::Failures, "failures"),
+        _ => (HistoryScope::Global, "global"),
+    }
+}
+
+fn next_history_mode(mode: SearchMode) -> SearchMode {
+    match mode {
+        SearchMode::Fuzzy => SearchMode::Prefix,
+        SearchMode::Prefix => SearchMode::FullText,
+        SearchMode::FullText => SearchMode::Family,
+        SearchMode::Family => SearchMode::Exact,
+        SearchMode::Exact => SearchMode::Fuzzy,
+    }
+}
+
+fn history_mode_label(mode: SearchMode) -> &'static str {
+    match mode {
+        SearchMode::Fuzzy => "fuzzy",
+        SearchMode::Prefix => "prefix",
+        SearchMode::FullText => "fulltext",
+        SearchMode::Exact => "exact",
+        SearchMode::Family => "family",
+    }
+}
+
+fn history_duration(ms: u64) -> String {
+    if ms == 0 {
+        "-".to_string()
+    } else if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{}m{}s", ms / 60_000, (ms % 60_000) / 1_000)
+    }
+}
+
+fn short_path(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => path
+            .strip_prefix(&home)
+            .map(|rest| format!("~{rest}"))
+            .unwrap_or_else(|| path.to_string()),
+        _ => path.to_string(),
+    }
+}
+
+fn truncate_one_line(value: &str, max: usize) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.chars().count() <= max {
+        value
+    } else {
+        let head: String = value.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}\u{2026}")
     }
 }
 

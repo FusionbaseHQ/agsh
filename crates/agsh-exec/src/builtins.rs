@@ -3,6 +3,7 @@ use std::process::Command;
 
 use agsh_compat::{CommandResolution, Resolver};
 use agsh_core::{CommandInvocation, ShellError};
+use agsh_store::history::{HistoryEntry, HistoryQuery, HistoryScope, SearchMode};
 use rustix::process::Signal;
 
 use crate::state::LoopControlKind;
@@ -539,6 +540,7 @@ Sandbox
   pty CMD                 run CMD under a pseudo-terminal
 
 Agent & workflow tools
+  history search QUERY    search native history by scope/mode; Ctrl-R opens the picker
   sessions [N]            list / resume the Claude & Codex sessions for this folder
   resume [list | N]       restore the shell state of a session that died (crash/HUP)
   keep -- CMD             run CMD under the keep broker: it survives this terminal
@@ -697,6 +699,31 @@ automatically when you enter it (project environments require explicit trust).
             "\
 agcontext [--json] — print a structured snapshot of the shell / project context
 (cwd, git, recent commands, last result) for an agent. --json for machine parsing.
+"
+        }
+        "history" => {
+            "\
+history — native command history, with rich metadata and an interactive picker.
+
+  history                 legacy numbered list (script-compatible)
+  history N               last N entries, legacy format
+  history -c              clear in-memory history
+  history list [--limit N] [--json|--plain]
+                          recent commands with exit, duration, cwd, branch, mode
+  history search [opts] QUERY
+                          ranked search; --json for structured rows
+  history stats           counts, common command families, slowest commands
+  history session         commands from the current AGSH_SESSION
+
+Search options:
+  --mode fuzzy|prefix|fulltext|exact|family
+  --scope global|host|session|cwd|project|git-root|failures|long
+  --failed        only non-zero exits       --exit N        exact exit code
+  --duration >10s / <500ms                  --limit N       result count
+
+At the prompt, Ctrl-R opens the native picker. Inside it:
+  Enter runs, Tab inserts for editing, Ctrl-R cycles scope, Ctrl-S cycles mode,
+  Alt-1..9 quick-runs a visible row.
 "
         }
         "peek" | "agpeek" => {
@@ -1752,18 +1779,27 @@ fn builtin_unabbr(args: &[String], state: &mut ShellState) -> Result<CommandOutc
 
 fn builtin_history(args: &[String], state: &mut ShellState) -> CommandOutcome {
     match args {
-        [] => history_list(state, state.history_len()),
-        [arg] if arg == "-c" => {
+        [] => history_legacy_list(state, state.history_len()),
+        [arg] if arg == "-c" || arg == "clear" => {
             state.clear_history();
             CommandOutcome::captured(0, Vec::new(), Vec::new())
         }
+        [cmd, rest @ ..] if cmd == "list" => history_rich_list(rest, state),
+        [cmd, rest @ ..] if cmd == "search" => history_search(rest, state),
+        [cmd, rest @ ..] if cmd == "session" => history_session(rest, state),
+        [cmd, rest @ ..] if cmd == "stats" => history_stats(rest, state),
+        [cmd] if cmd == "tui" => CommandOutcome::captured(
+            0,
+            b"history tui: press Ctrl-R at the prompt to open the native history picker\n".to_vec(),
+            Vec::new(),
+        ),
         [arg] if arg.starts_with('-') => CommandOutcome::captured(
             2,
             Vec::new(),
             format!("history: unsupported option: {arg}\n").into_bytes(),
         ),
         [arg] => match arg.parse::<usize>() {
-            Ok(limit) => history_list(state, limit),
+            Ok(limit) => history_legacy_list(state, limit),
             Err(_) => CommandOutcome::captured(
                 2,
                 Vec::new(),
@@ -1774,7 +1810,7 @@ fn builtin_history(args: &[String], state: &mut ShellState) -> CommandOutcome {
     }
 }
 
-fn history_list(state: &ShellState, limit: usize) -> CommandOutcome {
+fn history_legacy_list(state: &ShellState, limit: usize) -> CommandOutcome {
     let history = state.history_commands();
     let start = history.len().saturating_sub(limit);
     let mut out = String::new();
@@ -1782,6 +1818,472 @@ fn history_list(state: &ShellState, limit: usize) -> CommandOutcome {
         out.push_str(&format!("{:>5}  {entry}\n", index + 1));
     }
     CommandOutcome::captured(0, out.into_bytes(), Vec::new())
+}
+
+fn history_rich_list(args: &[String], state: &ShellState) -> CommandOutcome {
+    let mut limit = 50usize;
+    let mut json = false;
+    let mut plain = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json = true,
+            "--plain" => plain = true,
+            "--limit" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    return history_usage("--limit needs a number");
+                };
+                let Ok(n) = value.parse() else {
+                    return history_usage("--limit: invalid number");
+                };
+                limit = n;
+            }
+            arg if arg.chars().all(|c| c.is_ascii_digit()) => {
+                limit = arg.parse().unwrap_or(limit);
+            }
+            other => return history_usage(&format!("list: unsupported argument: {other}")),
+        }
+        i += 1;
+    }
+    let entries = state.history_entries();
+    let start = entries.len().saturating_sub(limit);
+    if json {
+        return history_entries_json(&entries[start..], start);
+    }
+    if plain {
+        let mut out = String::new();
+        for (offset, entry) in entries.iter().enumerate().skip(start) {
+            out.push_str(&format!("{:>5}  {}\n", offset + 1, entry.command));
+        }
+        return CommandOutcome::captured(0, out.into_bytes(), Vec::new());
+    }
+    CommandOutcome::captured(
+        0,
+        render_history_rows(&entries[start..], start).into_bytes(),
+        Vec::new(),
+    )
+}
+
+fn history_search(args: &[String], state: &ShellState) -> CommandOutcome {
+    let mut query = HistoryQuery {
+        limit: 25,
+        ..HistoryQuery::default()
+    };
+    let mut json = false;
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json = true,
+            "--no-dedupe" => query.dedupe = false,
+            "--failed" => query.failed = true,
+            "--limit" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    return history_usage("--limit needs a number");
+                };
+                let Ok(n) = value.parse() else {
+                    return history_usage("--limit: invalid number");
+                };
+                query.limit = n;
+            }
+            "--mode" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    return history_usage("--mode needs fuzzy|prefix|fulltext|exact|family");
+                };
+                let Some(mode) = parse_search_mode(value) else {
+                    return history_usage("--mode needs fuzzy|prefix|fulltext|exact|family");
+                };
+                query.mode = mode;
+            }
+            "--scope" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    return history_usage(
+                        "--scope needs global|host|session|cwd|project|failures|long",
+                    );
+                };
+                let Some(scope) = parse_history_scope(value, state) else {
+                    return history_usage(
+                        "--scope needs global|host|session|cwd|project|git-root|failures|long",
+                    );
+                };
+                query.scope = scope;
+            }
+            "--exit" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    return history_usage("--exit needs a code");
+                };
+                let Ok(code) = value.parse() else {
+                    return history_usage("--exit: invalid code");
+                };
+                query.exit_code = Some(code);
+            }
+            "--cwd" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    return history_usage("--cwd needs a path");
+                };
+                query.cwd = Some(value.clone());
+            }
+            "--project" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    return history_usage("--project needs a path/name");
+                };
+                query.project = Some(value.clone());
+            }
+            "--after" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    return history_usage("--after needs a unix timestamp");
+                };
+                let Ok(ts) = value.parse() else {
+                    return history_usage("--after currently expects a unix timestamp");
+                };
+                query.after = Some(ts);
+            }
+            "--before" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    return history_usage("--before needs a unix timestamp");
+                };
+                let Ok(ts) = value.parse() else {
+                    return history_usage("--before currently expects a unix timestamp");
+                };
+                query.before = Some(ts);
+            }
+            "--duration" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    return history_usage("--duration needs >Nms, <Nms, or Nms");
+                };
+                if let Err(message) = parse_duration_filter(value, &mut query) {
+                    return history_usage(&message);
+                }
+            }
+            other if other.starts_with('-') => {
+                return history_usage(&format!("search: unsupported option: {other}"));
+            }
+            other => words.push(other.to_string()),
+        }
+        i += 1;
+    }
+    query.text = words.join(" ");
+    let rows = state.history_query(&query);
+    if json {
+        return history_matches_json(&rows);
+    }
+    CommandOutcome::captured(0, render_history_matches(&rows).into_bytes(), Vec::new())
+}
+
+fn history_session(args: &[String], state: &ShellState) -> CommandOutcome {
+    if !args.is_empty() {
+        return history_usage("session takes no arguments");
+    }
+    let Some(session) = state.lookup("AGSH_SESSION").map(str::to_string) else {
+        return CommandOutcome::captured(
+            1,
+            Vec::new(),
+            b"history session: no active AGSH_SESSION\n".to_vec(),
+        );
+    };
+    let query = HistoryQuery {
+        scope: HistoryScope::Session(session),
+        limit: 100,
+        dedupe: false,
+        ..HistoryQuery::default()
+    };
+    let rows = state.history_query(&query);
+    CommandOutcome::captured(0, render_history_matches(&rows).into_bytes(), Vec::new())
+}
+
+fn history_stats(args: &[String], state: &ShellState) -> CommandOutcome {
+    if !args.is_empty() {
+        return history_usage("stats takes no arguments");
+    }
+    let stats = state.history_stats();
+    let mut out = String::new();
+    out.push_str(&format!("commands: {}\n", stats.total));
+    out.push_str(&format!("success:  {}\n", stats.succeeded));
+    out.push_str(&format!("failed:   {}\n", stats.failed));
+    if !stats.by_family.is_empty() {
+        out.push_str("\nfamilies:\n");
+        for (family, count) in &stats.by_family {
+            out.push_str(&format!("  {count:>5}  {family}\n"));
+        }
+    }
+    if !stats.most_used.is_empty() {
+        out.push_str("\nmost used:\n");
+        for (cmd, count) in &stats.most_used {
+            out.push_str(&format!("  {count:>5}  {}\n", truncate_field(cmd, 80)));
+        }
+    }
+    if !stats.slowest.is_empty() {
+        out.push_str("\nslowest:\n");
+        for entry in &stats.slowest {
+            if entry.duration_ms == 0 {
+                continue;
+            }
+            out.push_str(&format!(
+                "  {:>8}  {}\n",
+                format_duration(entry.duration_ms),
+                truncate_field(&entry.command, 80)
+            ));
+        }
+    }
+    CommandOutcome::captured(0, out.into_bytes(), Vec::new())
+}
+
+fn history_usage(message: &str) -> CommandOutcome {
+    CommandOutcome::captured(
+        2,
+        Vec::new(),
+        format!(
+            "history: {message}\n\
+             usage: history [N] | -c | list [--limit N] [--json] | search [opts] [query] | stats | session\n"
+        )
+        .into_bytes(),
+    )
+}
+
+fn parse_search_mode(value: &str) -> Option<SearchMode> {
+    match value {
+        "fuzzy" => Some(SearchMode::Fuzzy),
+        "prefix" => Some(SearchMode::Prefix),
+        "fulltext" | "contains" | "substring" => Some(SearchMode::FullText),
+        "exact" => Some(SearchMode::Exact),
+        "family" | "command" => Some(SearchMode::Family),
+        _ => None,
+    }
+}
+
+fn parse_history_scope(value: &str, state: &ShellState) -> Option<HistoryScope> {
+    match value {
+        "global" | "all" => Some(HistoryScope::Global),
+        "host" => Some(HistoryScope::Host(agsh_store::history::hostname())),
+        "session" => state
+            .lookup("AGSH_SESSION")
+            .map(|s| HistoryScope::Session(s.to_string())),
+        "cwd" | "directory" => Some(HistoryScope::Cwd(state.cwd().display().to_string())),
+        "project" | "workspace" => state
+            .git_context()
+            .map(|g| HistoryScope::Project(g.root.display().to_string()))
+            .or_else(|| Some(HistoryScope::Cwd(state.cwd().display().to_string()))),
+        "git-root" | "git" => state
+            .git_context()
+            .map(|g| HistoryScope::GitRoot(g.root.display().to_string())),
+        "failures" | "failed" => Some(HistoryScope::Failures),
+        "long" | "slow" => Some(HistoryScope::LongRunning { min_ms: 10_000 }),
+        _ => None,
+    }
+}
+
+fn parse_duration_filter(value: &str, query: &mut HistoryQuery) -> Result<(), String> {
+    let (op, rest) = if let Some(rest) = value.strip_prefix(">=") {
+        (">", rest)
+    } else if let Some(rest) = value.strip_prefix('>') {
+        (">", rest)
+    } else if let Some(rest) = value.strip_prefix("<=") {
+        ("<", rest)
+    } else if let Some(rest) = value.strip_prefix('<') {
+        ("<", rest)
+    } else {
+        ("=", value)
+    };
+    let Some(ms) = parse_duration_ms(rest) else {
+        return Err("--duration: invalid duration".to_string());
+    };
+    match op {
+        ">" => query.min_duration_ms = Some(ms),
+        "<" => query.max_duration_ms = Some(ms),
+        _ => {
+            query.min_duration_ms = Some(ms);
+            query.max_duration_ms = Some(ms);
+        }
+    }
+    Ok(())
+}
+
+fn parse_duration_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if let Some(n) = value.strip_suffix("ms") {
+        n.parse().ok()
+    } else if let Some(n) = value.strip_suffix('s') {
+        n.parse::<u64>().ok().map(|s| s * 1_000)
+    } else if let Some(n) = value.strip_suffix('m') {
+        n.parse::<u64>().ok().map(|m| m * 60_000)
+    } else {
+        value.parse().ok()
+    }
+}
+
+fn history_entries_json(entries: &[HistoryEntry], start: usize) -> CommandOutcome {
+    let rows: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .map(|(offset, entry)| history_entry_json(entry, start + offset + 1, 1, 0))
+        .collect();
+    match serde_json::to_vec_pretty(&rows) {
+        Ok(mut bytes) => {
+            bytes.push(b'\n');
+            CommandOutcome::captured(0, bytes, Vec::new())
+        }
+        Err(error) => CommandOutcome::captured(
+            1,
+            Vec::new(),
+            format!("history: json: {error}\n").into_bytes(),
+        ),
+    }
+}
+
+fn history_matches_json(rows: &[agsh_store::history::HistoryMatch]) -> CommandOutcome {
+    let values: Vec<_> = rows
+        .iter()
+        .map(|row| history_entry_json(&row.entry, row.index, row.count, row.score))
+        .collect();
+    match serde_json::to_vec_pretty(&values) {
+        Ok(mut bytes) => {
+            bytes.push(b'\n');
+            CommandOutcome::captured(0, bytes, Vec::new())
+        }
+        Err(error) => CommandOutcome::captured(
+            1,
+            Vec::new(),
+            format!("history: json: {error}\n").into_bytes(),
+        ),
+    }
+}
+
+fn history_entry_json(
+    entry: &HistoryEntry,
+    index: usize,
+    count: usize,
+    score: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "index": index,
+        "command": &entry.command,
+        "cwd": &entry.cwd,
+        "exit_code": entry.exit_code,
+        "started_at": entry.started_at,
+        "duration_ms": entry.duration_ms,
+        "hostname": &entry.hostname,
+        "user": &entry.user,
+        "session": &entry.session_id,
+        "git_root": &entry.git_root,
+        "git_branch": &entry.git_branch,
+        "output_mode": &entry.output_mode,
+        "trace_id": &entry.trace_id,
+        "family": &entry.command_family,
+        "count": count,
+        "score": score,
+    })
+}
+
+fn render_history_rows(entries: &[HistoryEntry], start: usize) -> String {
+    let rows = entries
+        .iter()
+        .enumerate()
+        .map(|(offset, entry)| (start + offset + 1, 1usize, entry));
+    render_history_entry_rows(rows)
+}
+
+fn render_history_matches(rows: &[agsh_store::history::HistoryMatch]) -> String {
+    render_history_entry_rows(rows.iter().map(|row| (row.index, row.count, &row.entry)))
+}
+
+fn render_history_entry_rows<'a>(
+    rows: impl IntoIterator<Item = (usize, usize, &'a HistoryEntry)>,
+) -> String {
+    let mut out = String::new();
+    for (index, count, entry) in rows {
+        let status = match entry.exit_code {
+            Some(0) => "ok",
+            Some(_) => "!!",
+            None => "--",
+        };
+        let repeat = if count > 1 {
+            format!(" x{count}")
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "{index:>5}  {status:<2} {:>7} {:>8}{repeat:<5}  {}\n",
+            ago(entry.started_at),
+            format_duration(entry.duration_ms),
+            truncate_field(&entry.command, 100),
+        ));
+        let mut context = Vec::new();
+        if !entry.cwd.is_empty() {
+            context.push(short_home(&entry.cwd));
+        }
+        if let Some(branch) = &entry.git_branch {
+            context.push(format!("git:{branch}"));
+        }
+        if let Some(mode) = &entry.output_mode {
+            context.push(format!("mode:{mode}"));
+        }
+        if let Some(session) = &entry.session_id {
+            context.push(format!("session:{}", truncate_field(session, 12)));
+        }
+        if !context.is_empty() {
+            out.push_str(&format!("       {}\n", context.join("  ")));
+        }
+    }
+    out
+}
+
+fn ago(started_at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let secs = now.saturating_sub(started_at);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3_600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+fn format_duration(ms: u64) -> String {
+    if ms == 0 {
+        "-".to_string()
+    } else if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{}m{}s", ms / 60_000, (ms % 60_000) / 1_000)
+    }
+}
+
+fn short_home(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => path
+            .strip_prefix(&home)
+            .map(|rest| format!("~{rest}"))
+            .unwrap_or_else(|| path.to_string()),
+        _ => path.to_string(),
+    }
+}
+
+fn truncate_field(value: &str, max: usize) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.chars().count() <= max {
+        value
+    } else {
+        let head: String = value.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
 }
 
 fn builtin_jobs(args: &[String], state: &ShellState) -> CommandOutcome {

@@ -10,7 +10,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use agsh_core::{CommandId, ShellError, Value};
 use agsh_index::{GitContext, PathCache};
 use agsh_output::{CompactorConfig, OutputMode};
-use agsh_store::history::{self, HistoryEntry};
+use agsh_store::history::{
+    self, command_family, HistoryEntry, HistoryMatch, HistoryQuery, HistoryStats,
+};
 use agsh_store::{HistoryStore, TraceRecord, TraceStore};
 use agsh_style::{Role, Theme};
 
@@ -1586,12 +1588,28 @@ impl ShellState {
     /// Record a command as it starts (exit code and duration are filled in later
     /// by [`finalize_history`]).
     pub fn record_history(&self, line: impl Into<String>) {
+        self.record_history_with_mode(line, None);
+    }
+
+    pub fn record_history_with_mode(
+        &self,
+        line: impl Into<String>,
+        output_mode: Option<OutputMode>,
+    ) {
         let line = line.into();
         if line.trim().is_empty() {
             return;
         }
         let mut entry = HistoryEntry::new(line, self.cwd().display().to_string(), unix_now());
         entry.hostname = history::hostname();
+        entry.user = history::username();
+        entry.session_id = self.lookup("AGSH_SESSION").map(str::to_string);
+        entry.output_mode = output_mode.map(|mode| mode.as_str().to_string());
+        entry.command_family = command_family(&entry.command);
+        if let Some(git) = self.git_context() {
+            entry.git_root = Some(git.root.display().to_string());
+            entry.git_branch = git.branch;
+        }
         if let Ok(mut store) = self.history.lock() {
             store.push(entry);
         }
@@ -1622,6 +1640,13 @@ impl ShellState {
             .unwrap_or_default()
     }
 
+    pub fn history_entries(&self) -> Vec<HistoryEntry> {
+        self.history
+            .lock()
+            .map(|s| s.entries().to_vec())
+            .unwrap_or_default()
+    }
+
     /// The most recent command beginning with `prefix`, for autosuggestion.
     pub fn history_suggest(&self, prefix: &str) -> Option<String> {
         self.history
@@ -1641,6 +1666,17 @@ impl ShellState {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub fn history_query(&self, query: &HistoryQuery) -> Vec<HistoryMatch> {
+        self.history
+            .lock()
+            .map(|s| s.query(query, unix_now()))
+            .unwrap_or_default()
+    }
+
+    pub fn history_stats(&self) -> HistoryStats {
+        self.history.lock().map(|s| s.stats()).unwrap_or_default()
     }
 
     /// Directories ranked by frecency, for directory jumping.

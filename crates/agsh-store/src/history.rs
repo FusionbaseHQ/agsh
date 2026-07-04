@@ -28,6 +28,27 @@ pub struct HistoryEntry {
     pub hostname: String,
     #[serde(default)]
     pub project: Option<String>,
+    /// User account that ran the command, when known.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// agsh interactive session id (`$AGSH_SESSION`), when journaling is active.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Git worktree root for the command's cwd, when known.
+    #[serde(default)]
+    pub git_root: Option<String>,
+    /// Git branch/detached label at command start, when known.
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    /// agsh output mode active for the command, when known.
+    #[serde(default)]
+    pub output_mode: Option<String>,
+    /// Raw trace id for captured output, when one is attached.
+    #[serde(default)]
+    pub trace_id: Option<String>,
+    /// First executable/builtin word, normalized for filtering and stats.
+    #[serde(default)]
+    pub command_family: Option<String>,
 }
 
 impl HistoryEntry {
@@ -40,8 +61,93 @@ impl HistoryEntry {
             duration_ms: 0,
             hostname: String::new(),
             project: None,
+            user: None,
+            session_id: None,
+            git_root: None,
+            git_branch: None,
+            output_mode: None,
+            trace_id: None,
+            command_family: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryScope {
+    Global,
+    Host(String),
+    Session(String),
+    Cwd(String),
+    Project(String),
+    GitRoot(String),
+    Failures,
+    LongRunning { min_ms: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    Fuzzy,
+    Prefix,
+    FullText,
+    Exact,
+    Family,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryQuery {
+    pub text: String,
+    pub mode: SearchMode,
+    pub scope: HistoryScope,
+    pub limit: usize,
+    pub exit_code: Option<i32>,
+    pub failed: bool,
+    pub after: Option<u64>,
+    pub before: Option<u64>,
+    pub cwd: Option<String>,
+    pub project: Option<String>,
+    pub min_duration_ms: Option<u64>,
+    pub max_duration_ms: Option<u64>,
+    pub dedupe: bool,
+}
+
+impl Default for HistoryQuery {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            mode: SearchMode::Fuzzy,
+            scope: HistoryScope::Global,
+            limit: 50,
+            exit_code: None,
+            failed: false,
+            after: None,
+            before: None,
+            cwd: None,
+            project: None,
+            min_duration_ms: None,
+            max_duration_ms: None,
+            dedupe: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryMatch {
+    pub entry: HistoryEntry,
+    /// 1-based position in the history file.
+    pub index: usize,
+    pub score: i64,
+    /// Number of matching entries with the same command when de-duping.
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HistoryStats {
+    pub total: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub most_used: Vec<(String, usize)>,
+    pub by_family: Vec<(String, usize)>,
+    pub slowest: Vec<HistoryEntry>,
 }
 
 /// In-memory history with optional JSONL persistence.
@@ -235,6 +341,109 @@ impl HistoryStore {
         best.into_iter().map(|(e, _)| e).collect()
     }
 
+    /// Query the native history store with Atuin-style scope and search modes.
+    /// Results are newest/relevance ranked and optionally de-duplicated by
+    /// command text, keeping the newest matching occurrence as the display row.
+    pub fn query(&self, query: &HistoryQuery, now: u64) -> Vec<HistoryMatch> {
+        let limit = query.limit.max(1);
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut matches: Vec<HistoryMatch> = Vec::new();
+
+        for (idx, entry) in self.entries.iter().enumerate().rev() {
+            if !entry_matches_filters(entry, query) {
+                continue;
+            }
+            let Some(search_score) = search_score(entry, &query.text, query.mode) else {
+                continue;
+            };
+            if query.dedupe {
+                let count = seen.entry(entry.command.as_str()).or_insert(0);
+                *count += 1;
+                if *count > 1 {
+                    continue;
+                }
+            }
+            let status_score = match entry.exit_code {
+                Some(0) => 20,
+                Some(_) => -10,
+                None => 0,
+            };
+            let duration_score = if entry.duration_ms > 0 {
+                -(entry.duration_ms.min(60_000) as i64 / 1_000)
+            } else {
+                0
+            };
+            matches.push(HistoryMatch {
+                entry: entry.clone(),
+                index: idx + 1,
+                score: search_score
+                    + frecency_weight(now, entry.started_at)
+                    + status_score
+                    + duration_score,
+                count: 1,
+            });
+        }
+
+        if query.dedupe {
+            for row in &mut matches {
+                row.count = seen.get(row.entry.command.as_str()).copied().unwrap_or(1);
+            }
+        }
+        matches.sort_by_key(|row| std::cmp::Reverse(row.score));
+        matches.truncate(limit);
+        matches
+    }
+
+    /// Aggregate command-history statistics for `history stats`.
+    pub fn stats(&self) -> HistoryStats {
+        let mut stats = HistoryStats {
+            total: self.entries.len(),
+            ..HistoryStats::default()
+        };
+        let mut command_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        let mut family_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        for entry in &self.entries {
+            match entry.exit_code {
+                Some(0) => stats.succeeded += 1,
+                Some(_) => stats.failed += 1,
+                None => {}
+            }
+            *command_counts.entry(entry.command.as_str()).or_insert(0) += 1;
+            let family = entry
+                .command_family
+                .clone()
+                .or_else(|| command_family(&entry.command));
+            if let Some(family) = family {
+                *family_counts.entry(family).or_insert(0) += 1;
+            }
+        }
+
+        stats.most_used = command_counts
+            .into_iter()
+            .map(|(cmd, count)| (cmd.to_string(), count))
+            .collect();
+        stats
+            .most_used
+            .sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        stats.most_used.truncate(10);
+
+        stats.by_family = family_counts.into_iter().collect();
+        stats
+            .by_family
+            .sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        stats.by_family.truncate(10);
+
+        stats.slowest = self.entries.clone();
+        stats
+            .slowest
+            .sort_by_key(|entry| std::cmp::Reverse(entry.duration_ms));
+        stats.slowest.truncate(10);
+        stats
+    }
+
     /// Directories ranked by frecency, for directory jumping (`z`).
     pub fn frecent_dirs(&self, now: u64) -> Vec<(String, i64)> {
         let mut scores: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
@@ -252,6 +461,154 @@ impl HistoryStore {
         ranked.sort_by_key(|b| std::cmp::Reverse(b.1));
         ranked
     }
+}
+
+fn entry_matches_filters(entry: &HistoryEntry, query: &HistoryQuery) -> bool {
+    match &query.scope {
+        HistoryScope::Global => {}
+        HistoryScope::Host(host) => {
+            if &entry.hostname != host {
+                return false;
+            }
+        }
+        HistoryScope::Session(session) => {
+            if entry.session_id.as_deref() != Some(session.as_str()) {
+                return false;
+            }
+        }
+        HistoryScope::Cwd(cwd) => {
+            if &entry.cwd != cwd {
+                return false;
+            }
+        }
+        HistoryScope::Project(project) => {
+            if entry.project.as_deref() != Some(project.as_str())
+                && entry.git_root.as_deref() != Some(project.as_str())
+            {
+                return false;
+            }
+        }
+        HistoryScope::GitRoot(root) => {
+            if entry.git_root.as_deref() != Some(root.as_str()) {
+                return false;
+            }
+        }
+        HistoryScope::Failures => {
+            if entry.exit_code.is_none_or(|code| code == 0) {
+                return false;
+            }
+        }
+        HistoryScope::LongRunning { min_ms } => {
+            if entry.duration_ms < *min_ms {
+                return false;
+            }
+        }
+    }
+    if let Some(code) = query.exit_code {
+        if entry.exit_code != Some(code) {
+            return false;
+        }
+    }
+    if query.failed && entry.exit_code.is_none_or(|code| code == 0) {
+        return false;
+    }
+    if let Some(after) = query.after {
+        if entry.started_at < after {
+            return false;
+        }
+    }
+    if let Some(before) = query.before {
+        if entry.started_at > before {
+            return false;
+        }
+    }
+    if let Some(cwd) = &query.cwd {
+        if &entry.cwd != cwd {
+            return false;
+        }
+    }
+    if let Some(project) = &query.project {
+        if entry.project.as_deref() != Some(project.as_str())
+            && entry.git_root.as_deref() != Some(project.as_str())
+        {
+            return false;
+        }
+    }
+    if let Some(min) = query.min_duration_ms {
+        if entry.duration_ms < min {
+            return false;
+        }
+    }
+    if let Some(max) = query.max_duration_ms {
+        if entry.duration_ms > max {
+            return false;
+        }
+    }
+    true
+}
+
+fn search_score(entry: &HistoryEntry, text: &str, mode: SearchMode) -> Option<i64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Some(100);
+    }
+    let cmd = entry.command.as_str();
+    let needle = text.to_lowercase();
+    let hay = cmd.to_lowercase();
+    match mode {
+        SearchMode::Fuzzy => fuzzy_score(text, cmd),
+        SearchMode::Prefix => hay
+            .starts_with(&needle)
+            .then_some(10_000 - hay.len() as i64),
+        SearchMode::FullText => hay.find(&needle).map(|pos| 8_000 - pos as i64),
+        SearchMode::Exact => (cmd == text).then_some(20_000),
+        SearchMode::Family => {
+            if let Some(family) = entry.command_family.as_deref() {
+                return (family == needle || family.starts_with(&needle)).then_some(12_000);
+            }
+            let family = command_family(cmd)?;
+            (family == needle || family.starts_with(&needle)).then_some(12_000)
+        }
+    }
+}
+
+/// Best-effort command-family extraction for history grouping. This is not a
+/// shell parser; it intentionally stays cheap and deterministic for hot paths.
+pub fn command_family(command: &str) -> Option<String> {
+    let wrappers = [
+        "raw",
+        "clean",
+        "compact",
+        "semantic",
+        "lossless-ref",
+        "lossless_ref",
+        "silent",
+        "rich",
+        "command",
+        "builtin",
+        "external",
+        "pty",
+        "agpty",
+    ];
+    for word in command.split_whitespace() {
+        if word.contains('=') && !word.starts_with('=') && !word.contains('/') {
+            let Some((name, _)) = word.split_once('=') else {
+                continue;
+            };
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+        }
+        let unquoted = word.trim_matches(['\'', '"']);
+        if wrappers.contains(&unquoted) {
+            continue;
+        }
+        let family = unquoted.rsplit('/').next().unwrap_or(unquoted);
+        if !family.is_empty() {
+            return Some(family.to_ascii_lowercase());
+        }
+    }
+    None
 }
 
 /// Recency weight in frecency buckets (more recent = higher).
@@ -314,6 +671,14 @@ pub fn hostname() -> String {
         .map(|h| h.trim().to_string())
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "localhost".to_string())
+}
+
+/// Best-effort account name for history entries.
+pub fn username() -> Option<String> {
+    std::env::var("USER")
+        .ok()
+        .or_else(|| std::env::var("LOGNAME").ok())
+        .filter(|u| !u.trim().is_empty())
 }
 
 /// Default history file: `$AGSH_HISTORY_FILE`, else
@@ -426,6 +791,90 @@ mod tests {
         assert_eq!(count, 1);
         // Non-matching command excluded.
         assert!(!results.iter().any(|e| e.command == "ls -la"));
+    }
+
+    #[test]
+    fn query_filters_scopes_and_counts_duplicates() {
+        let mut h = HistoryStore::in_memory();
+        let mut first = entry("cargo test parser", "/repo", 100);
+        first.exit_code = Some(0);
+        first.session_id = Some("s1".into());
+        first.git_root = Some("/repo".into());
+        first.command_family = command_family(&first.command);
+        h.push(first);
+
+        let mut second = entry("cargo test parser", "/repo", 200);
+        second.exit_code = Some(101);
+        second.session_id = Some("s1".into());
+        second.git_root = Some("/repo".into());
+        second.command_family = command_family(&second.command);
+        h.push(second);
+
+        let mut third = entry("npm test", "/repo/web", 300);
+        third.exit_code = Some(0);
+        third.session_id = Some("s2".into());
+        third.git_root = Some("/repo".into());
+        third.command_family = command_family(&third.command);
+        h.push(third);
+
+        let q = HistoryQuery {
+            text: "cargo".into(),
+            scope: HistoryScope::Session("s1".into()),
+            mode: SearchMode::Prefix,
+            limit: 10,
+            ..HistoryQuery::default()
+        };
+        let rows = h.query(&q, 300);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entry.command, "cargo test parser");
+        assert_eq!(rows[0].count, 2);
+
+        let failures = HistoryQuery {
+            scope: HistoryScope::Failures,
+            limit: 10,
+            dedupe: false,
+            ..HistoryQuery::default()
+        };
+        let rows = h.query(&failures, 300);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entry.exit_code, Some(101));
+    }
+
+    #[test]
+    fn family_search_and_stats_group_commands() {
+        let mut h = HistoryStore::in_memory();
+        for (cmd, at) in [
+            ("raw cargo check", 1),
+            ("FOO=1 cargo test", 2),
+            ("git status", 3),
+        ] {
+            let mut e = entry(cmd, "/repo", at);
+            e.command_family = command_family(cmd);
+            h.push(e);
+        }
+
+        let q = HistoryQuery {
+            text: "cargo".into(),
+            mode: SearchMode::Family,
+            limit: 10,
+            dedupe: false,
+            ..HistoryQuery::default()
+        };
+        let rows = h.query(&q, 100);
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .all(|row| { row.entry.command_family.as_deref() == Some("cargo") }));
+
+        let stats = h.stats();
+        assert!(stats
+            .by_family
+            .iter()
+            .any(|(name, count)| name == "cargo" && *count == 2));
+        assert_eq!(
+            command_family("semantic command /usr/bin/git status").as_deref(),
+            Some("git")
+        );
     }
 
     #[test]

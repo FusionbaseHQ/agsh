@@ -2,7 +2,7 @@ use std::io::{self, IsTerminal, Write};
 
 use agsh_exec::ShellState;
 
-use crate::editor::read_line_raw;
+use crate::editor::read_line_raw_with_initial;
 
 const CONTINUATION_PROMPT: &str = "> ";
 
@@ -11,8 +11,16 @@ const CONTINUATION_PROMPT: &str = "> ";
 /// otherwise (piped stdin, `-c`, non-TTY) it falls back to the cooked reader so
 /// behavior stays byte-identical to a plain line read.
 pub fn read_line(prompt: &str, state: &ShellState) -> io::Result<Option<String>> {
+    read_line_with_initial(prompt, state, "")
+}
+
+pub fn read_line_with_initial(
+    prompt: &str,
+    state: &ShellState,
+    initial: &str,
+) -> io::Result<Option<String>> {
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        read_line_raw(prompt, state)
+        read_line_raw_with_initial(prompt, state, initial)
     } else {
         read_line_cooked(prompt)
     }

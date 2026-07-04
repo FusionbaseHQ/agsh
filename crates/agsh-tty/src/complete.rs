@@ -304,7 +304,7 @@ fn builtin_description(name: &str) -> Option<&'static str> {
         "mode:intercept" => "route the agent's shells through agsh (compact:deep, off)",
         "agjob" => "run a command in the background with captured output",
         "sessions" => "list/resume Claude & Codex sessions for this folder",
-        "history" => "show command history",
+        "history" => "search, inspect, and navigate command history",
         "umask" => "set the file-creation mask",
         "set" => "set shell options and positionals",
         _ => return None,

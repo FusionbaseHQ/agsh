@@ -9,6 +9,7 @@ pub mod sessions;
 pub mod state;
 pub mod suggest;
 
+pub use agsh_store::history::{HistoryEntry, HistoryMatch, HistoryQuery, HistoryScope, SearchMode};
 pub use confine::{
     parse_spec as confine_parse_spec, plan as confine_plan, ConfineOpts, ConfinePlan, Preset,
 };
