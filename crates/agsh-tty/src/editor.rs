@@ -421,7 +421,9 @@ impl<'a> Editor<'a> {
                     }
                 }
                 Key::AltDigit(n) => {
-                    let idx = n.saturating_sub(1) as usize;
+                    let idx =
+                        history_window_start(selected, rows.len(), self.history_visible_rows())
+                            + n.saturating_sub(1) as usize;
                     if let Some(row) = rows.get(idx) {
                         return Ok(HistoryPick::Run(row.command.clone()));
                     }
@@ -469,7 +471,7 @@ impl<'a> Editor<'a> {
             text: query.to_string(),
             mode,
             scope,
-            limit: MENU_ROWS,
+            limit: self.state.history_len().max(1),
             dedupe: true,
             ..HistoryQuery::default()
         };
@@ -504,8 +506,12 @@ impl<'a> Editor<'a> {
         if rows.is_empty() {
             menu.push(theme.paint(Role::Muted, "  no matches"));
         } else {
-            for (i, row) in rows.iter().enumerate() {
-                let index = format!("{}", i + 1);
+            let visible_rows = self.history_visible_rows();
+            let start = history_window_start(selected, rows.len(), visible_rows);
+            let end = (start + visible_rows).min(rows.len());
+            for (slot, row) in rows[start..end].iter().enumerate() {
+                let index = format!("{}", slot + 1);
+                let absolute = start + slot;
                 let status = match row.exit_code {
                     Some(0) => theme.paint(Role::Ok, "ok"),
                     Some(_) => theme.paint(Role::Error, "!!"),
@@ -528,7 +534,7 @@ impl<'a> Editor<'a> {
                         &format!("  {}{}", truncate_one_line(&cwd, 28), branch),
                     ));
                 }
-                if i == selected {
+                if absolute == selected {
                     menu.push(theme.paint(Role::Selected, &line));
                 } else {
                     menu.push(line);
@@ -538,10 +544,12 @@ impl<'a> Editor<'a> {
                 menu.push(theme.paint(
                     Role::Muted,
                     &format!(
-                        " enter run  tab edit  ctrl-r scope  ctrl-s mode  cwd {}",
+                        " {}/{}  enter run  tab edit  ctrl-r scope  ctrl-s mode  cwd {}",
+                        selected + 1,
+                        rows.len(),
                         truncate_one_line(
                             &short_path(&row.cwd),
-                            self.cols.saturating_sub(52).max(12)
+                            self.cols.saturating_sub(64).max(12)
                         )
                     ),
                 ));
@@ -560,6 +568,10 @@ impl<'a> Editor<'a> {
         self.rendered_rows = rows_count;
         self.cursor_rpos = rpos;
         write_all(seq.as_bytes())
+    }
+
+    fn history_visible_rows(&self) -> usize {
+        MENU_ROWS.min(self.rows.saturating_sub(3).max(1)).max(1)
     }
 
     /// Open the completion dropdown for the word under the cursor. With one
@@ -849,6 +861,16 @@ fn next_history_mode(mode: SearchMode) -> SearchMode {
     }
 }
 
+fn history_window_start(selected: usize, total: usize, visible_rows: usize) -> usize {
+    if total == 0 || visible_rows == 0 || total <= visible_rows {
+        0
+    } else if selected >= visible_rows {
+        (selected + 1 - visible_rows).min(total - visible_rows)
+    } else {
+        0
+    }
+}
+
 fn history_mode_label(mode: SearchMode) -> &'static str {
     match mode {
         SearchMode::Fuzzy => "fuzzy",
@@ -1116,6 +1138,16 @@ mod tests {
             single_line_ghost("run\nthen more", "ru".len()),
             Some("n".to_string())
         );
+    }
+
+    #[test]
+    fn history_window_tracks_selection_through_all_rows() {
+        assert_eq!(history_window_start(0, 20, 8), 0);
+        assert_eq!(history_window_start(7, 20, 8), 0);
+        assert_eq!(history_window_start(8, 20, 8), 1);
+        assert_eq!(history_window_start(15, 20, 8), 8);
+        assert_eq!(history_window_start(19, 20, 8), 12);
+        assert_eq!(history_window_start(3, 4, 8), 0);
     }
 
     #[test]

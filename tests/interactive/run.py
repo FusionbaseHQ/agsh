@@ -232,6 +232,23 @@ def scenario_history_tui_command_opens_picker():
         s.close()
 
 
+def scenario_history_picker_scrolls_all_matches():
+    hist = "/tmp/agsh-pty-history-scroll.jsonl"
+    _seed_history(hist, [f"echo scroll-{i:02d}" for i in range(20)])
+    s = Session(history=hist)
+    try:
+        s.send(CTRL_R, 0.4)
+        scr = s.screen()
+        check("history picker shows total count", "/20" in scr, scr)
+        s.send("\x1b[B" * 15, 0.8)
+        scr = s.screen()
+        check("history picker scrolls beyond visible rows", "16/20" in scr, scr)
+        s.send(ENTER, 0.6)
+        check("scrolled history selection runs", "scroll-04" in s.screen(), s.screen())
+    finally:
+        s.close()
+
+
 def scenario_autosuggestion_accept():
     hist = "/tmp/agsh-pty-suggest.jsonl"
     _seed_history(hist, ["echo suggested-tail"])
@@ -762,6 +779,7 @@ SCENARIOS = [
     scenario_reverse_search,
     scenario_history_picker_tab_edits_and_mode_cycles,
     scenario_history_tui_command_opens_picker,
+    scenario_history_picker_scrolls_all_matches,
     scenario_autosuggestion_accept,
     scenario_completion_accept_and_run,
 ]
