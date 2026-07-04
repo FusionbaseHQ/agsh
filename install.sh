@@ -9,6 +9,7 @@
 #
 #   AGSH_VERSION      release tag to install (default: latest, e.g. v0.2.0)
 #   AGSH_INSTALL_DIR  install directory (default: ~/.local/bin)
+#   AGSH_REQUIRE_ATTESTATION=1  require `gh attestation verify` to pass
 #
 # Prefer to read before you run? Download first:
 #   curl -fsSLO https://raw.githubusercontent.com/FusionbaseHQ/agsh/main/install.sh
@@ -88,6 +89,18 @@ fi
   expected: $expected
   actual:   $actual
 The download may be corrupted or tampered with — not installing."
+
+if command -v gh >/dev/null 2>&1; then
+    if gh attestation verify "$tmp/$name.tar.gz" -R "$REPO" >/dev/null 2>&1; then
+        say "Verified GitHub artifact attestation."
+    elif [ "${AGSH_REQUIRE_ATTESTATION:-}" = "1" ]; then
+        fail "GitHub artifact attestation verification failed"
+    else
+        say "NOTE: GitHub artifact attestation was unavailable or failed; checksum matched."
+    fi
+elif [ "${AGSH_REQUIRE_ATTESTATION:-}" = "1" ]; then
+    fail "AGSH_REQUIRE_ATTESTATION=1 requires GitHub CLI (`gh`)"
+fi
 
 # ---- install -----------------------------------------------------------------
 tar -xzf "$tmp/$name.tar.gz" -C "$tmp"

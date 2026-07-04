@@ -220,13 +220,17 @@ fn command_not_found_suggests_and_hints() {
     assert!(stderr.contains("echo"), "stderr: {stderr}");
 
     // A known uninstalled tool yields an install hint (static, deterministic).
+    let empty_path = std::env::temp_dir().join(format!("agsh_empty_path_{}", std::process::id()));
+    std::fs::create_dir_all(&empty_path).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
         .args(["-c", "rg pattern"])
+        .env("PATH", &empty_path)
         .output()
         .expect("run agsh");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Install:"), "stderr: {stderr}");
     assert!(stderr.contains("ripgrep"), "stderr: {stderr}");
+    let _ = std::fs::remove_dir_all(&empty_path);
 }
 
 #[test]

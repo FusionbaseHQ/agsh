@@ -12,6 +12,9 @@ env:
 
 permissions:
   contents: write # create the release + upload assets
+  id-token: write # Sigstore signing for artifact attestations
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   # Gate: the tagged commit must pass the workspace tests on both platforms.
@@ -25,13 +28,27 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust (stable)
+      - name: Install Rust (stable + rustfmt + clippy)
         run: |
-          rustup toolchain install stable --profile minimal
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
       - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo build
+        run: cargo build --workspace --locked --verbose
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --verbose
+      - name: golden checks
+        run: python3 tests/checks/run.py tests/checks/*.agsh
+      - name: differential vs bash
+        run: python3 tests/differential/diff.py
+      - name: POSIX vs sh
+        run: python3 tests/differential/posix.py
+      - name: interactive (PTY) tests
+        run: python3 tests/interactive/run.py
 
   build:
     name: build (${{ matrix.target }})
@@ -203,6 +220,13 @@ jobs:
           cat ./*.sha256 > checksums.txt
           rm ./*.sha256
           ls -la
+      - name: Attest release assets
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/checksums.txt
       - name: Extract this version's notes from CHANGELOG.md
         run: |
           awk -v ver="${GITHUB_REF_NAME#v}" '

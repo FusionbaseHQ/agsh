@@ -10,14 +10,19 @@ Exit:   0 if all checks pass, else 1. Requires a working PTY (skips with code 0
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_helper import Session, ENTER, TAB, ESC, CTRL_C, CTRL_U, CTRL_A, CTRL_E, RIGHT  # noqa: E402
 
 PASS = 0
 FAIL = 0
+SKIP = 0
+_BROKER_RUNTIME = None
 
 
 def check(name, cond, detail=""):
@@ -29,8 +34,42 @@ def check(name, cond, detail=""):
         print(f"### FAIL {name}\n  {detail}")
 
 
+def skip(name, reason):
+    global SKIP
+    SKIP += 1
+    print(f"### SKIP {name}: {reason}")
+
+
+def broker_runtime_available():
+    global _BROKER_RUNTIME
+    if _BROKER_RUNTIME is not None:
+        return _BROKER_RUNTIME
+    try:
+        with tempfile.TemporaryDirectory(prefix="agsh-pty-broker-probe-") as d:
+            path = os.path.join(d, "agshd.sock")
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.bind(path)
+            finally:
+                sock.close()
+    except OSError as e:
+        _BROKER_RUNTIME = (False, f"AF_UNIX sockets unavailable: {e}")
+    else:
+        _BROKER_RUNTIME = (True, "")
+    return _BROKER_RUNTIME
+
+
 def has(screen, *subs):
     return all(s in screen for s in subs)
+
+
+def wait_screen(session, needle, timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if needle in session.screen():
+            return True
+        session.drain(0.1)
+    return needle in session.screen()
 
 
 def scenario_basic_echo():
@@ -482,12 +521,15 @@ def scenario_session_resume_after_kill():
 
         s2 = Session(session_dir=sess_dir, extra_env=banner_on)
         try:
-            scr = s2.screen()
-            check("restore banner offers resume", "resume" in scr and "2 changes" in scr, scr)
-            s2.send("resume" + ENTER, 0.6)
-            check("resume reports restore", "restored session" in s2.screen(), s2.screen())
-            s2.send("echo probe=$RESUME_PROBE" + ENTER, 0.5)
-            check("export restored", "probe=alive-42" in s2.screen(), s2.screen())
+            check(
+                "restore banner offers resume",
+                wait_screen(s2, "2 changes") and "resume" in s2.screen(),
+                s2.screen(),
+            )
+            s2.send("resume" + ENTER, 0.2)
+            check("resume reports restore", wait_screen(s2, "restored session"), s2.screen())
+            s2.send("echo probe=$RESUME_PROBE" + ENTER, 0.2)
+            check("export restored", wait_screen(s2, "probe=alive-42"), s2.screen())
             # A third session sees nothing: the journal was consumed and the
             # second session is still alive (its own journal is not offered).
             s3 = Session(session_dir=sess_dir, extra_env=banner_on)
@@ -502,6 +544,10 @@ def scenario_session_resume_after_kill():
 
 
 def scenario_keep_attach_detach():
+    ok, reason = broker_runtime_available()
+    if not ok:
+        skip("scenario_keep_attach_detach", reason)
+        return
     # Phase-2 interactive path: `keep -- cmd` attaches to a broker-held PTY;
     # Ctrl-] detaches leaving the job running; reattach replays scrollback;
     # the job survives the whole shell being replaced.
@@ -547,6 +593,10 @@ def scenario_keep_attach_detach():
 
 
 def scenario_keep_full_session_survives_client_death():
+    ok, reason = broker_runtime_available()
+    if not ok:
+        skip("scenario_keep_full_session_survives_client_death", reason)
+        return
     # Phase 3: `agsh --keep` runs the whole session under the broker. Killing
     # the attach client with SIGKILL (what terminal death looks like) leaves
     # the inner session alive with all its state; `agsh --attach` from a new
@@ -615,6 +665,10 @@ def scenario_keep_full_session_survives_client_death():
 
 
 def scenario_keep_attach_takeover():
+    ok, reason = broker_runtime_available()
+    if not ok:
+        skip("scenario_keep_attach_takeover", reason)
+        return
     # Two terminals, one job: the second attach takes over (last wins); the
     # first client lands back at its prompt with an honest message — the job
     # was NOT killed, just re-owned.
@@ -693,7 +747,9 @@ def main():
             global FAIL
             FAIL += 1
             print(f"### ERROR in {sc.__name__}: {e}")
-    print(f"\n================  interactive  PASS={PASS}  FAIL={FAIL}  ================")
+    print(
+        f"\n================  interactive  PASS={PASS}  FAIL={FAIL}  SKIP={SKIP}  ================"
+    )
     sys.exit(1 if FAIL else 0)
 
 

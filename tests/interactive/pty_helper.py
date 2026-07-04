@@ -51,6 +51,10 @@ class Session:
         )
         env.pop("AGSH_OUTPUT_MODE", None)
         env.pop("NO_COLOR", None)
+        env.pop("CLICOLOR", None)
+        env.pop("LSCOLORS", None)
+        env.pop("LS_COLORS", None)
+        env.pop("AGSH_BROKER_SOCKET", None)
         if extra_env:
             env.update(extra_env)
         pid, fd = pty.fork()

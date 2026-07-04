@@ -1,12 +1,13 @@
 # Releasing agsh
 
 Releases are built by [`.github/workflows/release.yml`](../.github/workflows/release.yml):
-pushing a `v*` tag runs a two-platform test gate, builds four targets
-(macOS arm64/x86_64, static-musl Linux x86_64/aarch64), **signs and notarizes
-the macOS binaries**, and publishes a GitHub Release with tarballs +
-`checksums.txt` and notes extracted from `CHANGELOG.md`. `workflow_dispatch`
-dry-runs the whole matrix without publishing (and without requiring signing
-secrets).
+pushing a `v*` tag runs the full two-platform gate (fmt, clippy, cargo tests,
+golden checks, bash/sh differential tests, and PTY interactive tests), builds
+four targets (macOS arm64/x86_64, static-musl Linux x86_64/aarch64), **signs
+and notarizes the macOS binaries**, and publishes a GitHub Release with
+tarballs + `checksums.txt` and notes extracted from `CHANGELOG.md`.
+`workflow_dispatch` dry-runs the whole matrix without publishing (and without
+requiring signing secrets).
 
 ## Cutting a release
 
@@ -94,6 +95,29 @@ gh secret set APPLE_API_KEY_P8 -R FusionbaseHQ/agsh < AuthKey_XXXXXXXXXX.p8
   failing the build unless the verdict is **Accepted**,
 - packages the *signed* binary into the release tarball (checksums therefore
   cover the signature).
+
+## Release integrity
+
+Release assets are protected in three layers:
+
+1. `checksums.txt` contains SHA-256 digests for every tarball.
+2. Public release runs generate GitHub/Sigstore artifact attestations for every
+   tarball and `checksums.txt`.
+3. The installer always checks SHA-256, and if `gh` is available it also runs
+   `gh attestation verify` for the downloaded tarball. Set
+   `AGSH_REQUIRE_ATTESTATION=1` to make attestation verification mandatory.
+
+GitHub artifact attestations only work for private repositories on Enterprise
+Cloud plans. Private dry runs therefore skip the attestation step; make the repo
+public before cutting the first public release if you want release attestations
+on that tag.
+
+Manual verification:
+
+```sh
+gh attestation verify agsh-vX.Y.Z-aarch64-apple-darwin.tar.gz -R FusionbaseHQ/agsh
+shasum -a 256 -c checksums.txt
+```
 
 ### Notes on CLI-tool notarization
 
