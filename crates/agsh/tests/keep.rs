@@ -345,7 +345,7 @@ fn attach_takeover_hangs_up_the_previous_client_only() {
     if !broker_runtime_available() {
         return;
     }
-    use std::io::Read;
+    use std::io::{ErrorKind, Read};
 
     let daemon = Daemon::start("steal");
     let info = daemon.spawn_sh("echo takeover-ready; exec cat");
@@ -356,7 +356,7 @@ fn attach_takeover_hangs_up_the_previous_client_only() {
         .expect("first attach");
     let mut first_reader = first.try_clone().expect("clone");
     first_reader
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_millis(100)))
         .expect("timeout");
 
     let (_second, attached) = daemon
@@ -372,6 +372,9 @@ fn attach_takeover_hangs_up_the_previous_client_only() {
         match first_reader.read(&mut buf) {
             Ok(0) => break,
             Ok(_) => {} // replayed scrollback before the hangup
+            Err(ref e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             Err(e) => panic!("first client should see EOF, got {e}"),
         }
         assert!(Instant::now() < deadline, "first client never hung up");
