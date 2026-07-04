@@ -605,18 +605,20 @@ fn run_exit_trap(executor: &mut Executor, state: &mut ShellState, options: &Exec
     }
 }
 
-/// Emit OSC 133 prompt-start (`A`) plus the window title set to the cwd. These
+/// Emit OSC 133 prompt-start (`A`), OSC 7 (current directory as a file URL,
+/// so terminals track `cd` live), and the window title set to the cwd. These
 /// shell-integration sequences let terminals navigate between prompts and show
 /// command status; they are only emitted on a TTY.
 fn shell_integration_prompt(state: &ShellState) {
-    let cwd = state.cwd().display().to_string();
+    let abs = state.cwd().display().to_string();
     let cwd = state
         .lookup("HOME")
         .filter(|h| !h.is_empty())
-        .and_then(|home| cwd.strip_prefix(home).map(|rest| format!("~{rest}")))
-        .unwrap_or(cwd);
+        .and_then(|home| abs.strip_prefix(home).map(|rest| format!("~{rest}")))
+        .unwrap_or_else(|| abs.clone());
     emit_osc(&format!(
-        "\x1b]133;A\x07\x1b]2;agsh: {}\x07",
+        "\x1b]133;A\x07\x1b]7;file://{}\x07\x1b]2;agsh: {}\x07",
+        title_text(&abs),
         title_text(&cwd)
     ));
 }
