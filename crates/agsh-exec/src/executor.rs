@@ -799,15 +799,18 @@ fn run_pipeline_item_inner(
             return Ok(outcome);
         }
 
-        let mut outcome = run_invocation(
-            &invocation,
-            state,
-            options.output_mode,
-            None,
-            options.output_mode.should_capture(),
-            LookupMode::Normal,
-            options.allow_process_replacement,
-        )?;
+        let rich_stdout = rich_stdout_allowed_for_invocation(&invocation, state, options);
+        let mut outcome = with_rich_stdout(state, rich_stdout, |state| {
+            run_invocation(
+                &invocation,
+                state,
+                options.output_mode,
+                None,
+                options.output_mode.should_capture(),
+                LookupMode::Normal,
+                options.allow_process_replacement,
+            )
+        })?;
         apply_pipeline_negation(&mut outcome, pipeline.negated);
         return Ok(outcome);
     }
@@ -5365,17 +5368,22 @@ fn run_pipeline(
 
     for (index, invocation) in commands.iter().enumerate() {
         outcome = if index == last_index {
-            run_invocation(
-                invocation,
-                state,
-                options.output_mode,
-                stdin_data.as_deref(),
-                true,
-                LookupMode::Normal,
-                options.allow_process_replacement,
-            )?
+            let rich_stdout = commands.len() == 1
+                && rich_stdout_allowed_for_invocation(invocation, state, options);
+            with_rich_stdout(state, rich_stdout, |state| {
+                run_invocation(
+                    invocation,
+                    state,
+                    options.output_mode,
+                    stdin_data.as_deref(),
+                    true,
+                    LookupMode::Normal,
+                    options.allow_process_replacement,
+                )
+            })?
         } else {
             let mut stage_state = state.clone();
+            stage_state.replace_rich_stdout(false);
             run_invocation(
                 invocation,
                 &mut stage_state,
@@ -5409,6 +5417,55 @@ fn run_pipeline(
         ));
     }
     Ok(outcome)
+}
+
+fn with_rich_stdout<T>(
+    state: &mut ShellState,
+    rich_stdout: bool,
+    f: impl FnOnce(&mut ShellState) -> Result<T, ShellError>,
+) -> Result<T, ShellError> {
+    let previous_rich_stdout = state.replace_rich_stdout(rich_stdout);
+    let result = f(state);
+    state.replace_rich_stdout(previous_rich_stdout);
+    result
+}
+
+fn rich_stdout_allowed_for_invocation(
+    invocation: &ExpandedInvocation,
+    state: &ShellState,
+    options: &ExecutionOptions,
+) -> bool {
+    rich_stdout_allowed_for_invocation_with_terminal(
+        invocation,
+        state,
+        options,
+        io::stdout().is_terminal(),
+    )
+}
+
+fn rich_stdout_allowed_for_invocation_with_terminal(
+    invocation: &ExpandedInvocation,
+    state: &ShellState,
+    options: &ExecutionOptions,
+    stdout_is_terminal: bool,
+) -> bool {
+    !options.output_mode.should_capture()
+        && state.streaming_stdout_is_none()
+        && stdout_is_terminal
+        && stdout_redirections_preserve_terminal(&invocation.redirections)
+}
+
+fn stdout_redirections_preserve_terminal(redirections: &[ExpandedRedirection]) -> bool {
+    !redirections
+        .iter()
+        .any(|redirection| match redirection.mode {
+            RedirectionMode::Write | RedirectionMode::WriteClobber | RedirectionMode::Append => {
+                redirection.fd == 1
+            }
+            RedirectionMode::WriteBoth => true,
+            RedirectionMode::DupFd => redirection.fd == 1,
+            RedirectionMode::Read | RedirectionMode::HereDoc | RedirectionMode::HereString => false,
+        })
 }
 
 fn run_buffered_command_pipeline(
@@ -12604,6 +12661,48 @@ mod tests {
     }
 
     #[test]
+    fn rich_stdout_gate_is_terminal_raw_and_unredirected_only() {
+        let mut state = ShellState::from_current_process();
+        let options = ExecutionOptions::default();
+        let graph = parse_line("history").unwrap();
+        let invocation = expand_invocation(&graph.pipeline.commands[0], &mut state).unwrap();
+
+        assert!(rich_stdout_allowed_for_invocation_with_terminal(
+            &invocation,
+            &state,
+            &options,
+            true,
+        ));
+        assert!(!rich_stdout_allowed_for_invocation_with_terminal(
+            &invocation,
+            &state,
+            &options,
+            false,
+        ));
+
+        let capture_options = ExecutionOptions {
+            output_mode: OutputMode::Clean,
+            ..ExecutionOptions::default()
+        };
+        assert!(!rich_stdout_allowed_for_invocation_with_terminal(
+            &invocation,
+            &state,
+            &capture_options,
+            true,
+        ));
+
+        let redirected = parse_line("history > /tmp/agsh-history-color-test").unwrap();
+        let redirected_invocation =
+            expand_invocation(&redirected.pipeline.commands[0], &mut state).unwrap();
+        assert!(!rich_stdout_allowed_for_invocation_with_terminal(
+            &redirected_invocation,
+            &state,
+            &options,
+            true,
+        ));
+    }
+
+    #[test]
     fn history_rejects_invalid_arguments() {
         let mut state = ShellState::from_current_process();
         let mut executor = Executor::new();
@@ -12671,6 +12770,26 @@ mod tests {
         );
         assert!(!failed_text.contains("git status"), "failed: {failed_text}");
 
+        let today = executor
+            .run_graph(
+                &parse_line("history search --today cargo").unwrap(),
+                &mut state,
+                &ExecutionOptions::default(),
+            )
+            .unwrap();
+        let today_text = String::from_utf8_lossy(&today.stdout);
+        assert!(today_text.contains("cargo check"), "today: {today_text}");
+
+        let since = executor
+            .run_graph(
+                &parse_line("history search --since yesterday git").unwrap(),
+                &mut state,
+                &ExecutionOptions::default(),
+            )
+            .unwrap();
+        let since_text = String::from_utf8_lossy(&since.stdout);
+        assert!(since_text.contains("git status"), "since: {since_text}");
+
         let json = executor
             .run_graph(
                 &parse_line("history search --json cargo").unwrap(),
@@ -12692,6 +12811,35 @@ mod tests {
         let stats_text = String::from_utf8_lossy(&stats.stdout);
         assert!(stats_text.contains("commands: 3"), "stats: {stats_text}");
         assert!(stats_text.contains("cargo"), "stats: {stats_text}");
+    }
+
+    #[test]
+    fn history_search_filters_by_explicit_date() {
+        let mut state = ShellState::from_current_process();
+        let cwd = state.cwd().display().to_string();
+        let mut on_date =
+            agsh_store::history::HistoryEntry::new("make july-four", cwd.clone(), 1_783_166_400);
+        on_date.exit_code = Some(0);
+        on_date.command_family = Some("make".to_string());
+        let mut previous_day =
+            agsh_store::history::HistoryEntry::new("make july-three", cwd, 1_783_080_000);
+        previous_day.exit_code = Some(0);
+        previous_day.command_family = Some("make".to_string());
+        state.push_history_entry_for_test(previous_day);
+        state.push_history_entry_for_test(on_date);
+        let mut executor = Executor::new();
+
+        let outcome = executor
+            .run_graph(
+                &parse_line("history search --date 2026-07-04 make").unwrap(),
+                &mut state,
+                &ExecutionOptions::default(),
+            )
+            .unwrap();
+
+        let text = String::from_utf8_lossy(&outcome.stdout);
+        assert!(text.contains("make july-four"), "date search: {text}");
+        assert!(!text.contains("make july-three"), "date search: {text}");
     }
 
     #[test]

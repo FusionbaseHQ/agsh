@@ -4,12 +4,14 @@ use std::process::Command;
 use agsh_compat::{CommandResolution, Resolver};
 use agsh_core::{CommandInvocation, ShellError};
 use agsh_store::history::{HistoryEntry, HistoryQuery, HistoryScope, SearchMode};
+use agsh_style::{highlight_shell_without_resolution, Theme};
 use rustix::process::Signal;
 
 use crate::state::LoopControlKind;
-use crate::{CommandOutcome, ShellState};
+use crate::{history_index_allows_syntax_highlight, CommandOutcome, ShellState};
 
 const DEFAULT_COMMAND_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+const SECS_PER_DAY: u64 = 86_400;
 
 /// Names of all shell builtins, for command suggestions and completion.
 pub fn builtin_names() -> &'static [&'static str] {
@@ -720,6 +722,11 @@ Search options:
   --scope global|host|session|cwd|project|git-root|failures|long
   --failed        only non-zero exits       --exit N        exact exit code
   --duration >10s / <500ms                  --limit N       result count
+  --today         commands from today (UTC)
+  --date YYYY-MM-DD                          exact UTC date
+  --since yesterday|today|YYYY-MM-DD         commands since a UTC date starts
+  --after/--before UNIX|YYYY-MM-DD           raw timestamp or UTC day bound
+  Syntax highlighting is TTY-only and limited to the newest 20 history rows.
 
 At the prompt, Ctrl-R opens the native picker. Inside it:
   Enter runs, Tab inserts for editing, Ctrl-R cycles scope, Ctrl-S cycles mode,
@@ -1812,10 +1819,14 @@ fn builtin_history(args: &[String], state: &mut ShellState) -> CommandOutcome {
 
 fn history_legacy_list(state: &ShellState, limit: usize) -> CommandOutcome {
     let history = state.history_commands();
+    let total = history.len();
     let start = history.len().saturating_sub(limit);
+    let theme = history_theme(state);
     let mut out = String::new();
     for (index, entry) in history.iter().enumerate().skip(start) {
-        out.push_str(&format!("{:>5}  {entry}\n", index + 1));
+        let displayed_index = index + 1;
+        let command = render_history_command(entry, displayed_index, total, &theme);
+        out.push_str(&format!("{displayed_index:>5}  {command}\n"));
     }
     CommandOutcome::captured(0, out.into_bytes(), Vec::new())
 }
@@ -1847,6 +1858,7 @@ fn history_rich_list(args: &[String], state: &ShellState) -> CommandOutcome {
         i += 1;
     }
     let entries = state.history_entries();
+    let total = entries.len();
     let start = entries.len().saturating_sub(limit);
     if json {
         return history_entries_json(&entries[start..], start);
@@ -1860,7 +1872,7 @@ fn history_rich_list(args: &[String], state: &ShellState) -> CommandOutcome {
     }
     CommandOutcome::captured(
         0,
-        render_history_rows(&entries[start..], start).into_bytes(),
+        render_history_rows(&entries[start..], start, total, state).into_bytes(),
         Vec::new(),
     )
 }
@@ -1872,6 +1884,7 @@ fn history_search(args: &[String], state: &ShellState) -> CommandOutcome {
     };
     let mut json = false;
     let mut words = Vec::new();
+    let now = epoch_secs_now();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1936,23 +1949,56 @@ fn history_search(args: &[String], state: &ShellState) -> CommandOutcome {
                 };
                 query.project = Some(value.clone());
             }
+            "--today" => {
+                let (after, before) = match parse_history_date_range("today", now, "--today") {
+                    Ok(range) => range,
+                    Err(message) => return history_usage(&message),
+                };
+                query.after = Some(after);
+                query.before = Some(before);
+            }
+            "--date" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    return history_usage("--date needs YYYY-MM-DD, today, or yesterday");
+                };
+                let (after, before) = match parse_history_date_range(value, now, "--date") {
+                    Ok(range) => range,
+                    Err(message) => return history_usage(&message),
+                };
+                query.after = Some(after);
+                query.before = Some(before);
+            }
+            "--since" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    return history_usage("--since needs YYYY-MM-DD, today, or yesterday");
+                };
+                let after = match parse_history_bound_start(value, now, "--since") {
+                    Ok(ts) => ts,
+                    Err(message) => return history_usage(&message),
+                };
+                query.after = Some(after);
+            }
             "--after" => {
                 i += 1;
                 let Some(value) = args.get(i) else {
-                    return history_usage("--after needs a unix timestamp");
+                    return history_usage("--after needs a unix timestamp or YYYY-MM-DD");
                 };
-                let Ok(ts) = value.parse() else {
-                    return history_usage("--after currently expects a unix timestamp");
+                let ts = match parse_history_bound_start(value, now, "--after") {
+                    Ok(ts) => ts,
+                    Err(message) => return history_usage(&message),
                 };
                 query.after = Some(ts);
             }
             "--before" => {
                 i += 1;
                 let Some(value) = args.get(i) else {
-                    return history_usage("--before needs a unix timestamp");
+                    return history_usage("--before needs a unix timestamp or YYYY-MM-DD");
                 };
-                let Ok(ts) = value.parse() else {
-                    return history_usage("--before currently expects a unix timestamp");
+                let ts = match parse_history_bound_end(value, now, "--before") {
+                    Ok(ts) => ts,
+                    Err(message) => return history_usage(&message),
                 };
                 query.before = Some(ts);
             }
@@ -1977,7 +2023,11 @@ fn history_search(args: &[String], state: &ShellState) -> CommandOutcome {
     if json {
         return history_matches_json(&rows);
     }
-    CommandOutcome::captured(0, render_history_matches(&rows).into_bytes(), Vec::new())
+    CommandOutcome::captured(
+        0,
+        render_history_matches(&rows, state.history_len(), state).into_bytes(),
+        Vec::new(),
+    )
 }
 
 fn history_session(args: &[String], state: &ShellState) -> CommandOutcome {
@@ -1998,7 +2048,11 @@ fn history_session(args: &[String], state: &ShellState) -> CommandOutcome {
         ..HistoryQuery::default()
     };
     let rows = state.history_query(&query);
-    CommandOutcome::captured(0, render_history_matches(&rows).into_bytes(), Vec::new())
+    CommandOutcome::captured(
+        0,
+        render_history_matches(&rows, state.history_len(), state).into_bytes(),
+        Vec::new(),
+    )
 }
 
 fn history_stats(args: &[String], state: &ShellState) -> CommandOutcome {
@@ -2044,7 +2098,8 @@ fn history_usage(message: &str) -> CommandOutcome {
         Vec::new(),
         format!(
             "history: {message}\n\
-             usage: history [N] | -c | list [--limit N] [--json] | search [opts] [query] | stats | session\n"
+             usage: history [N] | -c | list [--limit N] [--json] | search [opts] [query] | stats | session\n\
+             search date opts: --today | --date YYYY-MM-DD | --since yesterday|today|YYYY-MM-DD\n"
         )
         .into_bytes(),
     )
@@ -2080,6 +2135,94 @@ fn parse_history_scope(value: &str, state: &ShellState) -> Option<HistoryScope> 
         "long" | "slow" => Some(HistoryScope::LongRunning { min_ms: 10_000 }),
         _ => None,
     }
+}
+
+fn parse_history_date_range(value: &str, now: u64, flag: &str) -> Result<(u64, u64), String> {
+    let day = parse_history_day(value, now)
+        .ok_or_else(|| format!("{flag} needs YYYY-MM-DD, today, or yesterday"))?;
+    history_day_range(day).map_err(|message| format!("{flag}: {message}"))
+}
+
+fn parse_history_bound_start(value: &str, now: u64, flag: &str) -> Result<u64, String> {
+    if let Ok(ts) = value.parse::<u64>() {
+        return Ok(ts);
+    }
+    parse_history_date_range(value, now, flag).map(|(start, _)| start)
+}
+
+fn parse_history_bound_end(value: &str, now: u64, flag: &str) -> Result<u64, String> {
+    if let Ok(ts) = value.parse::<u64>() {
+        return Ok(ts);
+    }
+    parse_history_date_range(value, now, flag).map(|(_, end)| end)
+}
+
+fn parse_history_day(value: &str, now: u64) -> Option<i64> {
+    match value {
+        "today" => Some((now / SECS_PER_DAY) as i64),
+        "yesterday" => Some((now / SECS_PER_DAY) as i64 - 1),
+        _ => parse_iso_date_day(value),
+    }
+}
+
+fn parse_iso_date_day(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes[..4].iter().all(u8::is_ascii_digit)
+        || !bytes[5..7].iter().all(u8::is_ascii_digit)
+        || !bytes[8..].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let year = value[..4].parse::<i32>().ok()?;
+    let month = value[5..7].parse::<u32>().ok()?;
+    let day = value[8..].parse::<u32>().ok()?;
+    if year < 1970 || day == 0 || day > days_in_month(year, month)? {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
+fn history_day_range(day: i64) -> Result<(u64, u64), String> {
+    if day < 0 {
+        return Err("date must be 1970-01-01 or later".to_string());
+    }
+    let start = u64::try_from(day)
+        .ok()
+        .and_then(|day| day.checked_mul(SECS_PER_DAY))
+        .ok_or_else(|| "date is out of range".to_string())?;
+    let end = start
+        .checked_add(SECS_PER_DAY - 1)
+        .ok_or_else(|| "date is out of range".to_string())?;
+    Ok((start, end))
+}
+
+fn days_in_month(year: i32, month: u32) -> Option<u32> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 if is_leap_year(year) => Some(29),
+        2 => Some(28),
+        _ => None,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = month as i32;
+    let day = day as i32;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    i64::from(era) * 146_097 + i64::from(doe) - 719_468
 }
 
 fn parse_duration_filter(value: &str, query: &mut HistoryQuery) -> Result<(), String> {
@@ -2184,21 +2327,37 @@ fn history_entry_json(
     })
 }
 
-fn render_history_rows(entries: &[HistoryEntry], start: usize) -> String {
+fn render_history_rows(
+    entries: &[HistoryEntry],
+    start: usize,
+    total: usize,
+    state: &ShellState,
+) -> String {
     let rows = entries
         .iter()
         .enumerate()
         .map(|(offset, entry)| (start + offset + 1, 1usize, entry));
-    render_history_entry_rows(rows)
+    render_history_entry_rows(rows, total, state)
 }
 
-fn render_history_matches(rows: &[agsh_store::history::HistoryMatch]) -> String {
-    render_history_entry_rows(rows.iter().map(|row| (row.index, row.count, &row.entry)))
+fn render_history_matches(
+    rows: &[agsh_store::history::HistoryMatch],
+    total: usize,
+    state: &ShellState,
+) -> String {
+    render_history_entry_rows(
+        rows.iter().map(|row| (row.index, row.count, &row.entry)),
+        total,
+        state,
+    )
 }
 
 fn render_history_entry_rows<'a>(
     rows: impl IntoIterator<Item = (usize, usize, &'a HistoryEntry)>,
+    total: usize,
+    state: &ShellState,
 ) -> String {
+    let theme = history_theme(state);
     let mut out = String::new();
     for (index, count, entry) in rows {
         let status = match entry.exit_code {
@@ -2211,11 +2370,13 @@ fn render_history_entry_rows<'a>(
         } else {
             String::new()
         };
+        let display_command = truncate_field(&entry.command, 100);
+        let command = render_history_command(&display_command, index, total, &theme);
         out.push_str(&format!(
             "{index:>5}  {status:<2} {:>7} {:>8}{repeat:<5}  {}\n",
             ago(entry.started_at),
             format_duration(entry.duration_ms),
-            truncate_field(&entry.command, 100),
+            command,
         ));
         let mut context = Vec::new();
         if !entry.cwd.is_empty() {
@@ -2237,11 +2398,24 @@ fn render_history_entry_rows<'a>(
     out
 }
 
+fn history_theme(state: &ShellState) -> Theme {
+    if state.rich_stdout_enabled() {
+        state.theme()
+    } else {
+        Theme::plain()
+    }
+}
+
+fn render_history_command(command: &str, index: usize, total: usize, theme: &Theme) -> String {
+    if history_index_allows_syntax_highlight(index, total) {
+        highlight_shell_without_resolution(command, theme)
+    } else {
+        command.to_string()
+    }
+}
+
 fn ago(started_at: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = epoch_secs_now();
     let secs = now.saturating_sub(started_at);
     if secs < 60 {
         format!("{secs}s")
@@ -2252,6 +2426,13 @@ fn ago(started_at: u64) -> String {
     } else {
         format!("{}d", secs / 86_400)
     }
+}
+
+fn epoch_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn format_duration(ms: u64) -> String {
@@ -3510,4 +3691,102 @@ fn is_identifier(text: &str) -> bool {
 
 fn shell_single_quote(value: &str) -> String {
     value.replace('\'', "'\\''")
+}
+
+#[cfg(test)]
+mod history_date_filter_tests {
+    use super::*;
+
+    const JULY_4_2026_NOON_UTC: u64 = 1_783_166_400;
+
+    #[test]
+    fn history_highlights_commands_only_for_rich_stdout() {
+        let theme = Theme {
+            palette: agsh_style::Palette::dark(),
+            level: agsh_style::ColorLevel::Ansi16,
+            icons: agsh_style::Icons::disabled(),
+        };
+        let mut state = ShellState::from_current_process();
+        state.set_theme_for_test(theme);
+        state.record_history("OLD=$HOME echo \"$OLD\"");
+        for index in 0..20 {
+            state.record_history(format!("NEW{index}=$HOME echo \"$NEW{index}\""));
+        }
+        let args = vec!["21".to_string()];
+
+        let plain = builtin_history(&args, &mut state);
+        let plain_text = String::from_utf8_lossy(&plain.stdout);
+        assert!(
+            !plain_text.contains("\x1b["),
+            "plain history leaked ANSI: {plain_text:?}"
+        );
+
+        state.replace_rich_stdout(true);
+        let rich = builtin_history(&args, &mut state);
+        state.replace_rich_stdout(false);
+        let rich_text = String::from_utf8_lossy(&rich.stdout);
+        let mut rich_lines = rich_text.lines();
+        let old_line = rich_lines.next().expect("old history row");
+        let newest_line = rich_text.lines().last().expect("newest history row");
+
+        assert!(
+            !old_line.contains("\x1b["),
+            "older history row should stay raw: {old_line:?}"
+        );
+        assert!(
+            rich_text.contains("\x1b["),
+            "rich history was not highlighted: {rich_text:?}"
+        );
+        assert!(
+            newest_line.contains("\x1b["),
+            "newest history row should be highlighted: {newest_line:?}"
+        );
+    }
+
+    #[test]
+    fn parses_specific_iso_date_ranges() {
+        let (start, end) =
+            parse_history_date_range("2026-07-04", JULY_4_2026_NOON_UTC, "--date").unwrap();
+
+        assert_eq!(start, 1_783_123_200);
+        assert_eq!(end, 1_783_209_599);
+        assert_eq!(
+            parse_history_bound_start("2026-07-04", JULY_4_2026_NOON_UTC, "--after").unwrap(),
+            start
+        );
+        assert_eq!(
+            parse_history_bound_end("2026-07-04", JULY_4_2026_NOON_UTC, "--before").unwrap(),
+            end
+        );
+    }
+
+    #[test]
+    fn parses_relative_day_words() {
+        let today = parse_history_date_range("today", JULY_4_2026_NOON_UTC, "--today").unwrap();
+        let yesterday =
+            parse_history_date_range("yesterday", JULY_4_2026_NOON_UTC, "--since").unwrap();
+
+        assert_eq!(today, (1_783_123_200, 1_783_209_599));
+        assert_eq!(yesterday, (1_783_036_800, 1_783_123_199));
+    }
+
+    #[test]
+    fn rejects_malformed_or_impossible_dates() {
+        assert!(parse_history_date_range("2026-7-4", JULY_4_2026_NOON_UTC, "--date").is_err());
+        assert!(parse_history_date_range("2026-02-29", JULY_4_2026_NOON_UTC, "--date").is_err());
+        assert!(parse_history_date_range("1969-12-31", JULY_4_2026_NOON_UTC, "--date").is_err());
+    }
+
+    #[test]
+    fn accepts_leap_days_and_raw_timestamp_bounds() {
+        let (start, end) =
+            parse_history_date_range("2024-02-29", JULY_4_2026_NOON_UTC, "--date").unwrap();
+
+        assert_eq!(start, 1_709_164_800);
+        assert_eq!(end, 1_709_251_199);
+        assert_eq!(
+            parse_history_bound_start("1783123200", JULY_4_2026_NOON_UTC, "--after").unwrap(),
+            1_783_123_200
+        );
+    }
 }

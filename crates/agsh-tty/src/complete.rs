@@ -8,8 +8,12 @@
 
 use std::collections::BTreeSet;
 
+use agsh_core::lexer::{lex, Token};
 use agsh_exec::ShellState;
 use agsh_style::Role;
+
+const HISTORY_ASSIGNMENT_SCAN: usize = 1_000;
+const MAX_VALUE_CANDIDATES: usize = 50;
 
 /// What kind of thing a candidate is — drives the dim type tag in the menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +27,7 @@ pub enum CandidateKind {
     Branch,
     History,
     Variable,
+    Value,
 }
 
 impl CandidateKind {
@@ -37,6 +42,7 @@ impl CandidateKind {
             CandidateKind::Branch => "branch",
             CandidateKind::History => "history",
             CandidateKind::Variable => "var",
+            CandidateKind::Value => "value",
         }
     }
 
@@ -50,6 +56,7 @@ impl CandidateKind {
             CandidateKind::Branch => Role::Branch,
             CandidateKind::History => Role::History,
             CandidateKind::Variable => Role::Var,
+            CandidateKind::Value => Role::Str,
         }
     }
 }
@@ -106,6 +113,11 @@ impl Candidate {
         self.description = Some(desc.into());
         self
     }
+
+    fn without_append_space(mut self) -> Self {
+        self.append_space = false;
+        self
+    }
 }
 
 /// A completion: replace `start..cursor` (char indices) with a chosen candidate.
@@ -136,16 +148,24 @@ pub fn complete(line: &str, cursor: usize, state: &ShellState) -> Completion {
         .unwrap_or(prev_tokens.is_empty());
 
     // $VAR completion.
-    if let Some(name) = word.strip_prefix('$') {
-        let var_start = word_start + 1; // after '$'
+    if word.starts_with('$') {
         return Completion {
-            start: var_start,
-            candidates: variable_candidates(state, name),
+            start: word_start,
+            candidates: variable_candidates(state, VariableCompletionStyle::DollarPrefixed),
         };
     }
 
     // Redirection target -> files.
     let after_redirect = prefix.trim_end().ends_with(['>', '<']);
+
+    if !after_redirect {
+        if let Some(context) = assignment_value_context(&prev_tokens, &word, in_command_position) {
+            return Completion {
+                start: word_start + context.value_start,
+                candidates: assignment_value_candidates(state, &context.name),
+            };
+        }
+    }
 
     if in_command_position && !word.contains('/') && !after_redirect {
         return Completion {
@@ -175,6 +195,18 @@ pub fn complete(line: &str, cursor: usize, state: &ShellState) -> Completion {
                 };
             }
         }
+    }
+
+    if !after_redirect && completes_bare_variable_name(&prev_tokens, &word) {
+        let style = if assignment_name_context(&prev_tokens) {
+            VariableCompletionStyle::AssignmentName
+        } else {
+            VariableCompletionStyle::BareName
+        };
+        return Completion {
+            start: word_start,
+            candidates: variable_candidates(state, style),
+        };
     }
 
     // git-aware completion.
@@ -248,13 +280,234 @@ fn match_score(needle: &str, hay: &str) -> Option<i64> {
     (ni == n.len()).then_some(score - h.len() as i64 / 4)
 }
 
-fn variable_candidates(state: &ShellState, _name: &str) -> Vec<Candidate> {
-    let mut names: Vec<String> = state.vars().keys().cloned().collect();
-    names.sort();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VariableCompletionStyle {
+    BareName,
+    AssignmentName,
+    DollarPrefixed,
+}
+
+fn variable_candidates(state: &ShellState, style: VariableCompletionStyle) -> Vec<Candidate> {
+    let mut names: BTreeSet<String> = state.vars().keys().cloned().collect();
+    if matches!(style, VariableCompletionStyle::AssignmentName) {
+        names.extend(assignment_names_from_history(state));
+        names.retain(|name| is_variable_name(name));
+    }
     names
         .into_iter()
-        .map(|n| Candidate::new(format!("${n}"), CandidateKind::Variable))
+        .map(|n| {
+            let value = match style {
+                VariableCompletionStyle::BareName => n,
+                VariableCompletionStyle::AssignmentName => format!("{n}="),
+                VariableCompletionStyle::DollarPrefixed => format!("${n}"),
+            };
+            let candidate = Candidate::new(value, CandidateKind::Variable);
+            if matches!(style, VariableCompletionStyle::AssignmentName) {
+                candidate.without_append_space()
+            } else {
+                candidate
+            }
+        })
         .collect()
+}
+
+fn completes_bare_variable_name(prev_tokens: &[String], word: &str) -> bool {
+    if word.starts_with('-') || word.contains(['=', '/', '$']) {
+        return false;
+    }
+    matches!(
+        prev_tokens.first().map(String::as_str),
+        Some("export" | "unset" | "readonly" | "declare" | "typeset" | "local")
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssignmentValueContext {
+    name: String,
+    value_start: usize,
+}
+
+fn assignment_value_context(
+    prev_tokens: &[String],
+    word: &str,
+    in_command_position: bool,
+) -> Option<AssignmentValueContext> {
+    let (name, _) = parse_assignment_word(word)?;
+    if !is_assignment_value_context(prev_tokens, in_command_position) {
+        return None;
+    }
+    Some(AssignmentValueContext {
+        value_start: name.chars().count() + 1,
+        name: name.to_string(),
+    })
+}
+
+fn is_assignment_value_context(prev_tokens: &[String], in_command_position: bool) -> bool {
+    if assignment_name_context(prev_tokens) {
+        return true;
+    }
+    in_command_position
+        || prev_tokens
+            .iter()
+            .all(|token| parse_assignment_word(token).is_some())
+}
+
+fn assignment_name_context(prev_tokens: &[String]) -> bool {
+    prev_tokens
+        .first()
+        .is_some_and(|cmd| assignment_value_builtin(cmd))
+}
+
+fn assignment_value_builtin(command: &str) -> bool {
+    matches!(
+        command,
+        "export" | "readonly" | "declare" | "typeset" | "local"
+    )
+}
+
+fn assignment_value_candidates(state: &ShellState, name: &str) -> Vec<Candidate> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for command in state
+        .history_recent(HISTORY_ASSIGNMENT_SCAN)
+        .into_iter()
+        .rev()
+    {
+        let mut values = assignment_values_from_history_line(&command, name);
+        values.reverse();
+        for value in values {
+            if value.is_empty() || !seen.insert(value.clone()) {
+                continue;
+            }
+            out.push(Candidate::new(value, CandidateKind::Value));
+            if out.len() >= MAX_VALUE_CANDIDATES {
+                return out;
+            }
+        }
+    }
+    if let Some(value) = state.lookup(name) {
+        let quoted = shell_quote_value(value);
+        if seen.insert(quoted.clone()) {
+            out.push(Candidate::new(quoted, CandidateKind::Value));
+        }
+    }
+    out
+}
+
+fn assignment_names_from_history(state: &ShellState) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for command in state.history_recent(HISTORY_ASSIGNMENT_SCAN) {
+        names.extend(assignment_names_from_history_line(&command));
+    }
+    names
+}
+
+fn assignment_values_from_history_line(line: &str, name: &str) -> Vec<String> {
+    let Ok(tokens) = lex(line) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut command: Option<&str> = None;
+    let mut command_position = true;
+    for token in &tokens {
+        if token.quote == agsh_core::QuoteKind::None && is_command_separator(&token.text) {
+            command = None;
+            command_position = true;
+            continue;
+        }
+
+        if command_position {
+            if let Some((candidate_name, value)) = raw_assignment_value(line, token) {
+                if candidate_name == name {
+                    out.push(value);
+                }
+                continue;
+            }
+            command = Some(token.text.as_str());
+            command_position = false;
+            continue;
+        }
+
+        if command.is_some_and(assignment_value_builtin) {
+            if let Some((candidate_name, value)) = raw_assignment_value(line, token) {
+                if candidate_name == name {
+                    out.push(value);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn assignment_names_from_history_line(line: &str) -> BTreeSet<String> {
+    let Ok(tokens) = lex(line) else {
+        return BTreeSet::new();
+    };
+    let mut names = BTreeSet::new();
+    let mut command: Option<&str> = None;
+    let mut command_position = true;
+    for token in &tokens {
+        if token.quote == agsh_core::QuoteKind::None && is_command_separator(&token.text) {
+            command = None;
+            command_position = true;
+            continue;
+        }
+
+        if command_position {
+            if let Some((name, _)) = parse_assignment_word(&token.text) {
+                names.insert(name.to_string());
+                continue;
+            }
+            command = Some(token.text.as_str());
+            command_position = false;
+            continue;
+        }
+
+        if command.is_some_and(assignment_value_builtin) {
+            if let Some((name, _)) = parse_assignment_word(&token.text) {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+fn raw_assignment_value(line: &str, token: &Token) -> Option<(String, String)> {
+    let (name, _) = parse_assignment_word(&token.text)?;
+    let raw = line.get(token.span.start..token.span.end)?;
+    let (_, raw_value) = raw.split_once('=')?;
+    Some((name.to_string(), raw_value.to_string()))
+}
+
+fn parse_assignment_word(word: &str) -> Option<(&str, &str)> {
+    let (name, value) = word.split_once('=')?;
+    is_variable_name(name).then_some((name, value))
+}
+
+fn is_variable_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn is_command_separator(token: &str) -> bool {
+    matches!(token, ";" | "&&" | "||" | "|" | "&")
+}
+
+fn shell_quote_value(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./:@%+=".contains(c))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// One-line descriptions for builtins, shown in the completion dropdown.
@@ -561,6 +814,176 @@ mod tests {
         let c = complete("ec", 2, &state);
         assert_eq!(c.start, 0);
         assert!(c.candidates.iter().any(|c| c.value == "echo"));
+    }
+
+    #[test]
+    fn dollar_variable_completion_replaces_the_dollar_word() {
+        let mut state = ShellState::from_current_process();
+        state.set_var("MONGO_USER", "user");
+        state.export_var("MONGO_URI", "mongodb://localhost");
+
+        let c = complete("echo $MONGO_", "echo $MONGO_".chars().count(), &state);
+
+        assert_eq!(c.start, "echo ".chars().count());
+        assert!(c.candidates.iter().any(|c| c.value == "$MONGO_USER"));
+        assert!(c.candidates.iter().any(|c| c.value == "$MONGO_URI"));
+    }
+
+    #[test]
+    fn export_completes_bare_variable_names() {
+        let mut state = ShellState::from_current_process();
+        state.set_var("MONGO_USER", "user");
+        state.export_var("MONGO_URI", "mongodb://localhost");
+
+        let c = complete("export MONGO_", "export MONGO_".chars().count(), &state);
+
+        assert_eq!(c.start, "export ".chars().count());
+        assert!(c
+            .candidates
+            .iter()
+            .any(|c| c.value == "MONGO_USER=" && c.kind == CandidateKind::Variable));
+        assert!(c
+            .candidates
+            .iter()
+            .any(|c| c.value == "MONGO_URI=" && c.kind == CandidateKind::Variable));
+        assert!(!c.candidates.iter().any(|c| c.value == "$MONGO_USER"));
+        assert!(c
+            .candidates
+            .iter()
+            .filter(|c| c.value == "MONGO_USER=")
+            .all(|c| !c.append_space));
+    }
+
+    #[test]
+    fn unset_completes_bare_variable_names_without_assignment_equals() {
+        let mut state = ShellState::from_current_process();
+        state.set_var("MONGO_USER", "user");
+
+        let c = complete("unset MONGO_", "unset MONGO_".chars().count(), &state);
+
+        assert_eq!(c.start, "unset ".chars().count());
+        assert!(c
+            .candidates
+            .iter()
+            .any(|c| c.value == "MONGO_USER" && c.kind == CandidateKind::Variable));
+        assert!(!c.candidates.iter().any(|c| c.value == "MONGO_USER="));
+    }
+
+    #[test]
+    fn programmable_completion_precedes_bare_variable_context() {
+        let mut state = ShellState::from_current_process();
+        state.set_var("MONGO_USER", "user");
+        state.register_completion_spec("export", vec!["MONGO_CUSTOM".to_string()]);
+
+        let c = complete("export MONGO_", "export MONGO_".chars().count(), &state);
+
+        assert!(c
+            .candidates
+            .iter()
+            .any(|c| c.value == "MONGO_CUSTOM" && c.kind == CandidateKind::Command));
+        assert!(!c
+            .candidates
+            .iter()
+            .any(|c| c.value == "MONGO_USER" && c.kind == CandidateKind::Variable));
+    }
+
+    #[test]
+    fn export_assignment_value_completion_uses_recent_history_values() {
+        let mut state = ShellState::from_current_process();
+        state.unset("A");
+        state.record_history("export A=1");
+        state.record_history("export A=2");
+
+        let c = complete("export A=", "export A=".chars().count(), &state);
+
+        assert_eq!(c.start, "export A=".chars().count());
+        let values: Vec<&str> = c
+            .candidates
+            .iter()
+            .filter(|c| c.kind == CandidateKind::Value)
+            .map(|c| c.value.as_str())
+            .collect();
+        assert_eq!(values, vec!["2", "1"]);
+    }
+
+    #[test]
+    fn export_completion_supports_variable_then_value_tabs() {
+        let mut state = ShellState::from_current_process();
+        state.set_var("A", "2");
+        state.record_history("export A=1");
+        state.record_history("export A=2");
+
+        let name = complete("export A", "export A".chars().count(), &state);
+        assert!(name
+            .candidates
+            .iter()
+            .any(|c| { c.value == "A=" && c.kind == CandidateKind::Variable && !c.append_space }));
+
+        let value = complete("export A=", "export A=".chars().count(), &state);
+        let values: Vec<&str> = value
+            .candidates
+            .iter()
+            .filter(|c| c.kind == CandidateKind::Value)
+            .map(|c| c.value.as_str())
+            .collect();
+        assert_eq!(values, vec!["2", "1"]);
+    }
+
+    #[test]
+    fn export_assignment_value_completion_preserves_quoted_history_value() {
+        let state = ShellState::from_current_process();
+        state.record_history("export A=\"hello world\"");
+
+        let c = complete("export A=", "export A=".chars().count(), &state);
+
+        assert!(c
+            .candidates
+            .iter()
+            .any(|c| c.value == "\"hello world\"" && c.kind == CandidateKind::Value));
+        assert!(!c
+            .candidates
+            .iter()
+            .any(|c| c.value == "hello world" && c.kind == CandidateKind::Value));
+    }
+
+    #[test]
+    fn export_assignment_value_completion_falls_back_to_current_value() {
+        let mut state = ShellState::from_current_process();
+        state.set_var("A", "hello world");
+
+        let c = complete("export A=", "export A=".chars().count(), &state);
+
+        assert_eq!(c.start, "export A=".chars().count());
+        assert!(c
+            .candidates
+            .iter()
+            .any(|c| c.value == "'hello world'" && c.kind == CandidateKind::Value));
+    }
+
+    #[test]
+    fn export_variable_name_completion_uses_history_names() {
+        let state = ShellState::from_current_process();
+        state.record_history("export API_TOKEN=old");
+
+        let c = complete("export API_", "export API_".chars().count(), &state);
+
+        assert!(c
+            .candidates
+            .iter()
+            .any(|c| c.value == "API_TOKEN=" && c.kind == CandidateKind::Variable));
+    }
+
+    #[test]
+    fn bare_variable_completion_is_limited_to_variable_builtins() {
+        let mut state = ShellState::from_current_process();
+        state.set_var("MONGO_USER", "user");
+
+        let c = complete("echo MONGO_", "echo MONGO_".chars().count(), &state);
+
+        assert!(!c
+            .candidates
+            .iter()
+            .any(|c| c.value == "MONGO_USER" && c.kind == CandidateKind::Variable));
     }
 
     #[test]

@@ -10,8 +10,11 @@
 use std::io::{self, Read, Write};
 
 use agsh_core::is_incomplete;
-use agsh_exec::{HistoryEntry, HistoryQuery, HistoryScope, SearchMode, ShellState};
-use agsh_style::Role;
+use agsh_exec::{
+    history_index_allows_syntax_highlight, HistoryMatch, HistoryQuery, HistoryScope, SearchMode,
+    ShellState,
+};
+use agsh_style::{highlight_shell_without_resolution, Role};
 
 use crate::buffer::LineBuffer;
 use crate::complete::{complete, filter_rank, highlight_positions, Candidate, CandidateKind};
@@ -411,13 +414,13 @@ impl<'a> Editor<'a> {
             match self.reader.next_key()? {
                 Key::Enter => {
                     if let Some(row) = rows.get(selected) {
-                        return Ok(HistoryPick::Run(row.command.clone()));
+                        return Ok(HistoryPick::Run(row.entry.command.clone()));
                     }
                     return Ok(HistoryPick::Cancel);
                 }
                 Key::Tab => {
                     if let Some(row) = rows.get(selected) {
-                        return Ok(HistoryPick::Edit(row.command.clone()));
+                        return Ok(HistoryPick::Edit(row.entry.command.clone()));
                     }
                 }
                 Key::AltDigit(n) => {
@@ -425,7 +428,7 @@ impl<'a> Editor<'a> {
                         history_window_start(selected, rows.len(), self.history_visible_rows())
                             + n.saturating_sub(1) as usize;
                     if let Some(row) = rows.get(idx) {
-                        return Ok(HistoryPick::Run(row.command.clone()));
+                        return Ok(HistoryPick::Run(row.entry.command.clone()));
                     }
                 }
                 Key::Up => selected = selected.saturating_sub(1),
@@ -465,7 +468,7 @@ impl<'a> Editor<'a> {
         query: &str,
         scope_index: usize,
         mode: SearchMode,
-    ) -> Vec<HistoryEntry> {
+    ) -> Vec<HistoryMatch> {
         let (scope, _) = history_scope(self.state, scope_index);
         let q = HistoryQuery {
             text: query.to_string(),
@@ -475,11 +478,7 @@ impl<'a> Editor<'a> {
             dedupe: true,
             ..HistoryQuery::default()
         };
-        self.state
-            .history_query(&q)
-            .into_iter()
-            .map(|row| row.entry)
-            .collect()
+        self.state.history_query(&q)
     }
 
     fn render_history_picker(
@@ -488,9 +487,10 @@ impl<'a> Editor<'a> {
         scope_index: usize,
         mode: SearchMode,
         selected: usize,
-        rows: &[HistoryEntry],
+        rows: &[HistoryMatch],
     ) -> io::Result<()> {
         let theme = self.state.theme();
+        let total_history_rows = self.state.history_len();
         let (_, scope_label) = history_scope(self.state, scope_index);
         let mode_label = history_mode_label(mode);
         let prefix = format!("history [{scope_label}/{mode_label}] ");
@@ -510,24 +510,30 @@ impl<'a> Editor<'a> {
             let start = history_window_start(selected, rows.len(), visible_rows);
             let end = (start + visible_rows).min(rows.len());
             for (slot, row) in rows[start..end].iter().enumerate() {
+                let entry = &row.entry;
                 let index = format!("{}", slot + 1);
                 let absolute = start + slot;
-                let status = match row.exit_code {
+                let status = match entry.exit_code {
                     Some(0) => theme.paint(Role::Ok, "ok"),
                     Some(_) => theme.paint(Role::Error, "!!"),
                     None => theme.paint(Role::Muted, "--"),
                 };
-                let duration = theme.paint(Role::Muted, &history_duration(row.duration_ms));
-                let cwd = short_path(&row.cwd);
-                let branch = row
+                let duration = theme.paint(Role::Muted, &history_duration(entry.duration_ms));
+                let cwd = short_path(&entry.cwd);
+                let branch = entry
                     .git_branch
                     .as_deref()
                     .map(|b| format!(" {b}"))
                     .unwrap_or_default();
-                let mut line = format!(
-                    " {index:>1}  {status} {duration:>7}  {}",
-                    truncate_one_line(&row.command, self.cols.saturating_sub(24).max(24)),
-                );
+                let display_command =
+                    truncate_one_line(&entry.command, self.cols.saturating_sub(24).max(24));
+                let command =
+                    if history_index_allows_syntax_highlight(row.index, total_history_rows) {
+                        highlight_shell_without_resolution(&display_command, &theme)
+                    } else {
+                        display_command
+                    };
+                let mut line = format!(" {index:>1}  {status} {duration:>7}  {}", command,);
                 if !cwd.is_empty() || !branch.is_empty() {
                     line.push_str(&theme.paint(
                         Role::Muted,
@@ -548,7 +554,7 @@ impl<'a> Editor<'a> {
                         selected + 1,
                         rows.len(),
                         truncate_one_line(
-                            &short_path(&row.cwd),
+                            &short_path(&row.entry.cwd),
                             self.cols.saturating_sub(64).max(12)
                         )
                     ),
@@ -615,6 +621,19 @@ impl<'a> Editor<'a> {
     /// processed normally.
     fn handle_completion_key(&mut self, key: &Key) -> io::Result<bool> {
         let visible_len = self.completion_visible().len();
+        if let Some(menu) = &self.completion {
+            let rows = self.completion_row_count();
+            let start = completion_window_start(menu.selected, visible_len, rows);
+            let window_len = visible_len.saturating_sub(start).min(rows);
+            if let Some(selected) = completion_direct_index(key, start, window_len) {
+                if let Some(menu) = &mut self.completion {
+                    menu.selected = selected;
+                }
+                self.accept_completion();
+                self.render()?;
+                return Ok(true);
+            }
+        }
         match key {
             Key::Tab | Key::Down => {
                 if let Some(menu) = &mut self.completion {
@@ -675,6 +694,10 @@ impl<'a> Editor<'a> {
                 Ok(false)
             }
         }
+    }
+
+    fn completion_row_count(&self) -> usize {
+        MENU_ROWS.min(self.rows.saturating_sub(2).max(1))
     }
 
     /// Candidate indices currently visible (filtered by the typed word).
@@ -749,20 +772,16 @@ impl<'a> Editor<'a> {
             return vec![theme.paint(Role::Muted, "  (no matches)")];
         }
         let word = self.buffer.text_range(menu.start, self.buffer.cursor());
-        let rows = MENU_ROWS.min(self.rows.saturating_sub(2).max(1));
+        let rows = self.completion_row_count();
         let total = visible.len();
-        let start = if menu.selected >= rows {
-            menu.selected - rows + 1
-        } else {
-            0
-        };
+        let start = completion_window_start(menu.selected, total, rows);
         let end = (start + rows).min(total);
         let max_val = visible[start..end]
             .iter()
             .map(|i| menu.candidates[*i].value.chars().count())
             .max()
             .unwrap_or(0)
-            .min(self.cols.saturating_sub(16).max(1));
+            .min(self.cols.saturating_sub(20).max(1));
 
         let mut lines = Vec::new();
         for (row, &i) in visible[start..end].iter().enumerate() {
@@ -775,6 +794,7 @@ impl<'a> Editor<'a> {
             } else {
                 " ".to_string()
             };
+            let shortcut = theme.paint(Role::Muted, &format!("{}", row + 1));
             // Type icon (empty unless AGSH_ICONS).
             let icon = self.candidate_icon(cand);
             let icon_cell = if icon.is_empty() {
@@ -788,7 +808,7 @@ impl<'a> Editor<'a> {
             // Optional one-line description (truncated to fit the terminal).
             let desc = match &cand.description {
                 Some(d) if !d.is_empty() => {
-                    let budget = self.cols.saturating_sub(max_val + 18);
+                    let budget = self.cols.saturating_sub(max_val + 22);
                     let shown: String = d.chars().take(budget).collect();
                     if shown.is_empty() {
                         String::new()
@@ -798,7 +818,7 @@ impl<'a> Editor<'a> {
                 }
                 _ => String::new(),
             };
-            lines.push(format!("{bar} {icon_cell}{value}  {tag}{desc}"));
+            lines.push(format!("{bar} {shortcut} {icon_cell}{value}  {tag}{desc}"));
         }
         if total > rows {
             lines.push(theme.paint(
@@ -823,6 +843,24 @@ impl<'a> Editor<'a> {
 }
 
 const HISTORY_SCOPES: &[&str] = &["global", "directory", "workspace", "session", "failures"];
+
+fn completion_window_start(selected: usize, total: usize, visible_rows: usize) -> usize {
+    if total == 0 || visible_rows == 0 || total <= visible_rows {
+        0
+    } else if selected >= visible_rows {
+        (selected + 1 - visible_rows).min(total - visible_rows)
+    } else {
+        0
+    }
+}
+
+fn completion_direct_index(key: &Key, window_start: usize, window_len: usize) -> Option<usize> {
+    let Key::AltDigit(n) = key else {
+        return None;
+    };
+    let row = n.saturating_sub(1) as usize;
+    (row < window_len).then_some(window_start + row)
+}
 
 fn history_scope(state: &ShellState, index: usize) -> (HistoryScope, &'static str) {
     match HISTORY_SCOPES[index % HISTORY_SCOPES.len()] {
@@ -1148,6 +1186,25 @@ mod tests {
         assert_eq!(history_window_start(15, 20, 8), 8);
         assert_eq!(history_window_start(19, 20, 8), 12);
         assert_eq!(history_window_start(3, 4, 8), 0);
+    }
+
+    #[test]
+    fn completion_window_tracks_selection_through_all_rows() {
+        assert_eq!(completion_window_start(0, 20, 8), 0);
+        assert_eq!(completion_window_start(7, 20, 8), 0);
+        assert_eq!(completion_window_start(8, 20, 8), 1);
+        assert_eq!(completion_window_start(15, 20, 8), 8);
+        assert_eq!(completion_window_start(19, 20, 8), 12);
+        assert_eq!(completion_window_start(3, 4, 8), 0);
+    }
+
+    #[test]
+    fn completion_alt_digit_selects_visible_window_row() {
+        assert_eq!(completion_direct_index(&Key::AltDigit(1), 0, 8), Some(0));
+        assert_eq!(completion_direct_index(&Key::AltDigit(8), 0, 8), Some(7));
+        assert_eq!(completion_direct_index(&Key::AltDigit(1), 4, 8), Some(4));
+        assert_eq!(completion_direct_index(&Key::AltDigit(9), 4, 8), None);
+        assert_eq!(completion_direct_index(&Key::Char('1'), 0, 8), None);
     }
 
     #[test]

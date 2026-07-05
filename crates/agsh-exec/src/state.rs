@@ -281,6 +281,10 @@ pub struct ShellState {
     /// Session default output mode (set by config/env/flag at startup and the
     /// runtime `mode` builtin); `None` means use the executor's mode.
     default_output_mode: Option<OutputMode>,
+    /// True only while a builtin is rendering directly to a human terminal.
+    /// Pipes, redirects, scripts, and capture modes keep this false so rich
+    /// presentation never contaminates raw bytes.
+    rich_stdout: bool,
     git_cache: Arc<Mutex<Option<GitCacheEntry>>>,
     command_names: CommandNameCache,
     /// Directory and saved prior values for a currently-activated project `.env`.
@@ -406,6 +410,7 @@ impl ShellState {
             advisories: Arc::new(Mutex::new(std::collections::HashSet::new())),
             config: Arc::new(CompactorConfig::load()),
             default_output_mode: None,
+            rich_stdout: false,
             git_cache: Arc::new(Mutex::new(None)),
             command_names: Arc::new(Mutex::new(None)),
             active_env: None,
@@ -641,6 +646,14 @@ impl ShellState {
     /// icons honor AGSH_ICONS). Built once and shared via clones.
     pub fn theme(&self) -> Theme {
         self.theme
+    }
+
+    pub fn rich_stdout_enabled(&self) -> bool {
+        self.rich_stdout
+    }
+
+    pub(crate) fn replace_rich_stdout(&mut self, enabled: bool) -> bool {
+        std::mem::replace(&mut self.rich_stdout, enabled)
     }
 
     /// Apply (or refresh) the current directory's trusted `.env`, restoring any
@@ -1613,6 +1626,18 @@ impl ShellState {
         if let Ok(mut store) = self.history.lock() {
             store.push(entry);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_history_entry_for_test(&self, entry: HistoryEntry) {
+        if let Ok(mut store) = self.history.lock() {
+            store.push(entry);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_theme_for_test(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
     /// Attach the exit code and wall-clock duration to the most recent command.

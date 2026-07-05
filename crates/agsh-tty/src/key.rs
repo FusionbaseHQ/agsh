@@ -38,7 +38,7 @@ pub enum Key {
     ReverseSearch,
     /// Ctrl-S — cycle search mode inside the history picker.
     SearchMode,
-    /// Alt-1..9 — quick-select a visible history result.
+    /// Alt-1..9 — quick-select a visible history result or completion candidate.
     AltDigit(u8),
     /// Ctrl-C — abort the current line.
     Interrupt,
