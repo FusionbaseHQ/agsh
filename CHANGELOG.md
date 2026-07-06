@@ -6,11 +6,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-07-03
+## [0.2.0] - 2026-07-06
 
 The resilience release: agsh now separates the three lifetimes every other
 shell welds together — the terminal, the shell state, and the processes.
-Sessions survive closed windows, dropped SSH, crashes, and reboots.
+Sessions survive closed windows, dropped SSH, crashes, and reboots. It also
+ships a richer native history workflow for browsing, filtering, and reusing
+commands without giving up shell-native storage.
 
 ### Added — session resilience
 - **The keep broker** (`agshd`, new `agsh-broker` crate) — a per-user daemon
@@ -50,6 +52,24 @@ Sessions survive closed windows, dropped SSH, crashes, and reboots.
   release pipeline; tagged builds fail if signing secrets are missing, so an
   unsigned release can't slip out. See `docs/RELEASING.md`.
 
+### Added — history and command entry
+- **Native rich `history` workbench** — the history UI is scrollable over all
+  matches instead of a fixed short page, with search-first navigation and
+  metadata that includes the recorded date and time for each command.
+- **Date-aware history filtering** — `history --today`, `history --date
+  YYYY-MM-DD`, `history --since/--after YYYY-MM-DD`, and
+  `history --before YYYY-MM-DD` filter by recorded command time using clear day
+  boundaries.
+- **Syntax-highlighted history commands** — TTY history views color commands
+  with the same shell-aware highlighter used by the editor, gated so pipes,
+  redirects, and captured output remain plain bytes.
+- **Faster completion selection** — the completion menu numbers visible rows and
+  supports direct Alt/Meta number selection, so common picks do not require
+  repeated arrow navigation.
+- **Environment-aware completion** — `export NAME=` can complete values from
+  command history and the current environment, while `export NAME` and
+  `unset NAME` complete variable names in the form each builtin expects.
+
 ### Added — earlier unreleased work
 - **Startup rc file** — interactive sessions source `~/.config/agsh/agshrc`
   (aliases, functions, exports, prompt hooks, `mode:…`); `--norc` /
@@ -80,6 +100,10 @@ Sessions survive closed windows, dropped SSH, crashes, and reboots.
   flooding the screen; accepting with `→` still inserts the full command.
 - The generic compact reducer credits its baseline: ported and extended from
   [rtk](https://github.com/rtk-ai/rtk), natively integrated into the shell.
+- The prompt now emits OSC 7 current-directory integration so compatible
+  terminals track `cd` changes live.
+- Release gates now run the full behavioral suite before publishing artifacts,
+  and public releases emit GitHub artifact attestations alongside checksums.
 
 ### Fixed
 - **PTY controller fd leak** — spawned jobs inherited their own PTY controller
