@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import shutil
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 AGSH = os.environ.get("AGSH", os.path.join(_REPO, "target", "debug", "agsh"))
@@ -35,10 +36,14 @@ TESTS = [
     ("IFS custom", 'IFS=:; x="a:b:c"; set -- $x; echo $2'),
     # 2.6 expansions (POSIX parameter expansion only)
     ("param default", "echo ${u:-fallback}"),
+    ("param quoted default word", 'unset u; set -- ${u:-"a b"}; printf "%s:<%s>\\n" "$#" "$1"'),
+    ("param escaped default word", r'unset u; set -- ${u:-a\ b}; printf "%s:<%s>\n" "$#" "$1"'),
+    ("param quoted positional fields", 'set -- a "b c"; unset u; f(){ printf "<%s>\\n" "$@"; }; f ${u:-"$@"}; f "${u:-$@}"'),
     ("param assign", "echo ${v:=set}; echo $v"),
     ("param alt", "x=1; echo ${x:+yes}"),
     ("param length", "x=hello; echo ${#x}"),
     ("remove prefix", "p=a/b/c; echo ${p##*/}"),
+    ("remove quoted prefix", 'p="a*b"; q="a*"; printf "%s|%s|%s\\n" "${p#'"'"'a*'"'"'}" "${p#\"$q\"}" "${p#$q}"'),
     ("remove suffix", "p=a.b.c; echo ${p%.*}"),
     ("arith expansion", "echo $((2 + 3 * 4))"),
     ("command sub", 'echo "[$(echo hi)]"'),
@@ -47,6 +52,10 @@ TESTS = [
     ("redir out/in", "echo hi > o.txt; cat < o.txt"),
     ("redir append", "echo a > a.txt; echo b >> a.txt; cat a.txt"),
     ("heredoc", "cat <<EOF\nline1\nline2\nEOF"),
+    ("heredoc quoted delimiter", "x=value; cat <<E'O'F\n$x\nEOF"),
+    ("heredoc escapes", "x=value; cat <<EOF\n\\$x|\\\\|a\\\nb\nEOF"),
+    ("heredoc strip tabs", "cat <<-EOF\n\tone\n\tEOF"),
+    ("heredoc in compound", "if true; then cat <<EOF\ninside\nEOF\nfi; (cat <<'EOF'\n$HOME\nEOF\n)"),
     ("read-write fd0", "printf 'rw\\n' > rw.txt; cat <>rw.txt"),
     # 2.9 compound commands
     ("if/elif/else", "if false; then echo a; elif true; then echo b; else echo c; fi"),
@@ -70,15 +79,41 @@ TESTS = [
     ("times runs", "times >/dev/null; echo $?"),
     ("getopts", "set -- -a -b val x; while getopts ab: o; do echo $o:$OPTARG; done"),
     ("export to child", "export Y=1; sh -c 'echo $Y'"),
+    ("special builtin prefix persists", "unset AGSH_POSIX_PREFIX; AGSH_POSIX_PREFIX=x :; sh -c 'echo $AGSH_POSIX_PREFIX'"),
+    ("readonly reassignment status", "readonly AGSH_POSIX_RO=one; (readonly AGSH_POSIX_RO=two) 2>/dev/null; echo $?:$AGSH_POSIX_RO"),
+    ("readonly unset status", "readonly AGSH_POSIX_UNSET=one; (unset AGSH_POSIX_UNSET) 2>/dev/null; echo $?:$AGSH_POSIX_UNSET"),
     ("set positionals", "set -- one two; echo $1 $2"),
     ("shift", "set -- a b c; shift; echo $1"),
 ]
 
 
+def isolated_env(work):
+    env = dict(os.environ)
+    for key in list(env):
+        if key.startswith("AGSH_") or key in {
+            "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+            "BASH_ENV", "ENV",
+        }:
+            env.pop(key, None)
+    home = os.path.join(work, ".test-home")
+    os.makedirs(home, exist_ok=True)
+    env.update({
+        "HOME": home,
+        "XDG_CONFIG_HOME": os.path.join(home, ".config"),
+        "XDG_DATA_HOME": os.path.join(home, ".local", "share"),
+        "XDG_STATE_HOME": os.path.join(home, ".local", "state"),
+        "AGSH_HISTORY_FILE": os.path.join(home, "history.jsonl"),
+        "AGSH_SESSION_DIR": os.path.join(home, "sessions"),
+        "AGSH_BROKER_DIR": os.path.join(home, "broker"),
+    })
+    return env
+
+
 def runsh(shell, script, work):
     try:
         p = subprocess.run(
-            [shell, "-c", script], cwd=work, capture_output=True, text=True, timeout=15
+            [shell, "-c", script], cwd=work, env=isolated_env(work),
+            capture_output=True, text=True, timeout=15
         )
         return p.stdout, p.returncode
     except subprocess.TimeoutExpired:
@@ -89,11 +124,14 @@ def main():
     if not os.path.exists(AGSH):
         print(f"ERROR: agsh not found at {AGSH} (run `cargo build`)")
         sys.exit(2)
-    work = tempfile.mkdtemp()
     npass = nfail = 0
     for desc, script in TESTS:
-        ro, rc = runsh(REF, script, work)
-        ao, ac = runsh(AGSH, script, work)
+        ref_work = tempfile.mkdtemp(prefix="agsh-posix-ref-")
+        agsh_work = tempfile.mkdtemp(prefix="agsh-posix-agsh-")
+        ro, rc = runsh(REF, script, ref_work)
+        ao, ac = runsh(AGSH, script, agsh_work)
+        shutil.rmtree(ref_work, ignore_errors=True)
+        shutil.rmtree(agsh_work, ignore_errors=True)
         if ro == ao and rc == ac:
             npass += 1
             if os.environ.get("VERBOSE"):

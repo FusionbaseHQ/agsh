@@ -28,7 +28,14 @@ class Session:
         self.rows, self.cols = rows, cols
         self.term = Term(rows, cols)
         env = dict(os.environ)
-        home = "/tmp/agsh-pty-home"
+        for key in list(env):
+            if key.startswith("AGSH_") or key in {
+                "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+                "BASH_ENV", "ENV",
+            }:
+                env.pop(key, None)
+        self.runtime_dir = tempfile.mkdtemp(prefix="agsh-pty-runtime-")
+        home = os.path.join(self.runtime_dir, "home")
         os.makedirs(home, exist_ok=True)
         # Session journals go to a per-Session temp dir so scenarios never see
         # each other's (or the developer's) crashed-session restore banners.
@@ -43,7 +50,8 @@ class Session:
             HOME=home,
             XDG_CONFIG_HOME=os.path.join(home, ".config"),
             XDG_DATA_HOME=os.path.join(home, ".local", "share"),
-            AGSH_HISTORY_FILE=history or "/tmp/agsh-pty-history.jsonl",
+            XDG_STATE_HOME=os.path.join(home, ".local", "state"),
+            AGSH_HISTORY_FILE=history or os.path.join(self.runtime_dir, "history.jsonl"),
             AGSH_SESSION_DIR=self.session_dir,
             AGSH_BROKER_DIR=self.broker_dir,
             TERM="xterm",
@@ -146,6 +154,7 @@ class Session:
             shutil.rmtree(self.session_dir, ignore_errors=True)
         if self._owns_broker_dir:
             shutil.rmtree(self.broker_dir, ignore_errors=True)
+        shutil.rmtree(self.runtime_dir, ignore_errors=True)
 
 
 # Common control keys.

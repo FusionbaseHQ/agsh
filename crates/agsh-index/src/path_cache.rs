@@ -19,6 +19,10 @@ impl PathCache {
         self.entries.get(name)
     }
 
+    pub fn remove(&mut self, name: &str) -> Option<PathBuf> {
+        self.entries.remove(name)
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

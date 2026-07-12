@@ -1,16 +1,20 @@
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use agsh_core::parse_line;
+use agsh_core::{parse_line, ShellError, ShellErrorKind};
 use agsh_exec::{print_captured_if_needed, ExecutionOptions, Executor, ShellState};
 use agsh_output::OutputMode;
-use agsh_policy::{analyze_graph, RiskLevel};
 use agsh_tty::{pick_history, read_line, read_line_with_initial, render_prompt, HistorySelection};
+
+const MAX_SHELL_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RC_SOURCE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Default)]
 struct CliOptions {
     command: Option<String>,
+    /// `$0` for `-c`/`--run`; the first trailing argument names the command.
+    command_name: Option<String>,
     /// Script file to execute non-interactively (`agsh FILE [args...]`).
     script: Option<String>,
     /// Positional arguments ($1, $2, …) for `-c` or a script file.
@@ -43,12 +47,22 @@ struct CliOptions {
     keep_session: bool,
     /// `--attach [ID]`: reattach to a detached kept agsh session.
     attach: Option<Option<String>>,
+    /// Internal, bounded stdin state handoff for a POSIX asynchronous subshell.
+    background_state_stdin: bool,
+    capture_drain_run: bool,
     show_help: bool,
     show_version: bool,
 }
 
 fn main() {
-    let options = match parse_args(std::env::args().skip(1)) {
+    let cli_args = match collect_cli_args() {
+        Ok(args) => args,
+        Err(message) => {
+            eprintln!("agsh: {message}");
+            std::process::exit(2);
+        }
+    };
+    let options = match parse_args(cli_args.into_iter()) {
         Ok(options) => options,
         Err(message) => {
             eprintln!("agsh: {message}");
@@ -56,6 +70,9 @@ fn main() {
         }
     };
 
+    if options.capture_drain_run {
+        std::process::exit(run_capture_drain());
+    }
     if options.show_help {
         print_help();
         return;
@@ -105,7 +122,16 @@ fn main() {
         std::process::exit(run_attach(id.as_deref()));
     }
 
+    if let Ok(exe) = std::env::current_exe() {
+        agsh_exec::set_capture_drain_helper(exe);
+    }
     let mut state = ShellState::from_current_process();
+    if options.background_state_stdin {
+        if let Err(error) = agsh_exec::restore_background_snapshot_stdin(&mut state) {
+            eprintln!("agsh: background state: {error}");
+            std::process::exit(1);
+        }
+    }
     let mut executor = Executor::new().with_stdout_flush(true);
 
     // Session default output mode, highest priority first:
@@ -121,6 +147,7 @@ fn main() {
                 .ok()
                 .and_then(|value| OutputMode::from_str(&value).ok())
         })
+        .or_else(|| state.default_output_mode())
         .or_else(|| {
             std::io::stdout()
                 .is_terminal()
@@ -141,16 +168,21 @@ fn main() {
         eprintln!("agsh: failed to install signal handlers: {error}");
     }
 
-    // Load and persist rich history for the interactive session.
-    state.load_persistent_history();
-    // Activate a trusted project .env for the starting directory (no-op if none).
-    state.activate_project_env();
+    // A background child already received the parent's exact active overlay and
+    // saved baseline. Re-reading the trust store or `.env` here would introduce
+    // a startup race and could silently discard the inherited overlay.
+    if !options.background_state_stdin {
+        state.activate_project_env();
+    }
     // On a terminal, let the real `ls` colorize files vs directories (themed).
     seed_color_env(&mut state);
 
     // Apply command confinement (the `confine` guardrail). Order matters:
     // inherited env first (a child agsh self-confines), then `--allow`.
-    apply_confinement(&mut state, &options);
+    if let Err(error) = apply_confinement(&mut state, &options) {
+        eprintln!("agsh: cannot install confinement shell shims: {error}");
+        std::process::exit(1);
+    }
 
     // `--observe CMD ARGS…`: run CMD as a captured/observed external command whose
     // output is rendered in the session output mode (the compacting proxy behind
@@ -173,10 +205,7 @@ fn main() {
             .join(" ");
         let code = match run_one(&source, &mut executor, &mut state, &exec_options) {
             Ok(code) => code,
-            Err(error) => {
-                eprintln!("agsh: {error}");
-                1
-            }
+            Err(error) => report_shell_error(&error),
         };
         run_exit_trap(&mut executor, &mut state, &exec_options);
         std::process::exit(code);
@@ -188,11 +217,16 @@ fn main() {
     // already-observed subtree to avoid re-installing / re-entrancy.
     if std::env::var_os("AGSH_INTERCEPT_ACTIVE").is_none() {
         if let Some((mode, native, deep)) = intercept_mode() {
-            let _ = agsh_exec::install_intercept_shims(&mut state, mode, native);
-            if deep && !agsh_exec::install_deep_intercept(&mut state, mode) {
-                eprintln!(
-                    "agsh: deep interception unavailable (interposer not found); PATH shims only"
-                );
+            match agsh_exec::install_intercept_shims(&mut state, mode, native) {
+                Ok(_) if deep && !agsh_exec::install_deep_intercept(&mut state, mode) => {
+                    eprintln!(
+                        "agsh: deep interception unavailable (interposer not found); PATH shims only"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("agsh: shell interception unavailable: {error}");
+                }
             }
         }
     }
@@ -201,9 +235,8 @@ fn main() {
     // backend; self-managing agents are refused; falls back to shims only with
     // --best-effort).
     if let Some(command) = options.run.clone() {
-        if !options.script_args.is_empty() {
-            state.set_positionals(&options.script_args);
-        }
+        state.set_arg0(options.command_name.as_deref().unwrap_or("agsh"));
+        state.set_positionals(&options.script_args);
         let names: Vec<String> = options
             .allow
             .as_deref()
@@ -214,9 +247,15 @@ fn main() {
                     .collect()
             })
             .unwrap_or_default();
-        let final_command = if names.is_empty() {
-            command
-        } else {
+        if names.is_empty() {
+            eprintln!(
+                "agsh: --run requires a non-empty --allow capability list; use -c for ordinary execution"
+            );
+            std::process::exit(2);
+        }
+        let mut cleanup = Vec::new();
+        let mut removed_env = Vec::new();
+        let final_command = {
             let opts = agsh_exec::ConfineOpts {
                 force: options.force,
                 best_effort: options.best_effort,
@@ -230,12 +269,18 @@ fn main() {
                     std::process::exit(code);
                 }
                 agsh_exec::ConfinePlan::Sandboxed {
-                    command: wrapped, ..
+                    command: wrapped,
+                    cleanup: paths,
+                    env_remove,
+                    ..
                 } => {
-                    // NOTE: launch `--run` exec-replaces the shell, so the temp
-                    // profile/scratch are cleaned by the OS on TMPDIR rotation
-                    // (exec-only launch has no scratch); the interactive `confine`
-                    // builtin cleans up explicitly.
+                    removed_env = env_remove
+                        .into_iter()
+                        .filter_map(|name| {
+                            state.take_exported_env(&name).map(|value| (name, value))
+                        })
+                        .collect();
+                    cleanup = paths;
                     wrapped
                 }
                 agsh_exec::ConfinePlan::BestEffort => {
@@ -244,33 +289,41 @@ fn main() {
                         Some(p) => p.intersect(&names),
                         None => agsh_policy::AllowPolicy::from_names(&names),
                     };
+                    if let Err(error) = agsh_exec::install_confine_shims(&mut state) {
+                        eprintln!("agsh: cannot install confinement shell shims: {error}");
+                        std::process::exit(1);
+                    }
                     state.export_var("AGSH_CONFINE", effective.to_list());
-                    let _ = agsh_exec::install_confine_shims(&mut state);
                     command
                 }
             }
         };
         let code = match run_one(&final_command, &mut executor, &mut state, &exec_options) {
             Ok(code) => code,
-            Err(error) => {
-                eprintln!("agsh: {error}");
-                1
-            }
+            Err(error) => report_shell_error(&error),
         };
+        for path in cleanup {
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+        }
+        for (name, value) in removed_env {
+            state.restore_exported_env(name, value);
+        }
         run_exit_trap(&mut executor, &mut state, &exec_options);
         std::process::exit(code);
     }
 
     if let Some(command) = options.command {
-        if !options.script_args.is_empty() {
+        if !options.background_state_stdin {
+            state.set_arg0(options.command_name.as_deref().unwrap_or("agsh"));
             state.set_positionals(&options.script_args);
         }
         let code = match run_one(&command, &mut executor, &mut state, &exec_options) {
             Ok(code) => code,
-            Err(error) => {
-                eprintln!("agsh: {error}");
-                1
-            }
+            Err(error) => report_shell_error(&error),
         };
         run_exit_trap(&mut executor, &mut state, &exec_options);
         std::process::exit(code);
@@ -278,20 +331,44 @@ fn main() {
 
     // Non-interactive script file: `agsh FILE [args...]`.
     if let Some(path) = options.script {
-        let source = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
+        let source = match std::fs::File::open(&path)
+            .and_then(|file| read_utf8_limited(file, MAX_SHELL_SOURCE_BYTES, "shell source"))
+        {
+            Ok(source) => source,
             Err(error) => {
                 eprintln!("agsh: {path}: {error}");
                 std::process::exit(127);
             }
         };
+        state.set_arg0(&path);
         state.set_positionals(&options.script_args);
         let code = match run_one(&source, &mut executor, &mut state, &exec_options) {
             Ok(code) => code,
+            Err(error) => report_shell_error(&error),
+        };
+        run_exit_trap(&mut executor, &mut state, &exec_options);
+        std::process::exit(code);
+    }
+
+    // With no `-c` command or script file, non-terminal stdin is itself the
+    // script source. Execute it as one graph so multiline constructs and the
+    // final command status behave exactly like a script file, without ever
+    // entering the prompt/editor loop.
+    if !std::io::stdin().is_terminal() {
+        let source = match read_utf8_limited(
+            std::io::stdin(),
+            MAX_SHELL_SOURCE_BYTES,
+            "stdin shell source",
+        ) {
+            Ok(source) => source,
             Err(error) => {
-                eprintln!("agsh: {error}");
-                1
+                eprintln!("agsh: stdin: {error}");
+                std::process::exit(1);
             }
+        };
+        let code = match run_one(&source, &mut executor, &mut state, &exec_options) {
+            Ok(code) => code,
+            Err(error) => report_shell_error(&error),
         };
         run_exit_trap(&mut executor, &mut state, &exec_options);
         std::process::exit(code);
@@ -303,8 +380,13 @@ fn main() {
     // the differential tests are never affected.
     let mut session_recorder = None;
     if std::io::stdin().is_terminal() {
+        // File-backed history is strictly interactive. Until this point the
+        // state uses its in-memory store, so `-c`, script files, `--run`,
+        // `--observe`, and piped-stdin scripts cannot read or persist the user's
+        // command history.
+        state.load_persistent_history();
         source_rc(&mut executor, &mut state, &options, &exec_options);
-        // Journal this session's state deltas (crash-safe restore via `resume`).
+        // Best-effort journal this session's state deltas for `resume`.
         // Begun after the rc file, so only state typed into THIS session is
         // journaled — rc state is recreated by the rc file on the next start.
         session_recorder = agsh_exec::journal::SessionRecorder::begin(&mut state);
@@ -419,10 +501,7 @@ fn main() {
 
         let exit = match run_one(&line, &mut executor, &mut state, &exec_options) {
             Ok(code) => code,
-            Err(error) => {
-                eprintln!("agsh: {error}");
-                1
-            }
+            Err(error) => report_shell_error(&error),
         };
         // Shell integration: command-end mark with exit status.
         if integrate {
@@ -449,10 +528,42 @@ fn main() {
     }
 
     run_exit_trap(&mut executor, &mut state, &exec_options);
-    // Clean end: mark the journal so this session is never offered for restore.
+    // Clean end: best-effort mark the journal so it is not offered for restore.
     if let Some(recorder) = &session_recorder {
         recorder.finish(state.last_status());
     }
+}
+
+fn collect_cli_args() -> Result<Vec<String>, String> {
+    std::env::args_os()
+        .skip(1)
+        .map(|argument| {
+            argument
+                .into_string()
+                .map_err(|argument| format!("argument is not valid UTF-8: {argument:?}"))
+        })
+        .collect()
+}
+
+fn read_utf8_limited(
+    reader: impl Read,
+    limit: usize,
+    description: &str,
+) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
+    reader.take((limit + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{description} exceeds {limit} bytes"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{description} is not valid UTF-8: {error}"),
+        )
+    })
 }
 
 fn resolve_history_tui_line(state: &ShellState, integrate: bool) -> Option<String> {
@@ -489,6 +600,7 @@ fn resolve_history_tui_line(state: &ShellState, integrate: bool) -> Option<Strin
 /// from any later terminal resumes it exactly where it was.
 fn run_kept_session(options: &CliOptions) -> i32 {
     use std::io::IsTerminal;
+    use std::os::unix::ffi::OsStringExt;
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
         eprintln!("agsh: --keep needs a terminal");
         return 2;
@@ -521,9 +633,20 @@ fn run_kept_session(options: &CliOptions) -> i32 {
         cmd.push("--rcfile".into());
         cmd.push(rcfile.clone());
     }
-    let mut env: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| k != "AGSH_SESSION")
-        .collect();
+    let mut env = Vec::new();
+    let mut opaque_env = Vec::new();
+    for (key, value) in std::env::vars_os() {
+        if key == std::ffi::OsStr::new("AGSH_SESSION") {
+            continue;
+        }
+        match key.into_string() {
+            Ok(key) => match value.into_string() {
+                Ok(value) => env.push((key, value)),
+                Err(value) => opaque_env.push((key.into_bytes(), value.into_vec())),
+            },
+            Err(key) => opaque_env.push((key.into_vec(), value.into_vec())),
+        }
+    }
     env.push(("AGSH_KEPT".into(), "1".into()));
     let cwd = std::env::current_dir()
         .map(|d| d.display().to_string())
@@ -533,6 +656,7 @@ fn run_kept_session(options: &CliOptions) -> i32 {
         cmd,
         cwd,
         env,
+        opaque_env,
         rows,
         cols,
         kind: agsh_broker::JobKind::Session,
@@ -755,7 +879,7 @@ fn intercept_mode() -> Option<(OutputMode, bool, bool)> {
 /// 2. Apply `--allow LIST`: with `--run` the payload is exempt and only its
 ///    descendants are confined (export the env); without `--run` the session
 ///    itself is confined.
-fn apply_confinement(state: &mut ShellState, options: &CliOptions) {
+fn apply_confinement(state: &mut ShellState, options: &CliOptions) -> std::io::Result<()> {
     fn parse_list(list: &str) -> Vec<String> {
         list.split([',', ' ', '\t'])
             .filter(|s| !s.is_empty())
@@ -775,20 +899,22 @@ fn apply_confinement(state: &mut ShellState, options: &CliOptions) {
     // handled separately (OS-enforced confine / agent refusal) in `main`.
     if let Some(list) = &options.allow {
         if options.run.is_some() {
-            return;
+            return Ok(());
         }
         let names = parse_list(list);
         if names.is_empty() {
-            return;
+            return Ok(());
         }
+        // Provision the generic shims before committing the narrowed policy.
+        // A failure leaves this process unmodified and the caller refuses to run.
+        agsh_exec::install_confine_shims(state)?;
         state.set_confine(&names);
         if let Some(p) = state.confine_policy() {
             let list = p.to_list();
             state.export_var("AGSH_CONFINE", list);
         }
-        // Shell shims so a child's own `bash -c '…'` is routed back through agsh.
-        let _ = agsh_exec::install_confine_shims(state);
     }
+    Ok(())
 }
 
 /// Source the interactive startup rc file into the live session, if one exists.
@@ -804,7 +930,9 @@ fn source_rc(
     let Some((path, explicit)) = resolve_rc(options) else {
         return;
     };
-    let source = match std::fs::read_to_string(&path) {
+    let source = match open_regular_config(&path)
+        .and_then(|file| read_utf8_limited(file, MAX_RC_SOURCE_BYTES, "rc file"))
+    {
         Ok(source) => source,
         Err(error) => {
             // Only complain when the user explicitly named the file.
@@ -817,6 +945,25 @@ fn source_rc(
     if let Err(error) = run_one_inner(&source, executor, state, exec_options) {
         eprintln!("agsh: {}: {error}", path.display());
     }
+}
+
+fn open_regular_config(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let file = std::fs::File::from(descriptor);
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "configuration input is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 /// Resolve the rc file to source, as `(path, explicit)` — `explicit` is true when
@@ -843,6 +990,15 @@ fn resolve_rc(options: &CliOptions) -> Option<(PathBuf, bool)> {
         return Some((dot, false));
     }
     None
+}
+
+fn report_shell_error(error: &ShellError) -> i32 {
+    eprintln!("agsh: {error}");
+    if error.kind == ShellErrorKind::Parse {
+        2
+    } else {
+        1
+    }
 }
 
 fn run_one(
@@ -909,13 +1065,6 @@ fn run_one_inner(
     }
 
     let graph = parse_line(&effective_line)?;
-    let findings = analyze_graph(&graph);
-    for finding in findings
-        .iter()
-        .filter(|finding| finding.level >= RiskLevel::High)
-    {
-        eprintln!("agsh risk: {}: {}", finding.code, finding.message);
-    }
     let outcome = executor.run_graph(&graph, state, &effective_options)?;
     print_captured_if_needed(&outcome, &effective_options)?;
     Ok(outcome.exit_code)
@@ -973,6 +1122,36 @@ fn peel_output_mode(line: &str) -> (Option<OutputMode>, &str) {
     (None, line)
 }
 
+fn run_capture_drain() -> i32 {
+    use std::io::Write;
+
+    let mut input = std::io::stdin().lock();
+    if rustix::fs::fcntl_getfl(&input).is_err() {
+        return 1;
+    }
+    let mut acknowledgement = std::io::stdout().lock();
+    if acknowledgement
+        .write_all(&[agsh_exec::CAPTURE_DRAIN_READY])
+        .and_then(|()| acknowledgement.flush())
+        .is_err()
+    {
+        return 1;
+    }
+    drop(acknowledgement);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        match input.read(&mut buffer) {
+            Ok(0) => return 0,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return 1,
+        }
+    }
+}
+
 fn parse_args(args: impl Iterator<Item = String>) -> Result<CliOptions, String> {
     let mut options = CliOptions::default();
     let mut args = args.peekable();
@@ -984,8 +1163,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CliOptions, String> 
                     return Err("missing command after -c/--command".to_string());
                 };
                 options.command = Some(command);
-                // Remaining args become positional parameters ($0, $1, …).
-                options.script_args = args.by_ref().collect();
+                // POSIX: first trailing arg is `$0`; the rest are `$1`, `$2`, ….
+                let mut trailing: Vec<String> = args.by_ref().collect();
+                if !trailing.is_empty() {
+                    options.command_name = Some(trailing.remove(0));
+                }
+                options.script_args = trailing;
             }
             "--output" => {
                 let Some(value) = args.next() else {
@@ -1004,7 +1187,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CliOptions, String> 
                     return Err("missing command after --run".to_string());
                 };
                 options.run = Some(value);
-                options.script_args = args.by_ref().collect();
+                let mut trailing: Vec<String> = args.by_ref().collect();
+                if !trailing.is_empty() {
+                    options.command_name = Some(trailing.remove(0));
+                }
+                options.script_args = trailing;
             }
             "--force" => options.force = true,
             "--best-effort" => options.best_effort = true,
@@ -1026,6 +1213,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CliOptions, String> 
             }
             "--broker-daemon" => options.broker_daemon = true,
             "--broker-launch" => options.broker_launch = true,
+            "--background-state-stdin" => options.background_state_stdin = true,
+            "--capture-drain-run" => options.capture_drain_run = true,
             "--keep" => options.keep_session = true,
             "--attach" => {
                 // Optional session id: `--attach` or `--attach s1`.
@@ -1067,13 +1256,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CliOptions, String> 
 
 fn print_help() {
     println!(
-        "agsh - Aegis Shell\n\nUSAGE:\n  agsh [--output MODE] [--allow LIST] [--run COMMAND] [--rcfile FILE] [--norc] [-c COMMAND]\n  agsh --keep | --attach [ID]     kept sessions (survive the terminal; below)\n\nKEPT SESSIONS & JOBS (the keep broker):\n  agsh --keep         run this whole session under the per-user broker: closing\n                      the terminal (or losing SSH during standby) only DETACHES it\n  agsh --attach [ID]  reattach a detached session (newest, or by id)\n  keep -- CMD…        keep a single command instead (builtin; `help keep`)\n  Ctrl-]              detach key while attached\n\nSTARTUP:\n  interactive sessions source ~/.config/agsh/agshrc (or ~/.agshrc); --norc skips,\n  --rcfile FILE / $AGSH_RC picks another, $AGSH_NORC=1 disables\n\nINTERCEPTION (route the agent's own shell through agsh; off by default):\n  AGSH_INTERCEPT=compact agsh …   shim bash/sh/… to `agsh --observe` (real shell,\n                                  captured+rendered); nested shells pass through\n    :native  agsh interprets the command    :deep  also catch absolute-path\n    (instead of running the real shell)     /bin/bash + posix_spawn (preload)\n  toggle at runtime: `mode:intercept compact:deep` / `mode:intercept off`\n\nMODES:\n  raw | clean | compact | semantic | lossless-ref | silent | rich\n\nCONFINE (kernel-enforced capability sandbox for a leaf payload):\n  confine read-only -- python x.py  read+run; no writes/network/secret-reads\n  confine workspace -- ./build.sh   writes only within $PWD (+ a scratch dir)\n  confine offline -- npm test       network off; filesystem unchanged\n  confine convert -- ./batch.sh     exec-allowlist: may only exec `convert`\n  confine ls,df                     confine the current agsh session (sticky)\n    --rw PATH  add a writable root    --net/--no-net  toggle network\n    --explain  show capabilities      --dry-run  print profile, don't run\n    --force    run a refused agent    --best-effort  shim layer if no sandbox\n  enforced via sandbox-exec (macOS); Linux Landlock planned, fails closed\n  elsewhere. Self-managing agents (claude, …) are refused — use --allowedTools.\n\nAGSH TOOLS (ag-prefixed where a common CLI shares the name; bare otherwise):\n  agview FILE…   rich render (markdown, code, images)   agz DIR    frecent jump\n  agpatch        structured patch        agtrace/agtrust/agcontext/agmath/agjump\n  confine, peek, risk, snapshot, pty     stay bare (no common CLI conflict)\n  sessions       list/resume Claude & Codex sessions for this folder (sessions N)\n  mode:output M  set the session default output mode\n\nMODE SELECTION (highest priority first):\n  per-command wrapper   semantic git diff\n  --output flag         agsh --output compact -c 'pytest -q'\n  mode builtin          mode:output compact   (session default; `mode` shows all)\n  AGSH_OUTPUT_MODE env  AGSH_OUTPUT_MODE=semantic agsh -c 'cargo test'\n  ~/.config/agsh/token.toml  [mode] default = \"compact\"  (interactive sessions)\n  default               raw\n  (the config/`mode` default makes plain `ls` render like `compact ls`; it applies\n   to interactive sessions only — piped `agsh -c`/scripts stay raw)\n\nRICH RENDERING (human display, TTY only; raw bytes still pipe/redirect):\n  agview FILE...        render by type (markdown, JSON, CSV/TSV, diff, binary)\n  agview main.py        syntax-highlight source code (py, rs, js, ts, go, c, …)\n  agview image.png      show images inline (any terminal; crisp in iTerm2/Kitty)\n  AGSH_OUTPUT_MODE=rich  auto-render recognized command output\n\nTRACE:\n  raw output is captured in capturing modes and addressable via trace://<id>/...\n  trace                 list recent captured commands\n  trace <id>            print a command's raw stdout\n\nEXAMPLES:\n  agsh -c 'echo hello'\n  agsh --output semantic -c 'git status'\n  view README.md\n  semantic git diff"
+        "agsh - Aegis Shell\n\nUSAGE:\n  agsh [--output MODE] [--allow LIST] [--run COMMAND] [--rcfile FILE] [--norc] [-c COMMAND]\n  agsh --keep | --attach [ID]     kept sessions (survive the terminal; below)\n\nKEPT SESSIONS & JOBS (the keep broker):\n  agsh --keep         run this whole session under the per-user broker: closing\n                      the terminal (or losing SSH during standby) only DETACHES it\n  agsh --attach [ID]  reattach a detached session (newest, or by id)\n  keep -- CMD…        keep a single command instead (builtin; `help keep`)\n  Ctrl-]              detach key while attached\n\nSTARTUP:\n  interactive sessions source ~/.config/agsh/agshrc (or ~/.agshrc); --norc skips,\n  --rcfile FILE / $AGSH_RC picks another, $AGSH_NORC=1 disables\n\nINTERCEPTION (route the agent's own shell through agsh; off by default):\n  AGSH_INTERCEPT=compact agsh …   shim bash/sh/… to `agsh --observe` (real shell,\n                                  captured+rendered); nested shells pass through\n    :native  agsh interprets the command    :deep  also catch absolute-path\n    (instead of running the real shell)     /bin/bash + posix_spawn (preload)\n  toggle at runtime: `mode:intercept compact:deep` / `mode:intercept off`\n\nMODES:\n  raw | clean | compact | semantic | lossless-ref | silent | rich\n\nCONFINE (macOS kernel sandbox for a leaf payload; unsupported platforms fail closed):\n  confine read-only -- python x.py  deny writes/network/common credential paths\n  confine workspace -- ./build.sh   writes only within $PWD (+ a scratch dir)\n  confine offline -- npm test       network off; filesystem unchanged\n  confine convert -- ./batch.sh     exec-allowlist: may only exec `convert`\n  confine ls,df                     sticky command-name guardrail (not a sandbox)\n    --rw PATH  add a writable root    --net/--no-net  toggle network\n    --explain  show capabilities      --dry-run  print profile, don't run\n    --force    run a refused agent    --best-effort  non-security shim layer\n  leaf presets use sandbox-exec on macOS; Linux Landlock is planned. Credential\n  filtering is finite, not complete secret isolation. Self-managing agents\n  (claude, …) are refused — use their own tool-permission systems.\n\nAGSH TOOLS (ag-prefixed where a common CLI shares the name; bare otherwise):\n  agview FILE…   rich render (markdown, code, images)   agz DIR    frecent jump\n  agpatch        structured patch        agtrace/agtrust/agcontext/agmath/agjump\n  confine, peek, risk, snapshot, pty     stay bare (no common CLI conflict)\n  sessions       list/resume Claude & Codex sessions for this folder (sessions N)\n  mode:output M  set the session default output mode\n\nMODE SELECTION (highest priority first):\n  per-command wrapper   semantic git diff\n  --output flag         agsh --output compact -c 'pytest -q'\n  mode builtin          mode:output compact   (session default; `mode` shows all)\n  AGSH_OUTPUT_MODE env  AGSH_OUTPUT_MODE=semantic agsh -c 'cargo test'\n  ~/.config/agsh/token.toml  [mode] default = \"compact\"  (interactive sessions)\n  default               raw\n  (the config/`mode` default makes plain `ls` render like `compact ls`; it applies\n   to interactive sessions only — piped `agsh -c`/scripts stay raw unless an\n   explicit --output flag or AGSH_OUTPUT_MODE selects an observation mode)\n\nRICH RENDERING (human display, TTY only; raw bytes still pipe/redirect):\n  agview FILE...        render by type (markdown, JSON, CSV/TSV, diff, binary)\n  agview main.py        syntax-highlight source code (py, rs, js, ts, go, c, …)\n  agview image.png      show images inline (any terminal; crisp in iTerm2/Kitty)\n  AGSH_OUTPUT_MODE=rich  auto-render recognized command output\n\nTRACE:\n  successful `complete` captures are addressable via trace://<id>/...\n  agtrace               list recent captured commands\n  agtrace <id>          print up to 16 MiB; incomplete/unavailable returns status 2\n\nEXAMPLES:\n  agsh -c 'echo hello'\n  agsh --output semantic -c 'git status'\n  agview README.md\n  semantic git diff"
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_terminal_control_line;
+    use super::{is_terminal_control_line, open_regular_config, read_utf8_limited};
 
     #[test]
     fn terminal_control_lines_are_recognized() {
@@ -1088,5 +1277,43 @@ mod tests {
         assert!(!is_terminal_control_line("clear && ls")); // list: leave to normal mode
         assert!(!is_terminal_control_line("clear | tee x"));
         assert!(!is_terminal_control_line("echo clear"));
+    }
+
+    #[test]
+    fn source_reader_rejects_oversized_and_invalid_utf8_input() {
+        let oversized = std::io::Cursor::new(vec![b'x'; 9]);
+        let error = read_utf8_limited(oversized, 8, "test source").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
+
+        let invalid = std::io::Cursor::new(vec![0xff]);
+        let error = read_utf8_limited(invalid, 8, "test source").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("UTF-8"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rc_reader_rejects_symlinks_and_special_files_without_blocking() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!(
+            "agsh-rc-input-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let regular = dir.join("regular");
+        std::fs::write(&regular, b"echo safe\n").unwrap();
+        let symlink = dir.join("symlink");
+        std::os::unix::fs::symlink(&regular, &symlink).unwrap();
+        assert!(open_regular_config(&symlink).is_err());
+
+        let socket = dir.join("socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        assert!(open_regular_config(&socket).is_err());
+        drop(listener);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

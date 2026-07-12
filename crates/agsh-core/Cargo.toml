@@ -3,6 +3,12 @@ name = "agsh-core"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+authors.workspace = true
+description = "Lexer, parser, command IR, values, and errors for agsh."
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish.workspace = true
 
 [dependencies]
 

@@ -64,7 +64,12 @@ pub fn lex(input: &str) -> Result<Vec<Token>, ShellError> {
 
         // Process substitution `<( ... )` / `>( ... )`: one token (before the
         // `<`/`>` redirection operators are recognized).
-        if let Some((text, next_i, end)) = lex_process_substitution(&chars, i) {
+        if matches!(ch, '<' | '>') && chars.get(i + 1).is_some_and(|(_, c)| *c == '(') {
+            let Some((text, next_i, end)) = lex_process_substitution(&chars, i) else {
+                return Err(ShellError::parse("unterminated process substitution")
+                    .with_span(SourceSpan::new(start, input.len()))
+                    .with_code("agsh::parse::unterminated_substitution"));
+            };
             tokens.push(Token {
                 text: text.clone(),
                 quote: QuoteKind::None,
@@ -213,34 +218,43 @@ pub fn lex(input: &str) -> Result<Vec<Token>, ShellError> {
                     // A command substitution inside double quotes is consumed
                     // whole so its own quotes/parens do not close the string.
                     if quoted_char == '$' && chars.get(i + 1).is_some_and(|(_, c)| *c == '(') {
-                        if let Some((substitution, next_i, substitution_end)) =
+                        let Some((substitution, next_i, substitution_end)) =
                             read_dollar_paren(&chars, i)
-                        {
-                            segment.push_str(&substitution);
-                            end = substitution_end;
-                            i = next_i;
-                            continue;
-                        }
+                        else {
+                            return Err(ShellError::parse("unterminated command substitution")
+                                .with_span(SourceSpan::new(quoted_idx, input.len()))
+                                .with_code("agsh::parse::unterminated_substitution"));
+                        };
+                        segment.push_str(&substitution);
+                        end = substitution_end;
+                        i = next_i;
+                        continue;
                     }
                     if quoted_char == '$' && chars.get(i + 1).is_some_and(|(_, c)| *c == '{') {
-                        if let Some((substitution, next_i, substitution_end)) =
+                        let Some((substitution, next_i, substitution_end)) =
                             read_dollar_brace(&chars, i)
-                        {
-                            segment.push_str(&substitution);
-                            end = substitution_end;
-                            i = next_i;
-                            continue;
-                        }
+                        else {
+                            return Err(ShellError::parse("unterminated parameter substitution")
+                                .with_span(SourceSpan::new(quoted_idx, input.len()))
+                                .with_code("agsh::parse::unterminated_substitution"));
+                        };
+                        segment.push_str(&substitution);
+                        end = substitution_end;
+                        i = next_i;
+                        continue;
                     }
                     if quoted_char == '`' {
-                        if let Some((substitution, next_i, substitution_end)) =
+                        let Some((substitution, next_i, substitution_end)) =
                             read_backtick_substitution(&chars, i)
-                        {
-                            segment.push_str(&substitution);
-                            end = substitution_end;
-                            i = next_i;
-                            continue;
-                        }
+                        else {
+                            return Err(ShellError::parse("unterminated backtick substitution")
+                                .with_span(SourceSpan::new(quoted_idx, input.len()))
+                                .with_code("agsh::parse::unterminated_substitution"));
+                        };
+                        segment.push_str(&substitution);
+                        end = substitution_end;
+                        i = next_i;
+                        continue;
                     }
                     segment.push(quoted_char);
                     i += 1;
@@ -270,26 +284,32 @@ pub fn lex(input: &str) -> Result<Vec<Token>, ShellError> {
                     break;
                 }
                 if plain_char == '$' && chars.get(i + 1).is_some_and(|(_, c)| *c == '(') {
-                    if let Some((substitution, next_i, substitution_end)) =
+                    let Some((substitution, next_i, substitution_end)) =
                         read_dollar_paren(&chars, i)
-                    {
-                        segment.push_str(&substitution);
-                        end = substitution_end;
-                        i = next_i;
-                        continue;
-                    }
+                    else {
+                        return Err(ShellError::parse("unterminated command substitution")
+                            .with_span(SourceSpan::new(plain_idx, input.len()))
+                            .with_code("agsh::parse::unterminated_substitution"));
+                    };
+                    segment.push_str(&substitution);
+                    end = substitution_end;
+                    i = next_i;
+                    continue;
                 }
                 // Keep `${...}` (with internal spaces and nested braces) as one
                 // segment so `${VAR:-a b}` is not split on the space.
                 if plain_char == '$' && chars.get(i + 1).is_some_and(|(_, c)| *c == '{') {
-                    if let Some((substitution, next_i, substitution_end)) =
+                    let Some((substitution, next_i, substitution_end)) =
                         read_dollar_brace(&chars, i)
-                    {
-                        segment.push_str(&substitution);
-                        end = substitution_end;
-                        i = next_i;
-                        continue;
-                    }
+                    else {
+                        return Err(ShellError::parse("unterminated parameter substitution")
+                            .with_span(SourceSpan::new(plain_idx, input.len()))
+                            .with_code("agsh::parse::unterminated_substitution"));
+                    };
+                    segment.push_str(&substitution);
+                    end = substitution_end;
+                    i = next_i;
+                    continue;
                 }
                 if plain_char == '`' {
                     let Some((substitution, next_i, substitution_end)) =
@@ -379,32 +399,9 @@ pub fn lex(input: &str) -> Result<Vec<Token>, ShellError> {
 /// balancing nested parens and honoring quotes. Returns `(text, next_index,
 /// end_offset)`.
 fn read_extglob_group(chars: &[(usize, char)], start: usize) -> Option<(String, usize, usize)> {
-    let mut depth = 0usize;
-    let mut quote: Option<char> = None;
-    let mut i = start + 1; // skip the operator char; next is '('
-    while i < chars.len() {
-        let (idx, c) = chars[i];
-        i += 1;
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            continue;
-        }
-        match c {
-            '\'' | '"' => quote = Some(c),
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    let text: String = chars[start..i].iter().map(|(_, c)| *c).collect();
-                    return Some((text, i, idx + c.len_utf8()));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    let (next_i, end) = scan_balanced_parentheses(chars, start + 1)?;
+    let text = chars[start..next_i].iter().map(|(_, c)| *c).collect();
+    Some((text, next_i, end))
 }
 
 /// Read a process substitution `<( ... )` or `>( ... )` as one token (balanced
@@ -417,32 +414,9 @@ fn lex_process_substitution(
     if (c0 != '<' && c0 != '>') || chars.get(start + 1).map(|(_, c)| *c) != Some('(') {
         return None;
     }
-    let mut depth = 0usize;
-    let mut quote: Option<char> = None;
-    let mut i = start + 1;
-    while i < chars.len() {
-        let (idx, c) = chars[i];
-        i += 1;
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            continue;
-        }
-        match c {
-            '\'' | '"' => quote = Some(c),
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    let text: String = chars[start..i].iter().map(|(_, c)| *c).collect();
-                    return Some((text, i, idx + c.len_utf8()));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    let (next_i, end) = scan_balanced_parentheses(chars, start + 1)?;
+    let text = chars[start..next_i].iter().map(|(_, c)| *c).collect();
+    Some((text, next_i, end))
 }
 
 /// Read a `name=( ... )` (or `name[i]=(…)`, `name+=(…)`) array assignment as a
@@ -489,31 +463,9 @@ fn lex_array_assignment(chars: &[(usize, char)], start: usize) -> Option<(String
     if chars.get(i).map(|(_, c)| *c) != Some('(') {
         return None;
     }
-    let mut depth = 0usize;
-    let mut quote: Option<char> = None;
-    while i < chars.len() {
-        let (idx, c) = chars[i];
-        i += 1;
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            continue;
-        }
-        match c {
-            '\'' | '"' => quote = Some(c),
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    let text: String = chars[start..i].iter().map(|(_, c)| *c).collect();
-                    return Some((text, i, idx + c.len_utf8()));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    let (next_i, end) = scan_balanced_parentheses(chars, i)?;
+    let text = chars[start..next_i].iter().map(|(_, c)| *c).collect();
+    Some((text, next_i, end))
 }
 
 /// Read a `(( ... ))` arithmetic group as one token if `start` is at `((`.
@@ -524,30 +476,60 @@ fn lex_double_paren(chars: &[(usize, char)], start: usize) -> Option<(String, us
     {
         return None;
     }
+    let (next_i, end) = scan_balanced_parentheses(chars, start)?;
+    let text = chars[start..next_i].iter().map(|(_, c)| *c).collect();
+    Some((text, next_i, end))
+}
+
+/// Find the matching close for a parenthesized shell construct. Single quotes
+/// are literal; inside double quotes a backslash only quotes shell-special
+/// characters. Outside quotes a backslash protects the following character from
+/// affecting parenthesis balance.
+fn scan_balanced_parentheses(chars: &[(usize, char)], open_index: usize) -> Option<(usize, usize)> {
+    if chars.get(open_index).map(|(_, c)| *c) != Some('(') {
+        return None;
+    }
+
     let mut depth = 0usize;
     let mut quote: Option<char> = None;
-    let mut i = start;
+    let mut i = open_index;
     while i < chars.len() {
         let (idx, c) = chars[i];
-        i += 1;
-        if let Some(q) = quote {
-            if c == q {
+        if let Some(active_quote) = quote {
+            if active_quote == '"'
+                && c == '\\'
+                && chars
+                    .get(i + 1)
+                    .is_some_and(|(_, next)| matches!(next, '$' | '`' | '"' | '\\' | '\n'))
+            {
+                i += 2;
+                continue;
+            }
+            if c == active_quote {
                 quote = None;
             }
+            i += 1;
             continue;
         }
+
         match c {
             '\'' | '"' => quote = Some(c),
+            '\\' => {
+                i += 2;
+                continue;
+            }
             '(' => depth += 1,
             ')' => {
-                depth -= 1;
+                depth = depth.checked_sub(1)?;
+                i += 1;
                 if depth == 0 {
-                    let text: String = chars[start..i].iter().map(|(_, c)| *c).collect();
-                    return Some((text, i, idx + c.len_utf8()));
+                    return Some((i, idx + c.len_utf8()));
                 }
+                continue;
             }
             _ => {}
         }
+        i += 1;
     }
     None
 }
@@ -694,6 +676,15 @@ fn read_dollar_paren(chars: &[(usize, char)], start_i: usize) -> Option<(String,
     while i < chars.len() {
         let (_, ch) = chars[i];
         if let Some(q) = quote {
+            if q == '"'
+                && ch == '\\'
+                && chars
+                    .get(i + 1)
+                    .is_some_and(|(_, next)| matches!(next, '$' | '`' | '"' | '\\'))
+            {
+                i += 2;
+                continue;
+            }
             if ch == q {
                 quote = None;
             }
@@ -702,6 +693,10 @@ fn read_dollar_paren(chars: &[(usize, char)], start_i: usize) -> Option<(String,
         }
         match ch {
             '\'' | '"' => quote = Some(ch),
+            '\\' => {
+                i += 2;
+                continue;
+            }
             '(' => depth += 1,
             ')' => {
                 depth = depth.checked_sub(1)?;
@@ -729,6 +724,15 @@ fn read_dollar_brace(chars: &[(usize, char)], start_i: usize) -> Option<(String,
     while i < chars.len() {
         let (_, ch) = chars[i];
         if let Some(q) = quote {
+            if q == '"'
+                && ch == '\\'
+                && chars
+                    .get(i + 1)
+                    .is_some_and(|(_, next)| matches!(next, '$' | '`' | '"' | '\\'))
+            {
+                i += 2;
+                continue;
+            }
             if ch == q {
                 quote = None;
             }
@@ -737,6 +741,10 @@ fn read_dollar_brace(chars: &[(usize, char)], start_i: usize) -> Option<(String,
         }
         match ch {
             '\'' | '"' => quote = Some(ch),
+            '\\' => {
+                i += 2;
+                continue;
+            }
             '{' => depth += 1,
             '}' => {
                 depth = depth.checked_sub(1)?;
@@ -803,7 +811,12 @@ mod tests {
 
     #[test]
     fn lex_dollar_brace_honors_quotes() {
-        for src in ["echo ${x:-'a}b'}", "echo ${x:-\"a}b\"}"] {
+        for src in [
+            "echo ${x:-'a}b'}",
+            "echo ${x:-\"a}b\"}",
+            r#"echo ${x:-"a\"}b"}"#,
+            r#"echo ${x:-a\}b}"#,
+        ] {
             let tokens = lex(src).unwrap();
             assert_eq!(tokens.len(), 2, "{src}: {tokens:?}");
             assert_eq!(tokens[1].text, &src["echo ".len()..]);
@@ -914,6 +927,61 @@ mod tests {
     #[test]
     fn rejects_unterminated_backtick_substitution() {
         assert!(lex("echo `printf %s hi").is_err());
+    }
+
+    #[test]
+    fn rejects_unterminated_dollar_substitutions_in_all_quote_contexts() {
+        for source in [
+            "echo $(printf hi",
+            "echo ${value",
+            r#"echo "$(printf hi""#,
+            r#"echo "${value""#,
+        ] {
+            let error = lex(source).expect_err(source);
+            assert!(
+                error.message.contains("unterminated"),
+                "{source}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unterminated_backticks_inside_double_quotes() {
+        let error = lex(r#"echo "`printf hi""#).unwrap_err();
+        assert!(error.message.contains("unterminated"));
+    }
+
+    #[test]
+    fn rejects_unterminated_process_substitution() {
+        for source in ["cat <(printf hi", "cat >(printf hi"] {
+            let error = lex(source).expect_err(source);
+            assert!(error.message.contains("unterminated"));
+        }
+    }
+
+    #[test]
+    fn balanced_parenthesis_scanners_honor_escaped_double_quotes() {
+        for (source, expected) in [
+            (
+                r#"cat <(printf '%s\n' "a\")b")"#,
+                vec!["cat", r#"<(printf '%s\n' "a\")b")"#],
+            ),
+            (r#"arr=("a\")b" c)"#, vec![r#"arr=("a\")b" c)"#]),
+            (
+                r#"printf '%s\n' !("a\")b")"#,
+                vec!["printf", "%s\\n", r#"!("a\")b")"#],
+            ),
+        ] {
+            let tokens = lex(source).unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            assert_eq!(
+                tokens
+                    .iter()
+                    .map(|token| token.text.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{source}: {tokens:?}"
+            );
+        }
     }
 
     #[test]

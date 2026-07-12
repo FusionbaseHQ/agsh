@@ -1,9 +1,12 @@
+use std::collections::VecDeque;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use agsh_compat::{CommandResolution, Resolver};
 use agsh_core::{CommandInvocation, ShellError};
 use agsh_store::history::{HistoryEntry, HistoryQuery, HistoryScope, SearchMode};
+use agsh_store::{parse_trace_ref, TraceStream};
 use agsh_style::{highlight_shell_without_resolution, Theme};
 use rustix::process::Signal;
 
@@ -12,6 +15,11 @@ use crate::{history_index_allows_syntax_highlight, CommandOutcome, ShellState};
 
 const DEFAULT_COMMAND_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const SECS_PER_DAY: u64 = 86_400;
+const MAX_PRINTF_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TRACE_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TRACE_OUTPUT_LINES: usize = 5000;
+const MAX_TRACE_LINE_BYTES: usize = 1024 * 1024;
+const MAX_TRACE_SCAN_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Names of all shell builtins, for command suggestions and completion.
 pub fn builtin_names() -> &'static [&'static str] {
@@ -175,7 +183,13 @@ fn mode_intercept(value: Option<&str>, state: &mut ShellState) -> CommandOutcome
             Some((mode, native, deep)) => {
                 // Re-install from a clean slate so a re-toggle can't stack shim dirs.
                 crate::executor::uninstall_intercept(state);
-                let _ = crate::executor::install_intercept_shims(state, mode, native);
+                if let Err(error) = crate::executor::install_intercept_shims(state, mode, native) {
+                    return CommandOutcome::captured(
+                        1,
+                        Vec::new(),
+                        format!("mode: cannot install shell interception: {error}\n").into_bytes(),
+                    );
+                }
                 let mut msg = format!("shell interception on: {}", mode.as_str());
                 if native {
                     msg.push_str(":native");
@@ -290,6 +304,7 @@ fn builtin_getopts(args: &[String], state: &mut ShellState) -> CommandOutcome {
         .filter(|&n| n >= 1)
         .unwrap_or(1);
     let mut charpos = state.getopts_char();
+    let mut stderr = Vec::new();
 
     let result = loop {
         let Some(arg) = operands.get(optind - 1) else {
@@ -324,7 +339,7 @@ fn builtin_getopts(args: &[String], state: &mut ShellState) -> CommandOutcome {
                 set(state, "OPTARG", &opt.to_string());
             } else {
                 state.unset("OPTARG");
-                eprintln!("getopts: illegal option -- {opt}");
+                stderr.extend_from_slice(format!("getopts: illegal option -- {opt}\n").as_bytes());
             }
             if advance_arg {
                 optind += 1;
@@ -356,7 +371,9 @@ fn builtin_getopts(args: &[String], state: &mut ShellState) -> CommandOutcome {
                 } else {
                     set(state, &name, "?");
                     state.unset("OPTARG");
-                    eprintln!("getopts: option requires an argument -- {opt}");
+                    stderr.extend_from_slice(
+                        format!("getopts: option requires an argument -- {opt}\n").as_bytes(),
+                    );
                 }
                 break 0;
             }
@@ -374,7 +391,7 @@ fn builtin_getopts(args: &[String], state: &mut ShellState) -> CommandOutcome {
 
     state.set_var("OPTIND", optind.to_string());
     state.set_getopts_char(charpos);
-    CommandOutcome::captured(result, Vec::new(), Vec::new())
+    CommandOutcome::captured(result, Vec::new(), stderr)
 }
 
 /// `trap [action] sig...` / `trap -p` / `trap - sig...`: install, list, or reset
@@ -422,7 +439,7 @@ fn builtin_trap(args: &[String], state: &mut ShellState) -> CommandOutcome {
 
 fn builtin_trust(_args: &[String], state: &mut ShellState) -> CommandOutcome {
     match state.trust_current_env() {
-        Some(count) => CommandOutcome::captured(
+        Ok(Some(count)) => CommandOutcome::captured(
             0,
             format!(
                 "trust: activated .env ({count} variables) for {}\n",
@@ -431,11 +448,14 @@ fn builtin_trust(_args: &[String], state: &mut ShellState) -> CommandOutcome {
             .into_bytes(),
             Vec::new(),
         ),
-        None => CommandOutcome::captured(
+        Ok(None) => CommandOutcome::captured(
             1,
             Vec::new(),
             b"trust: no .env file in the current directory\n".to_vec(),
         ),
+        Err(error) => {
+            CommandOutcome::captured(1, Vec::new(), format!("trust: {error}\n").into_bytes())
+        }
     }
 }
 
@@ -538,7 +558,7 @@ Rich rendering — human display, TTY only (pipes & redirects still get exact by
   agview FILE...          render markdown, source code, JSON, CSV/TSV, diffs, and images
 
 Sandbox
-  confine PRESET -- CMD   kernel-enforced sandbox: read-only | workspace | offline | <exec-allowlist>
+  confine PRESET -- CMD   macOS leaf sandbox; unsupported platforms fail closed
   pty CMD                 run CMD under a pseudo-terminal
 
 Agent & workflow tools
@@ -553,13 +573,14 @@ Agent & workflow tools
   peek FILE               print a line-numbered slice of a file
   agpatch FILE            apply a unified diff (read from stdin / a heredoc)
   risk 'CMD'              rate how dangerous a command is before you run it
-  snapshot                take a git snapshot as a rollback point
+  snapshot                checkpoint tracked Git working-tree files
   agmath EXPR             evaluate integer or floating-point math
   agjob CMD               run CMD in the background with its output captured
 
 Standard POSIX builtins (use `type NAME` for one)
   cd pwd export unset set alias jobs fg bg wait kill trap read test [ [[ source . eval
   exec local return shift readonly getopts declare printf echo history ulimit umask …
+  (`fg`/`bg` lack complete terminal handoff/stopped-process tracking)
 
 Naming: agsh's own tools are ag-prefixed only where a bare name would shadow a real
 CLI (agview, agpatch, agmath, agz); conflict-free ones keep the bare name
@@ -585,8 +606,8 @@ Output MODEs:
   clean         raw with ANSI / control noise removed
   compact       trimmed + de-duplicated
   semantic      a structured observation of recognized commands
-  lossless-ref  compact view + a trace:// pointer to the full raw output
-  silent        suppress display, keep exit status + trace
+  lossless-ref  compact view + status-aware refs (exact only when persistence is complete)
+  silent        suppress display; keep status and a trace when persistence succeeds
   rich          human rich rendering (see `help agview`)
 
 The default applies to interactive sessions only; piped `agsh -c` and scripts stay
@@ -606,19 +627,20 @@ rendering is TTY-only: piped or redirected output is always the exact bytes.
         }
         "confine" => {
             "\
-confine — run a payload under a kernel-enforced capability sandbox (macOS Seatbelt;
-Linux Landlock is planned and fails closed until then).
+confine — run a leaf payload under a macOS Seatbelt capability sandbox. Linux
+Landlock is planned; unsupported platforms fail closed unless --best-effort is explicit.
 
-  confine read-only -- python x.py   read + run; no writes, network, or secret reads
+  confine read-only -- python x.py   deny writes, network, and common credential paths
   confine workspace -- ./build.sh     writes only within $PWD (+ a private scratch dir)
   confine offline -- npm test         network off; filesystem unchanged
   confine convert -- ./thumb.sh       exec-allowlist: the payload may only run `convert`
-  confine ls,df                       confine the CURRENT session (sticky) to an allowlist
+  confine ls,df                       sticky command-name guardrail (not a sandbox)
 
   --rw PATH   add a writable root     --net / --no-net   toggle network
   --explain   show the capabilities   --dry-run          print the profile, don't run
-  --force     run a refused agent     --best-effort      shim layer if no kernel backend
+  --force     run a refused agent     --best-effort      non-security shim layer
 
+Credential filtering is finite defense in depth, not complete secret isolation.
 Self-managing agents (claude, …) are refused — use their own tool-permission systems.
 See docs/CONFINE.md for the guarantees and non-guarantees.
 "
@@ -655,8 +677,9 @@ and your cwd. Detaching never kills it; exiting your shell never kills it.
             "\
 resume — restore the shell state of a session that died without a clean exit
 (crash, closed terminal / SIGHUP, reboot). Interactive sessions journal their
-state deltas as they happen, so nothing is saved at exit — and nothing is lost
-without one.
+state deltas at command boundaries, so recovery does not depend on a save-at-exit
+step. Journaling is best effort and not synchronously flushed; recent or failed
+writes and changes made by an in-flight command may be absent.
 
   resume          restore the most recent dead session
   resume list     show restorable sessions (age, cwd, changes, what was running)
@@ -671,7 +694,8 @@ closed at an idle prompt.
 Restores cwd, exported vars, shell vars, aliases, abbreviations, functions, and
 set/shopt options by replaying journaled deltas — commands are never re-run. If
 an agent (claude/codex) was running when the session died, `sessions` can resume
-its conversation too. A restored journal is consumed (never offered twice).
+its conversation too. A successfully persisted restored marker prevents the same
+journal from being offered twice; resume is not transactional.
 "
         }
         "agtrace" | "trace" => {
@@ -679,9 +703,15 @@ its conversation too. A restored journal is consumed (never offered twice).
 agtrace — inspect the raw output captured in capturing modes (addressable as trace://).
 
   agtrace                       list recent captured commands
-  agtrace <id>                  print a command's full raw stdout
+  agtrace <id>                  print up to 16 MiB of retained raw stdout
+  agtrace <id> --head N         print the first N lines
+  agtrace <id> --tail N         print the last N lines
+  agtrace <id> --range A:B      print an inclusive line range
   agtrace <id> --grep PATTERN   filter that output
-  agtrace <id> START:END        print a line range
+
+Reads are streamed and output is bounded. Truncated or disabled raw storage is
+reported explicitly with status 2; it is never described as not found. Grep scans
+at most 1 GiB. Unnumbered line selections preserve the selected raw line bytes.
 "
         }
         "agz" | "agjump" => {
@@ -761,8 +791,10 @@ flagging things like recursive deletes. Advisory only — it does not block.
         }
         "snapshot" | "agsnapshot" => {
             "\
-snapshot  (alias: agsnapshot) — take a git snapshot of the working tree as a
-rollback point, without disturbing your index or current branch.
+snapshot  (alias: agsnapshot) — checkpoint tracked working-tree files without
+changing the index or current branch. Untracked and ignored files are not saved;
+restore overwrites tracked files below the current directory. Git subprocesses
+are limited to 4 MiB per stream and 30 seconds.
 "
         }
         "pty" => {
@@ -856,7 +888,7 @@ pub fn run_builtin(
         "fg" => Ok(builtin_fg(args, state)),
         "bg" => Ok(builtin_bg(args, state)),
         "wait" => Ok(builtin_wait(args, state)),
-        "agjob" => Ok(builtin_agjob(args, state)),
+        "agjob" => Ok(crate::keep::builtin_agjob(args, state)),
         "kill" => builtin_kill(args, state),
         "exec" => Err(ShellError::execution(
             "exec: process replacement is handled by executor",
@@ -981,19 +1013,95 @@ fn builtin_local(args: &[String], state: &mut ShellState) -> CommandOutcome {
         );
     }
 
+    let mut indexed = false;
+    let mut assoc = false;
+    let mut export = false;
+    let mut integer = false;
+    let mut readonly = false;
+    let mut operand_start = 0;
+    while let Some(arg) = args.get(operand_start) {
+        if arg == "--" {
+            operand_start += 1;
+            break;
+        }
+        if arg.len() <= 1 || !arg.starts_with('-') {
+            break;
+        }
+        for option in arg[1..].chars() {
+            match option {
+                'a' => indexed = true,
+                'A' => assoc = true,
+                'x' => export = true,
+                'i' => integer = true,
+                'r' => readonly = true,
+                _ => {
+                    return CommandOutcome::captured(
+                        2,
+                        Vec::new(),
+                        format!("local: -{option}: invalid option\n").into_bytes(),
+                    );
+                }
+            }
+        }
+        operand_start += 1;
+    }
+    if indexed && assoc {
+        return CommandOutcome::captured(
+            2,
+            Vec::new(),
+            b"local: cannot use -a and -A together\n".to_vec(),
+        );
+    }
+
     let mut err = String::new();
     let mut exit_code = 0;
-    for arg in args {
+    for arg in &args[operand_start..] {
         if let Some((name, value)) = arg.split_once('=') {
             if !is_identifier(name) {
                 err.push_str(&format!("local: {name}: not a valid identifier\n"));
                 exit_code = 1;
                 continue;
             }
-            state.declare_local(name);
-            state.set_var(name, value);
+            if !state.declare_local(name) {
+                err.push_str(&format!("local: {name}: readonly variable\n"));
+                exit_code = 1;
+                continue;
+            }
+            if integer {
+                state.mark_integer(name);
+            }
+            if let Err(message) = assign_declared_value(name, value, indexed, assoc, integer, state)
+            {
+                err.push_str(&format!("local: {name}: {message}\n"));
+                exit_code = 1;
+                continue;
+            }
+            if export {
+                state.mark_exported(name);
+            }
+            if readonly {
+                state.mark_readonly(name);
+            }
         } else if is_identifier(arg) {
-            state.declare_local(arg);
+            if !state.declare_local(arg) {
+                err.push_str(&format!("local: {arg}: readonly variable\n"));
+                exit_code = 1;
+                continue;
+            }
+            if indexed {
+                state.declare_array(arg);
+            } else if assoc {
+                state.declare_assoc(arg);
+            }
+            if integer {
+                state.mark_integer(arg);
+            }
+            if export {
+                state.mark_exported(arg);
+            }
+            if readonly {
+                state.mark_readonly(arg);
+            }
         } else {
             err.push_str(&format!("local: {arg}: not a valid identifier\n"));
             exit_code = 1;
@@ -1126,24 +1234,260 @@ fn builtin_trace(args: &[String], state: &ShellState) -> CommandOutcome {
     };
 
     // Stream: --stderr flag, or a trailing stdout/stderr positional.
-    let stderr = flags.iter().any(|f| f == "--stderr")
-        || positional.get(1).map(String::as_str) == Some("stderr");
-    let base = reference
-        .trim_end_matches("/stdout")
-        .trim_end_matches("/stderr");
+    let (base, reference_stream) = parse_trace_ref(reference);
+    let positional_stream = positional.get(1).map(String::as_str);
+    let stderr = if flags.iter().any(|flag| flag == "--stderr") {
+        true
+    } else {
+        match positional_stream {
+            Some("stderr") => true,
+            Some("stdout") => false,
+            _ => reference_stream == TraceStream::Stderr,
+        }
+    };
     let resolved = format!("{base}/{}", if stderr { "stderr" } else { "stdout" });
 
-    match state.resolve_trace(&resolved) {
-        Some(bytes) => {
-            let text = String::from_utf8_lossy(&bytes);
-            let sliced = crate::agent::apply_slice(&text, &opts);
-            CommandOutcome::captured(0, sliced.into_bytes(), Vec::new())
-        }
-        None => CommandOutcome::captured(
+    let Some(reader) = state.open_trace_reader(&resolved) else {
+        return CommandOutcome::captured(
             1,
             Vec::new(),
             format!("trace: {reference}: not found\n").into_bytes(),
+        );
+    };
+    let status = reader.status;
+    if opts.head.is_none()
+        && opts.tail.is_none()
+        && opts.range.is_none()
+        && opts.grep.is_none()
+        && !opts.number
+    {
+        trace_full(reader, status, reference)
+    } else {
+        trace_slice(reader, status, reference, &opts)
+    }
+}
+
+fn trace_full(
+    reader: crate::TraceReader,
+    status: agsh_output::RawTraceStatus,
+    reference: &str,
+) -> CommandOutcome {
+    if matches!(
+        status,
+        agsh_output::RawTraceStatus::Disabled | agsh_output::RawTraceStatus::Unavailable
+    ) {
+        return CommandOutcome::captured(
+            2,
+            Vec::new(),
+            trace_status_diagnostic(reference, status).into_bytes(),
+        );
+    }
+
+    let mut output = Vec::with_capacity(64 * 1024);
+    let mut limited = reader.take((MAX_TRACE_OUTPUT_BYTES + 1) as u64);
+    if let Err(error) = limited.read_to_end(&mut output) {
+        return CommandOutcome::captured(
+            2,
+            Vec::new(),
+            format!("trace: {reference}: {error}\n").into_bytes(),
+        );
+    }
+    let output_limited = output.len() > MAX_TRACE_OUTPUT_BYTES;
+    output.truncate(MAX_TRACE_OUTPUT_BYTES);
+
+    let mut diagnostic = trace_status_diagnostic(reference, status);
+    if output_limited {
+        diagnostic.push_str(&format!(
+            "trace: {reference}: output limit is {MAX_TRACE_OUTPUT_BYTES} bytes; use --head, --tail, --range, or --grep\n"
+        ));
+    }
+    let exit = i32::from(!diagnostic.is_empty()) * 2;
+    CommandOutcome::captured(exit, output, diagnostic.into_bytes())
+}
+
+#[derive(Clone, Copy)]
+enum TraceSelection {
+    Range(usize, usize),
+    Head(usize),
+    Tail(usize),
+    All,
+}
+
+fn trace_slice(
+    reader: crate::TraceReader,
+    status: agsh_output::RawTraceStatus,
+    reference: &str,
+    opts: &crate::agent::SliceOpts,
+) -> CommandOutcome {
+    let selection = if let Some((start, end)) = opts.range {
+        TraceSelection::Range(start, end)
+    } else if let Some(count) = opts.head {
+        TraceSelection::Head(count)
+    } else if let Some(count) = opts.tail {
+        TraceSelection::Tail(count)
+    } else {
+        TraceSelection::All
+    };
+    if matches!(
+        status,
+        agsh_output::RawTraceStatus::Disabled | agsh_output::RawTraceStatus::Unavailable
+    ) {
+        return CommandOutcome::captured(
+            2,
+            Vec::new(),
+            trace_status_diagnostic(reference, status).into_bytes(),
+        );
+    }
+    if matches!(selection, TraceSelection::Head(0) | TraceSelection::Tail(0)) {
+        let diagnostic = trace_status_diagnostic(reference, status);
+        let exit = i32::from(!diagnostic.is_empty()) * 2;
+        return CommandOutcome::captured(exit, Vec::new(), diagnostic.into_bytes());
+    }
+
+    let mut reader = BufReader::with_capacity(64 * 1024, reader);
+    let mut line = Vec::new();
+    let mut selected = VecDeque::<Vec<u8>>::new();
+    let mut selected_bytes = 0usize;
+    let mut selected_count = 0usize;
+    let mut line_number = 0usize;
+    let mut oversized_lines = 0usize;
+    let mut output_limited = false;
+
+    loop {
+        match read_bounded_trace_line(&mut reader, &mut line, MAX_TRACE_LINE_BYTES) {
+            Ok(TraceLine::Eof) => break,
+            Ok(TraceLine::Oversized) => {
+                line_number = line_number.saturating_add(1);
+                oversized_lines = oversized_lines.saturating_add(1);
+                if matches!(selection, TraceSelection::Range(_, end) if line_number >= end) {
+                    break;
+                }
+                continue;
+            }
+            Ok(TraceLine::Line) => line_number = line_number.saturating_add(1),
+            Err(error) => {
+                return CommandOutcome::captured(
+                    2,
+                    Vec::new(),
+                    format!("trace: {reference}: {error}\n").into_bytes(),
+                );
+            }
+        }
+
+        let content_end = line
+            .iter()
+            .rposition(|byte| !matches!(*byte, b'\n' | b'\r'))
+            .map_or(0, |index| index + 1);
+        let text = String::from_utf8_lossy(&line[..content_end]);
+        if opts
+            .grep
+            .as_ref()
+            .is_some_and(|pattern| !text.contains(pattern.as_str()))
+        {
+            if matches!(selection, TraceSelection::Range(_, end) if line_number >= end) {
+                break;
+            }
+            continue;
+        }
+
+        let selected_by_range = match selection {
+            TraceSelection::Range(start, end) => line_number >= start && line_number <= end,
+            _ => true,
+        };
+        if !selected_by_range {
+            if matches!(selection, TraceSelection::Range(_, end) if line_number >= end) {
+                break;
+            }
+            continue;
+        }
+
+        selected_count = selected_count.saturating_add(1);
+        let mut rendered = Vec::with_capacity(line.len().saturating_add(16));
+        if opts.number {
+            rendered.extend_from_slice(format!("{line_number:>6}  ").as_bytes());
+            rendered.extend_from_slice(text.as_bytes());
+            rendered.push(b'\n');
+        } else {
+            // Selection and grep decide *which* lines to emit, but do not alter
+            // their bytes. Preserve CRLF, non-UTF-8, and an unterminated final
+            // line exactly unless numbering was explicitly requested.
+            rendered.extend_from_slice(&line);
+        }
+
+        match selection {
+            TraceSelection::Tail(requested) => {
+                let retained_lines = requested.min(MAX_TRACE_OUTPUT_LINES);
+                if retained_lines == 0 || rendered.len() > MAX_TRACE_OUTPUT_BYTES {
+                    output_limited = true;
+                } else {
+                    selected_bytes = selected_bytes.saturating_add(rendered.len());
+                    selected.push_back(rendered);
+                    while selected.len() > retained_lines {
+                        if let Some(removed) = selected.pop_front() {
+                            selected_bytes = selected_bytes.saturating_sub(removed.len());
+                            if requested > MAX_TRACE_OUTPUT_LINES {
+                                output_limited = true;
+                            }
+                        }
+                    }
+                    while selected_bytes > MAX_TRACE_OUTPUT_BYTES {
+                        if let Some(removed) = selected.pop_front() {
+                            selected_bytes = selected_bytes.saturating_sub(removed.len());
+                            output_limited = true;
+                        }
+                    }
+                }
+            }
+            TraceSelection::Range(_, _) | TraceSelection::Head(_) | TraceSelection::All => {
+                if selected.len() == MAX_TRACE_OUTPUT_LINES
+                    || rendered.len() > MAX_TRACE_OUTPUT_BYTES.saturating_sub(selected_bytes)
+                {
+                    output_limited = true;
+                    break;
+                }
+                selected_bytes = selected_bytes.saturating_add(rendered.len());
+                selected.push_back(rendered);
+            }
+        }
+
+        if matches!(selection, TraceSelection::Head(requested) if selected_count >= requested)
+            || matches!(selection, TraceSelection::Range(_, end) if line_number >= end)
+        {
+            break;
+        }
+    }
+
+    let mut output = Vec::with_capacity(selected_bytes);
+    for rendered in selected {
+        output.extend_from_slice(&rendered);
+    }
+    let mut diagnostic = trace_status_diagnostic(reference, status);
+    if oversized_lines > 0 {
+        diagnostic.push_str(&format!(
+            "trace: {reference}: incomplete slice: {oversized_lines} line(s) exceeded {MAX_TRACE_LINE_BYTES} bytes\n"
+        ));
+    }
+    if output_limited {
+        diagnostic.push_str(&format!(
+            "trace: {reference}: output limit is {MAX_TRACE_OUTPUT_LINES} lines or {MAX_TRACE_OUTPUT_BYTES} bytes\n"
+        ));
+    }
+    let exit = i32::from(!diagnostic.is_empty()) * 2;
+    CommandOutcome::captured(exit, output, diagnostic.into_bytes())
+}
+
+fn trace_status_diagnostic(reference: &str, status: agsh_output::RawTraceStatus) -> String {
+    match status {
+        agsh_output::RawTraceStatus::Complete => String::new(),
+        agsh_output::RawTraceStatus::Truncated => format!(
+            "trace: {reference}: raw trace is truncated; output is only the retained prefix\n"
         ),
+        agsh_output::RawTraceStatus::Disabled => {
+            format!("trace: {reference}: raw trace is disabled and no bytes were retained\n")
+        }
+        agsh_output::RawTraceStatus::Unavailable => {
+            format!("trace: {reference}: raw trace storage is unavailable\n")
+        }
     }
 }
 
@@ -1152,10 +1496,10 @@ fn builtin_trace(args: &[String], state: &ShellState) -> CommandOutcome {
 /// and return a bounded, structured result: total match count plus the first N
 /// numbered matching lines. Lets an agent query a large output without re-running
 /// the command or reading back the whole raw stream. grep-style exit: 0 = matches,
-/// 1 = none, 2 = usage/not-found.
+/// 1 = none, 2 = usage/not-found/incomplete.
 fn trace_grep(args: &[String], state: &ShellState) -> CommandOutcome {
     let want_stderr = args.iter().any(|a| a == "--stderr");
-    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let positional: Vec<&String> = args.iter().filter(|a| *a != "--stderr").collect();
     let (Some(pattern), Some(reference)) = (positional.first(), positional.get(1)) else {
         return CommandOutcome::captured(
             2,
@@ -1163,22 +1507,37 @@ fn trace_grep(args: &[String], state: &ShellState) -> CommandOutcome {
             b"trace: usage: agtrace grep <pattern> <ref> [--stderr]\n".to_vec(),
         );
     };
-    // Resolve the bytes: a disk-backed file path, else a `trace://<id>` reference.
-    let bytes = if std::path::Path::new(reference.as_str()).is_file() {
-        std::fs::read(reference.as_str()).ok()
+    let direct_path = Path::new(reference.as_str());
+    let direct_candidate = !reference.starts_with("trace://") && direct_path.exists();
+    let (reader, trace_status): (Box<dyn Read>, agsh_output::RawTraceStatus) = if direct_candidate {
+        match open_regular_trace_path(direct_path) {
+            Ok(file) => (
+                Box::new(file),
+                state
+                    .trace_status_for_path(direct_path)
+                    .unwrap_or(agsh_output::RawTraceStatus::Complete),
+            ),
+            Err(error) => {
+                return CommandOutcome::captured(
+                    2,
+                    Vec::new(),
+                    format!("trace: {reference}: {error}\n").into_bytes(),
+                );
+            }
+        }
     } else {
-        let base = reference
-            .trim_end_matches("/stdout")
-            .trim_end_matches("/stderr");
-        let resolved = format!("{base}/{}", if want_stderr { "stderr" } else { "stdout" });
-        state.resolve_trace(&resolved)
-    };
-    let Some(bytes) = bytes else {
-        return CommandOutcome::captured(
-            2,
-            Vec::new(),
-            format!("trace: {reference}: not found\n").into_bytes(),
-        );
+        let (base, reference_stream) = parse_trace_ref(reference);
+        let stderr = want_stderr || reference_stream == TraceStream::Stderr;
+        let resolved = format!("{base}/{}", if stderr { "stderr" } else { "stdout" });
+        let Some(reader) = state.open_trace_reader(&resolved) else {
+            return CommandOutcome::captured(
+                2,
+                Vec::new(),
+                format!("trace: {reference}: not found\n").into_bytes(),
+            );
+        };
+        let status = reader.status;
+        (Box::new(reader), status)
     };
     // Bounded regex (guards against pathological patterns); literal fallback.
     let re = regex::RegexBuilder::new(pattern)
@@ -1187,30 +1546,161 @@ fn trace_grep(args: &[String], state: &ShellState) -> CommandOutcome {
         .build()
         .ok();
     const MAX_SHOWN: usize = 100;
-    let text = String::from_utf8_lossy(&bytes);
+    const MAX_LINE_BYTES: usize = 1024 * 1024;
+    let mut limited = reader.take(MAX_TRACE_SCAN_BYTES + 1);
+    let mut reader = BufReader::with_capacity(64 * 1024, &mut limited);
+    let mut line = Vec::new();
     let mut total = 0usize;
+    let mut line_number = 0usize;
+    let mut oversized_lines = 0usize;
     let mut shown = String::new();
-    for (i, line) in text.lines().enumerate() {
+    loop {
+        match read_bounded_trace_line(&mut reader, &mut line, MAX_LINE_BYTES) {
+            Ok(TraceLine::Eof) => break,
+            Ok(TraceLine::Oversized) => {
+                line_number = line_number.saturating_add(1);
+                oversized_lines = oversized_lines.saturating_add(1);
+                continue;
+            }
+            Ok(TraceLine::Line) => {
+                line_number = line_number.saturating_add(1);
+            }
+            Err(error) => {
+                return CommandOutcome::captured(
+                    2,
+                    Vec::new(),
+                    format!("trace: {reference}: {error}\n").into_bytes(),
+                );
+            }
+        }
+        while line
+            .last()
+            .is_some_and(|byte| matches!(*byte, b'\n' | b'\r'))
+        {
+            line.pop();
+        }
+        let line = String::from_utf8_lossy(&line);
         let hit = match &re {
-            Some(r) => r.is_match(line),
+            Some(r) => r.is_match(&line),
             None => line.contains(pattern.as_str()),
         };
         if !hit {
             continue;
         }
-        total += 1;
+        total = total.saturating_add(1);
         if total <= MAX_SHOWN {
             let clipped: String = line.chars().take(300).collect();
-            shown.push_str(&format!("{}: {clipped}\n", i + 1));
+            shown.push_str(&format!("{line_number}: {clipped}\n"));
         }
     }
-    let header = if total > MAX_SHOWN {
+    drop(reader);
+    let scan_limited = limited.limit() == 0;
+    let incomplete = trace_status != agsh_output::RawTraceStatus::Complete
+        || oversized_lines > 0
+        || scan_limited;
+    let mut header = if total > MAX_SHOWN {
         format!("[{total} matches, showing first {MAX_SHOWN}]\n")
     } else {
         format!("[{total} match{}]\n", if total == 1 { "" } else { "es" })
     };
-    let exit = i32::from(total == 0);
+    if trace_status != agsh_output::RawTraceStatus::Complete {
+        header.push_str(&format!(
+            "[incomplete search: raw trace is {}]\n",
+            trace_status.as_str()
+        ));
+    }
+    if oversized_lines > 0 {
+        header.push_str(&format!(
+            "[incomplete search: {oversized_lines} line(s) exceeded {MAX_LINE_BYTES} bytes]\n"
+        ));
+    }
+    if scan_limited {
+        header.push_str(&format!(
+            "[incomplete search: input exceeded {MAX_TRACE_SCAN_BYTES} bytes]\n"
+        ));
+    }
+    let exit = if incomplete {
+        2
+    } else if total > 0 {
+        0
+    } else {
+        1
+    };
     CommandOutcome::captured(exit, format!("{header}{shown}").into_bytes(), Vec::new())
+}
+
+fn open_regular_trace_path(path: &Path) -> io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let file = std::fs::File::from(descriptor);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_TRACE_SCAN_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("file exceeds the {MAX_TRACE_SCAN_BYTES}-byte trace scan limit"),
+        ));
+    }
+    Ok(file)
+}
+
+enum TraceLine {
+    Eof,
+    Line,
+    Oversized,
+}
+
+fn read_bounded_trace_line(
+    reader: &mut impl BufRead,
+    output: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<TraceLine> {
+    output.clear();
+    let mut oversized = false;
+    loop {
+        let (consumed, ended) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(if oversized {
+                    TraceLine::Oversized
+                } else if output.is_empty() {
+                    TraceLine::Eof
+                } else {
+                    TraceLine::Line
+                });
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map_or(available.len(), |index| index + 1);
+            if !oversized {
+                let remaining = limit.saturating_add(1).saturating_sub(output.len());
+                output.extend_from_slice(&available[..consumed.min(remaining)]);
+                if output.len() > limit {
+                    output.clear();
+                    oversized = true;
+                }
+            }
+            (consumed, newline.is_some())
+        };
+        reader.consume(consumed);
+        if ended {
+            return Ok(if oversized {
+                TraceLine::Oversized
+            } else {
+                TraceLine::Line
+            });
+        }
+    }
 }
 
 fn builtin_shift(args: &[String], state: &mut ShellState) -> CommandOutcome {
@@ -1235,18 +1725,61 @@ fn builtin_shift(args: &[String], state: &mut ShellState) -> CommandOutcome {
 }
 
 fn builtin_readonly(args: &[String], state: &mut ShellState) -> CommandOutcome {
-    for arg in args {
-        if arg == "-p" {
-            continue;
+    let mut print = args.is_empty();
+    let mut operand_start = 0;
+    while let Some(arg) = args.get(operand_start) {
+        match arg.as_str() {
+            "-p" => print = true,
+            "--" => {
+                operand_start += 1;
+                break;
+            }
+            option if option.starts_with('-') && option != "-" => {
+                return CommandOutcome::captured(
+                    2,
+                    Vec::new(),
+                    format!("readonly: {option}: invalid option\n").into_bytes(),
+                );
+            }
+            _ => break,
         }
+        operand_start += 1;
+    }
+
+    let operands = &args[operand_start..];
+    if print && operands.is_empty() {
+        let mut out = String::new();
+        for name in state.readonly_variable_names() {
+            if let Some(line) = format_declaration(name, state, Some('r')) {
+                out.push_str(&line);
+            }
+        }
+        return CommandOutcome::captured(0, out.into_bytes(), Vec::new());
+    }
+
+    let mut stderr = String::new();
+    let mut status = 0;
+    for arg in operands {
         if let Some((key, value)) = arg.split_once('=') {
-            state.set_var(key, value);
+            if !is_identifier(key) {
+                stderr.push_str(&format!("readonly: {arg}: not a valid identifier\n"));
+                status = 1;
+                continue;
+            }
+            if !state.try_set_var(key, value) {
+                stderr.push_str(&format!("readonly: {key}: readonly variable\n"));
+                status = 1;
+                continue;
+            }
             state.mark_readonly(key);
-        } else {
+        } else if is_identifier(arg) {
             state.mark_readonly(arg);
+        } else {
+            stderr.push_str(&format!("readonly: {arg}: not a valid identifier\n"));
+            status = 1;
         }
     }
-    CommandOutcome::captured(0, Vec::new(), Vec::new())
+    CommandOutcome::captured(status, Vec::new(), stderr.into_bytes())
 }
 
 /// `math [-p PREC] EXPR...`: evaluate a floating-point expression (bash has no
@@ -1388,12 +1921,123 @@ fn parse_assoc_pairs(inner: &str) -> Vec<(String, String)> {
     pairs
 }
 
+fn assign_declared_value(
+    name: &str,
+    raw: &str,
+    indexed: bool,
+    assoc: bool,
+    integer: bool,
+    state: &mut ShellState,
+) -> Result<(), String> {
+    if raw.starts_with('(') && raw.ends_with(')') {
+        let inner = &raw[1..raw.len() - 1];
+        if assoc {
+            state.set_assoc(name, parse_assoc_pairs(inner), false);
+        } else {
+            let elements = inner.split_whitespace().map(String::from).collect();
+            state.set_array(name, elements, false);
+        }
+        return Ok(());
+    }
+
+    let value = if integer {
+        crate::executor::eval_arithmetic(raw, state)
+            .map(|number| number.to_string())
+            .map_err(|error| error.to_string())?
+    } else {
+        raw.to_string()
+    };
+    if assoc {
+        state.set_assoc_element(name, "0".to_string(), value, false);
+    } else if indexed {
+        state.set_array(name, vec![value], false);
+    } else if !state.try_set_var(name, value) {
+        return Err("readonly variable".to_string());
+    }
+    Ok(())
+}
+
+fn format_declaration(name: &str, state: &ShellState, force_flag: Option<char>) -> Option<String> {
+    if !state.variable_exists(name) && !state.is_readonly(name) {
+        return None;
+    }
+    let mut flags = String::new();
+    if state.is_array(name) {
+        flags.push('a');
+    }
+    if state.is_assoc(name) {
+        flags.push('A');
+    }
+    if state.is_integer(name) {
+        flags.push('i');
+    }
+    if state.is_readonly(name) || force_flag == Some('r') {
+        flags.push('r');
+    }
+    if state.is_exported(name) || force_flag == Some('x') {
+        flags.push('x');
+    }
+    let option = if flags.is_empty() {
+        "--".to_string()
+    } else {
+        format!("-{flags}")
+    };
+
+    let value = if let Some(array) = state.array(name) {
+        let elements = array
+            .iter()
+            .map(|value| format!("\"{}\"", escape_double_quoted(value)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("=({elements})")
+    } else if let Some(entries) = state.assoc_entries(name) {
+        let elements = entries
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "[\"{}\"]=\"{}\"",
+                    escape_double_quoted(key),
+                    escape_double_quoted(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("=({elements})")
+    } else if let Some(value) = state.lookup(name) {
+        format!("=\"{}\"", escape_double_quoted(value))
+    } else {
+        String::new()
+    };
+    Some(format!("declare {option} {name}{value}\n"))
+}
+
+fn escape_double_quoted(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '\\' | '"' | '$' | '`' | '!') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+fn split_variable_subscript(name: &str) -> (&str, Option<&str>) {
+    let Some(open) = name.find('[') else {
+        return (name, None);
+    };
+    let Some(inner) = name.strip_suffix(']').and_then(|name| name.get(open + 1..)) else {
+        return (name, None);
+    };
+    (&name[..open], Some(inner))
+}
+
 /// `declare`/`typeset [-i -x -r -p -a -A] [name[=value]]`: `-i` integer, `-x`
 /// export, `-r` readonly (enforced), `-p` print, `-a` indexed array, `-A`
 /// associative array.
 fn builtin_declare(args: &[String], state: &mut ShellState) -> CommandOutcome {
-    let (mut export, mut integer, mut print, mut readonly, mut assoc) =
-        (false, false, false, false, false);
+    let (mut export, mut integer, mut print, mut readonly, mut indexed, mut assoc, mut global) =
+        (false, false, false, false, false, false, false);
     let mut i = 0;
     while let Some(arg) = args.get(i) {
         if arg.len() > 1 && arg.starts_with('-') && arg != "--" {
@@ -1403,10 +2047,16 @@ fn builtin_declare(args: &[String], state: &mut ShellState) -> CommandOutcome {
                     'i' => integer = true,
                     'p' => print = true,
                     'r' => readonly = true,
+                    'a' => indexed = true,
                     'A' => assoc = true,
-                    // -r (readonly, not enforced), -g/-l (scope), -a/-A (arrays,
-                    // unsupported), -f/-F (functions): accepted, no-op here.
-                    _ => {}
+                    'g' => global = true,
+                    _ => {
+                        return CommandOutcome::captured(
+                            2,
+                            Vec::new(),
+                            format!("declare: -{ch}: invalid option\n").into_bytes(),
+                        );
+                    }
                 }
             }
             i += 1;
@@ -1418,126 +2068,252 @@ fn builtin_declare(args: &[String], state: &mut ShellState) -> CommandOutcome {
         }
     }
     let names = &args[i..];
+    if indexed && assoc {
+        return CommandOutcome::captured(
+            2,
+            Vec::new(),
+            b"declare: cannot use -a and -A together\n".to_vec(),
+        );
+    }
 
     if print {
         let mut out = String::new();
-        let print_one = |out: &mut String, key: &str, value: &str, state: &ShellState| {
-            let flag = if state.exported_env().contains_key(key) {
-                "-x"
-            } else {
-                "--"
-            };
-            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-            out.push_str(&format!("declare {flag} {key}=\"{escaped}\"\n"));
-        };
+        let mut stderr = String::new();
+        let mut status = 0;
         if names.is_empty() {
-            for (key, value) in state.vars().clone() {
-                print_one(&mut out, &key, &value, state);
+            for key in state.variable_names() {
+                if let Some(line) = format_declaration(key, state, None) {
+                    out.push_str(&line);
+                }
             }
         } else {
             for name in names {
-                if let Some(value) = state.lookup(name).map(str::to_string) {
-                    print_one(&mut out, name, &value, state);
+                if let Some(line) = format_declaration(name, state, None) {
+                    out.push_str(&line);
+                } else {
+                    stderr.push_str(&format!("declare: {name}: not found\n"));
+                    status = 1;
                 }
             }
         }
-        return CommandOutcome::captured(0, out.into_bytes(), Vec::new());
+        return CommandOutcome::captured(status, out.into_bytes(), stderr.into_bytes());
     }
 
+    let mut stderr = String::new();
+    let mut status = 0;
     for name in names {
         if let Some((key, raw)) = name.split_once('=') {
-            // `declare -a a=(x y z)` / `declare -A h=([k]=v ...)`: array literal.
-            if raw.starts_with('(') && raw.ends_with(')') {
-                let inner = &raw[1..raw.len() - 1];
-                if assoc {
-                    state.set_assoc(key, parse_assoc_pairs(inner), false);
-                } else {
-                    let elements = inner.split_whitespace().map(String::from).collect();
-                    state.set_array(key, elements, false);
-                }
-                if readonly {
-                    state.mark_readonly(key);
-                }
+            if !is_identifier(key) {
+                stderr.push_str(&format!("declare: {name}: not a valid identifier\n"));
+                status = 1;
                 continue;
             }
-            let value = if integer {
-                crate::executor::eval_arithmetic(raw, state)
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|_| "0".to_string())
-            } else {
-                raw.to_string()
-            };
+            if state.in_function() && !global && !state.declare_local(key) {
+                stderr.push_str(&format!("declare: {key}: readonly variable\n"));
+                status = 1;
+                continue;
+            }
+            if state.is_readonly(key) {
+                stderr.push_str(&format!("declare: {key}: readonly variable\n"));
+                status = 1;
+                continue;
+            }
+            if integer {
+                state.mark_integer(key);
+            }
+            if let Err(message) = assign_declared_value(key, raw, indexed, assoc, integer, state) {
+                stderr.push_str(&format!("declare: {key}: {message}\n"));
+                status = 1;
+                continue;
+            }
             if export {
-                state.export_var(key, value);
-            } else {
-                state.set_var(key, value);
+                state.mark_exported(key);
             }
             if readonly {
                 state.mark_readonly(key);
             }
         } else {
+            if !is_identifier(name) {
+                stderr.push_str(&format!("declare: {name}: not a valid identifier\n"));
+                status = 1;
+                continue;
+            }
+            if state.in_function() && !global && !state.declare_local(name) {
+                stderr.push_str(&format!("declare: {name}: readonly variable\n"));
+                status = 1;
+                continue;
+            }
+            if state.is_readonly(name) && (indexed || assoc || integer) {
+                stderr.push_str(&format!("declare: {name}: readonly variable\n"));
+                status = 1;
+                continue;
+            }
             if assoc {
                 state.declare_assoc(name);
+            } else if indexed {
+                state.declare_array(name);
+            }
+            if integer {
+                state.mark_integer(name);
             }
             if export {
-                let value = state.lookup(name).map(str::to_string).unwrap_or_default();
-                state.export_var(name.as_str(), value);
+                state.mark_exported(name);
             }
             if readonly {
                 state.mark_readonly(name);
             }
         }
     }
-    CommandOutcome::captured(0, Vec::new(), Vec::new())
+    CommandOutcome::captured(status, Vec::new(), stderr.into_bytes())
 }
 
 fn builtin_export(args: &[String], state: &mut ShellState) -> Result<CommandOutcome, ShellError> {
-    // `export -p`: list exported variables in re-inputtable form.
-    if args.first().map(String::as_str) == Some("-p") {
+    let mut print = args.is_empty();
+    let mut remove = false;
+    let mut operand_start = 0;
+    while let Some(arg) = args.get(operand_start) {
+        if arg == "--" {
+            operand_start += 1;
+            break;
+        }
+        if arg.len() <= 1 || !arg.starts_with('-') {
+            break;
+        }
+        for option in arg[1..].chars() {
+            match option {
+                'p' => print = true,
+                'n' => remove = true,
+                _ => {
+                    return Ok(CommandOutcome::captured(
+                        2,
+                        Vec::new(),
+                        format!("export: -{option}: invalid option\n").into_bytes(),
+                    ));
+                }
+            }
+        }
+        operand_start += 1;
+    }
+    let operands = &args[operand_start..];
+    if print && operands.is_empty() {
         let mut out = String::new();
-        for (key, value) in state.exported_env().clone() {
-            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-            out.push_str(&format!("declare -x {key}=\"{escaped}\"\n"));
+        for key in state.exported_variable_names() {
+            if let Some(line) = format_declaration(key, state, Some('x')) {
+                out.push_str(&line);
+            }
         }
         return Ok(CommandOutcome::captured(0, out.into_bytes(), Vec::new()));
     }
-    for arg in args {
+
+    let mut stderr = String::new();
+    let mut status = 0;
+    for arg in operands {
         if let Some((key, value)) = arg.split_once('=') {
-            state.export_var(key, value);
-        } else if let Some(value) = state.lookup(arg).map(str::to_string) {
-            state.export_var(arg.as_str(), value);
+            if !is_identifier(key) {
+                stderr.push_str(&format!("export: {arg}: not a valid identifier\n"));
+                status = 1;
+            } else if remove {
+                if !state.try_set_var(key, value) || !state.unexport(key) {
+                    stderr.push_str(&format!("export: {key}: readonly variable\n"));
+                    status = 1;
+                }
+            } else if !state.try_export_var(key, value) {
+                stderr.push_str(&format!("export: {key}: readonly variable\n"));
+                status = 1;
+            }
+        } else if !is_identifier(arg) {
+            stderr.push_str(&format!("export: {arg}: not a valid identifier\n"));
+            status = 1;
+        } else if remove {
+            if !state.unexport(arg) {
+                stderr.push_str(&format!("export: {arg}: readonly variable\n"));
+                status = 1;
+            }
         } else {
-            state.export_var(arg.as_str(), "");
+            state.mark_exported(arg);
         }
     }
-    Ok(CommandOutcome::captured(0, Vec::new(), Vec::new()))
+    Ok(CommandOutcome::captured(
+        status,
+        Vec::new(),
+        stderr.into_bytes(),
+    ))
 }
 
 fn builtin_unset(args: &[String], state: &mut ShellState) -> Result<CommandOutcome, ShellError> {
     let mut functions_only = false;
     let mut vars_only = false;
-    for arg in args {
-        match arg.as_str() {
-            "-f" => functions_only = true,
-            "-v" => vars_only = true,
-            name => {
-                if functions_only {
-                    state.remove_function(name);
-                } else if vars_only {
-                    state.unset(name);
-                } else {
-                    // Without a flag, remove a variable, falling back to a
-                    // function of the same name (matching bash precedence).
-                    if state.lookup(name).is_some() {
-                        state.unset(name);
-                    } else {
-                        state.remove_function(name);
-                    }
+    let mut operand_start = 0;
+    while let Some(arg) = args.get(operand_start) {
+        if arg == "--" {
+            operand_start += 1;
+            break;
+        }
+        if arg.len() <= 1 || !arg.starts_with('-') {
+            break;
+        }
+        for option in arg[1..].chars() {
+            match option {
+                'f' => functions_only = true,
+                'v' => vars_only = true,
+                _ => {
+                    return Ok(CommandOutcome::captured(
+                        2,
+                        Vec::new(),
+                        format!("unset: -{option}: invalid option\n").into_bytes(),
+                    ));
                 }
             }
         }
+        operand_start += 1;
     }
-    Ok(CommandOutcome::captured(0, Vec::new(), Vec::new()))
+
+    let mut stderr = String::new();
+    let mut status = 0;
+    for name in &args[operand_start..] {
+        let (base, subscript) = split_variable_subscript(name);
+        if !is_identifier(base) || (functions_only && subscript.is_some()) {
+            stderr.push_str(&format!("unset: {name}: not a valid identifier\n"));
+            status = 1;
+            continue;
+        }
+        if functions_only {
+            state.remove_function(name);
+            continue;
+        }
+        if state.is_readonly(base) {
+            stderr.push_str(&format!("unset: {base}: readonly variable\n"));
+            status = 1;
+            continue;
+        }
+        if let Some(subscript) = subscript {
+            let ok = if state.is_assoc(base) {
+                state.remove_assoc_element(base, subscript)
+            } else if state.is_array(base) {
+                subscript
+                    .parse::<usize>()
+                    .ok()
+                    .is_some_and(|index| state.remove_array_element(base, index))
+            } else {
+                true
+            };
+            if !ok {
+                stderr.push_str(&format!("unset: {name}: invalid array subscript\n"));
+                status = 1;
+            }
+        } else {
+            if vars_only || state.variable_exists(name) {
+                state.unset(name);
+            } else {
+                state.remove_function(name);
+            }
+        }
+    }
+    Ok(CommandOutcome::captured(
+        status,
+        Vec::new(),
+        stderr.into_bytes(),
+    ))
 }
 
 fn builtin_set(args: &[String], state: &mut ShellState) -> CommandOutcome {
@@ -2513,100 +3289,6 @@ fn builtin_bg(args: &[String], state: &ShellState) -> CommandOutcome {
     CommandOutcome::captured(0, Vec::new(), Vec::new())
 }
 
-/// `agjob <command…>` — run a command in the BACKGROUND with its output CAPTURED to
-/// a retrievable log file, returning immediately with a job id + the log path. Solves
-/// the #1 agent-blocking failure (long `cargo build` / `npm test` / dev servers):
-/// instead of blocking the tool call or losing `&`'s terminal output, the agent gets
-/// a non-blocking handle it can poll with `jobs` and query with `agtrace grep <log>`.
-fn builtin_agjob(args: &[String], state: &ShellState) -> CommandOutcome {
-    use std::os::unix::process::CommandExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
-    if args.is_empty() {
-        return CommandOutcome::captured(
-            2,
-            Vec::new(),
-            b"agjob: usage: agjob <command> [args...]\n".to_vec(),
-        );
-    }
-    // Single-quote each arg so the reconstructed command line preserves quoting
-    // exactly (a bare join would mangle `agjob sh -c "a; b"`).
-    let source = args
-        .iter()
-        .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let dir = std::env::var_os("AGSH_TRACE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("agsh-jobs"));
-    if std::fs::create_dir_all(&dir).is_err() {
-        return CommandOutcome::captured(
-            1,
-            Vec::new(),
-            b"agjob: could not create the job log directory\n".to_vec(),
-        );
-    }
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let log = dir.join(format!("job-{}-{seq}.log", std::process::id()));
-    let file = match std::fs::File::create(&log) {
-        Ok(file) => file,
-        Err(error) => {
-            return CommandOutcome::captured(
-                1,
-                Vec::new(),
-                format!("agjob: {error}\n").into_bytes(),
-            )
-        }
-    };
-    // stdout + stderr merge into one raw log (a child `agsh -c` runs raw by default,
-    // so the file holds exact bytes). Detached process group, no terminal stdin.
-    let err_handle = match file.try_clone() {
-        Ok(handle) => handle,
-        Err(error) => {
-            return CommandOutcome::captured(
-                1,
-                Vec::new(),
-                format!("agjob: {error}\n").into_bytes(),
-            )
-        }
-    };
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            return CommandOutcome::captured(
-                1,
-                Vec::new(),
-                format!("agjob: {error}\n").into_bytes(),
-            )
-        }
-    };
-    let mut command = Command::new(exe);
-    command.arg("-c").arg(&source);
-    command.current_dir(state.cwd());
-    command.env_clear();
-    command.envs(state.exported_env());
-    command.process_group(0);
-    command.stdin(std::process::Stdio::null());
-    command.stdout(std::process::Stdio::from(file));
-    command.stderr(std::process::Stdio::from(err_handle));
-    match command.spawn() {
-        Ok(child) => {
-            let pid = child.id();
-            state.set_last_bg_pid(pid);
-            let (id, _pgid) = state.register_job(child, source);
-            CommandOutcome::captured(
-                0,
-                format!("[{id}] {pid}  output: {}\n", log.display()).into_bytes(),
-                Vec::new(),
-            )
-        }
-        Err(error) => {
-            CommandOutcome::captured(1, Vec::new(), format!("agjob: {error}\n").into_bytes())
-        }
-    }
-}
-
 fn builtin_wait(args: &[String], state: &ShellState) -> CommandOutcome {
     if args.is_empty() {
         state.wait_for_jobs(None);
@@ -2920,17 +3602,22 @@ fn builtin_printf(args: &[String]) -> Result<CommandOutcome, ShellError> {
     }
 
     let format = &args[0];
+    if format.len() > MAX_PRINTF_OUTPUT_BYTES {
+        return Err(ShellError::execution(format!(
+            "printf output limit is {MAX_PRINTF_OUTPUT_BYTES} bytes"
+        )));
+    }
     let operands = &args[1..];
     let mut out = String::new();
     let mut exit_code = 0;
 
     if operands.is_empty() {
-        render_printf_format(format, operands, &mut out, &mut exit_code);
+        render_printf_format(format, operands, &mut out, &mut exit_code)?;
     } else {
         let mut index = 0;
         while index < operands.len() {
             let consumed =
-                render_printf_format(format, &operands[index..], &mut out, &mut exit_code);
+                render_printf_format(format, &operands[index..], &mut out, &mut exit_code)?;
             if consumed == 0 {
                 break;
             }
@@ -2952,7 +3639,7 @@ fn render_printf_format(
     operands: &[String],
     out: &mut String,
     exit_code: &mut i32,
-) -> usize {
+) -> Result<usize, ShellError> {
     let chars: Vec<char> = format.chars().collect();
     let mut i = 0;
     let mut arg_index = 0;
@@ -2968,8 +3655,13 @@ fn render_printf_format(
                 i += 2;
             }
             '%' => {
-                let (spec_len, consumed) =
-                    render_printf_conversion(&chars[i..], operands, &mut arg_index, out, exit_code);
+                let (spec_len, consumed) = render_printf_conversion(
+                    &chars[i..],
+                    operands,
+                    &mut arg_index,
+                    out,
+                    exit_code,
+                )?;
                 if spec_len == 0 {
                     out.push('%');
                     i += 1;
@@ -2983,9 +3675,14 @@ fn render_printf_format(
                 i += 1;
             }
         }
+        if out.len() > MAX_PRINTF_OUTPUT_BYTES {
+            return Err(ShellError::execution(format!(
+                "printf output limit is {MAX_PRINTF_OUTPUT_BYTES} bytes"
+            )));
+        }
     }
 
-    arg_index
+    Ok(arg_index)
 }
 
 /// Decode a backslash escape inside a printf format. `i` points past the `\`.
@@ -3024,7 +3721,7 @@ fn render_printf_conversion(
     arg_index: &mut usize,
     out: &mut String,
     exit_code: &mut i32,
-) -> (usize, bool) {
+) -> Result<(usize, bool), ShellError> {
     // chars[0] == '%'
     let mut j = 1;
     let flags_start = j;
@@ -3054,7 +3751,7 @@ fn render_printf_conversion(
     }
 
     let Some(&conv) = chars.get(j) else {
-        return (0, false);
+        return Ok((0, false));
     };
     let spec_len = j + 1;
 
@@ -3065,6 +3762,20 @@ fn render_printf_conversion(
     };
 
     let width_num = width.parse::<usize>().ok();
+    if width_num.is_some_and(|width| width > MAX_PRINTF_OUTPUT_BYTES) {
+        return Err(ShellError::execution(format!(
+            "printf output limit is {MAX_PRINTF_OUTPUT_BYTES} bytes"
+        )));
+    }
+    if precision
+        .as_deref()
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|precision| precision > MAX_PRINTF_OUTPUT_BYTES)
+    {
+        return Err(ShellError::execution(format!(
+            "printf output limit is {MAX_PRINTF_OUTPUT_BYTES} bytes"
+        )));
+    }
     let left = flags.contains('-');
     let zero = flags.contains('0') && !left;
 
@@ -3091,8 +3802,8 @@ fn render_printf_conversion(
             let value = parse_printf_int(&raw, exit_code);
             let mut body = value.unsigned_abs().to_string();
             if let Some(p) = precision.as_ref().and_then(|p| p.parse::<usize>().ok()) {
-                while body.len() < p {
-                    body.insert(0, '0');
+                if body.len() < p {
+                    body = format!("{}{body}", "0".repeat(p - body.len()));
                 }
             }
             let sign = if value < 0 {
@@ -3117,8 +3828,8 @@ fn render_printf_conversion(
                 _ => unsigned.to_string(),
             };
             if let Some(p) = precision.as_ref().and_then(|p| p.parse::<usize>().ok()) {
-                while body.len() < p {
-                    body.insert(0, '0');
+                if body.len() < p {
+                    body = format!("{}{body}", "0".repeat(p - body.len()));
                 }
             }
             pad_number("", &body, width_num, left, zero && precision.is_none())
@@ -3142,12 +3853,17 @@ fn render_printf_conversion(
             pad_number("", &body, width_num, left, zero)
         }
         _ => {
-            return (0, false);
+            return Ok((0, false));
         }
     };
 
+    if out.len().saturating_add(rendered.len()) > MAX_PRINTF_OUTPUT_BYTES {
+        return Err(ShellError::execution(format!(
+            "printf output limit is {MAX_PRINTF_OUTPUT_BYTES} bytes"
+        )));
+    }
     out.push_str(&rendered);
-    (spec_len, true)
+    Ok((spec_len, true))
 }
 
 fn parse_printf_int(raw: &str, exit_code: &mut i32) -> i64 {
@@ -3691,6 +4407,353 @@ fn is_identifier(text: &str) -> bool {
 
 fn shell_single_quote(value: &str) -> String {
     value.replace('\'', "'\\''")
+}
+
+#[cfg(test)]
+mod getopts_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_are_captured_in_the_command_outcome() {
+        let mut state = ShellState::from_current_process();
+        state.set_positionals(&["-x".to_string()]);
+
+        let unknown = builtin_getopts(&["ab".into(), "option".into()], &mut state);
+
+        assert_eq!(unknown.exit_code, 0);
+        assert_eq!(unknown.stdout, Vec::<u8>::new());
+        assert_eq!(unknown.stderr, b"getopts: illegal option -- x\n");
+
+        state.set_var("OPTIND", "1".to_string());
+        state.set_getopts_char(0);
+        state.set_positionals(&["-b".to_string()]);
+
+        let missing = builtin_getopts(&["ab:".into(), "option".into()], &mut state);
+
+        assert_eq!(missing.exit_code, 0);
+        assert_eq!(missing.stdout, Vec::<u8>::new());
+        assert_eq!(
+            missing.stderr,
+            b"getopts: option requires an argument -- b\n"
+        );
+    }
+
+    #[test]
+    fn unsliced_trace_output_preserves_arbitrary_bytes() {
+        let state = ShellState::from_current_process();
+        let cmd_id = agsh_core::CommandId::new();
+        let raw = [0x00, 0xff, b'\n', 0x80, b'x'];
+        state.record_trace(&cmd_id, "binary-producer", 0, &raw, b"");
+
+        let outcome = builtin_trace(&[cmd_id.to_string()], &state);
+
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.stdout, raw);
+        assert!(outcome.stderr.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn temp_trace(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "agsh-trace-grep-{name}-{}",
+            agsh_core::CommandId::new()
+        ))
+    }
+
+    fn recorded_trace(
+        name: &str,
+        config: &str,
+        stdout: &[u8],
+    ) -> (ShellState, agsh_core::CommandId, PathBuf) {
+        let dir = temp_trace(name);
+        let mut state = ShellState::from_current_process();
+        state.set_var("AGSH_TRACE_DIR", dir.display().to_string());
+        state.replace_output_config_for_test(agsh_output::CompactorConfig::from_toml(config));
+        let cmd_id = agsh_core::CommandId::new();
+        state.record_trace(&cmd_id, "producer", 0, stdout, b"");
+        (state, cmd_id, dir)
+    }
+
+    #[test]
+    fn truncated_trace_is_streamed_and_reported_instead_of_not_found() {
+        let (state, cmd_id, dir) = recorded_trace(
+            "truncated-status",
+            "[storage]\nmax_raw_per_command = \"4b\"\n",
+            b"abcdefgh",
+        );
+
+        let outcome = builtin_trace(&[cmd_id.to_string()], &state);
+
+        assert_eq!(outcome.exit_code, 2);
+        assert_eq!(outcome.stdout, b"abcd");
+        let diagnostic = String::from_utf8_lossy(&outcome.stderr);
+        assert!(
+            diagnostic.contains("raw trace is truncated"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("not found"), "{diagnostic}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn disabled_trace_is_reported_as_unavailable_instead_of_not_found() {
+        let (state, cmd_id, dir) = recorded_trace(
+            "disabled-status",
+            "[storage]\nstore_raw = false\n",
+            b"not retained",
+        );
+
+        let outcome = builtin_trace(&[cmd_id.to_string()], &state);
+
+        assert_eq!(outcome.exit_code, 2);
+        assert!(outcome.stdout.is_empty());
+        let diagnostic = String::from_utf8_lossy(&outcome.stderr);
+        assert!(diagnostic.contains("raw trace is disabled"), "{diagnostic}");
+        assert!(!diagnostic.contains("not found"), "{diagnostic}");
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn full_trace_read_has_a_hard_output_bound() {
+        let raw = vec![b'x'; MAX_TRACE_OUTPUT_BYTES + 1];
+        let (state, cmd_id, dir) = recorded_trace(
+            "full-bound",
+            "[storage]\nmax_raw_per_command = \"32mb\"\n",
+            &raw,
+        );
+
+        let outcome = builtin_trace(&[cmd_id.to_string()], &state);
+
+        assert_eq!(outcome.exit_code, 2);
+        assert_eq!(outcome.stdout.len(), MAX_TRACE_OUTPUT_BYTES);
+        assert!(String::from_utf8_lossy(&outcome.stderr).contains("output limit"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn head_tail_range_and_grep_slices_use_the_streaming_trace_reader() {
+        let (state, cmd_id, dir) = recorded_trace(
+            "streamed-slices",
+            "[storage]\nmax_raw_per_command = \"1mb\"\n",
+            b"alpha\nbeta\ngamma\ndelta\n",
+        );
+        let id = cmd_id.to_string();
+
+        let head = builtin_trace(&[id.clone(), "--head".into(), "2".into()], &state);
+        let tail = builtin_trace(&[id.clone(), "--tail".into(), "2".into()], &state);
+        let range = builtin_trace(&[id.clone(), "--range".into(), "2:3".into()], &state);
+        let grep = builtin_trace(&[id, "--grep".into(), "mm".into()], &state);
+
+        assert_eq!(head.exit_code, 0);
+        assert_eq!(head.stdout, b"alpha\nbeta\n");
+        assert_eq!(tail.exit_code, 0);
+        assert_eq!(tail.stdout, b"gamma\ndelta\n");
+        assert_eq!(range.exit_code, 0);
+        assert_eq!(range.stdout, b"beta\ngamma\n");
+        assert_eq!(grep.exit_code, 0);
+        assert_eq!(grep.stdout, b"gamma\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn grep_subcommand_marks_matches_from_a_truncated_trace_incomplete() {
+        let (state, cmd_id, dir) = recorded_trace(
+            "grep-truncated",
+            "[storage]\nmax_raw_per_command = \"6b\"\n",
+            b"needle and omitted suffix\n",
+        );
+
+        let outcome = trace_grep(&["needle".into(), cmd_id.to_string()], &state);
+
+        assert_eq!(outcome.exit_code, 2);
+        let output = String::from_utf8_lossy(&outcome.stdout);
+        assert!(output.contains("1: needle"), "{output}");
+        assert!(output.contains("raw trace is truncated"), "{output}");
+        assert!(!output.contains("not found"), "{output}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn direct_path_grep_preserves_persisted_truncation_status() {
+        let (state, _cmd_id, dir) = recorded_trace(
+            "grep-truncated-path",
+            "[storage]\nmax_raw_per_command = \"6b\"\n",
+            b"needle and omitted suffix\n",
+        );
+        let stdout_path = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "out"))
+            .expect("persisted stdout trace");
+
+        let outcome = trace_grep(
+            &["needle".into(), stdout_path.display().to_string()],
+            &state,
+        );
+
+        assert_eq!(outcome.exit_code, 2);
+        let output = String::from_utf8_lossy(&outcome.stdout);
+        assert!(output.contains("raw trace is truncated"), "{output}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_stderr_reference_selects_stderr_for_reads_and_grep() {
+        let dir = temp_trace("stderr-reference");
+        let mut state = ShellState::from_current_process();
+        state.set_var("AGSH_TRACE_DIR", dir.display().to_string());
+        let cmd_id = agsh_core::CommandId::new();
+        state.record_trace(&cmd_id, "producer", 0, b"stdout\n", b"stderr-needle\n");
+        let reference = format!("trace://{cmd_id}/stderr");
+
+        let read = builtin_trace(std::slice::from_ref(&reference), &state);
+        let grep = trace_grep(&["needle".into(), reference], &state);
+
+        assert_eq!(read.exit_code, 0);
+        assert_eq!(read.stdout, b"stderr-needle\n");
+        assert_eq!(grep.exit_code, 0);
+        assert!(String::from_utf8_lossy(&grep.stdout).contains("stderr-needle"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unnumbered_trace_slices_preserve_selected_line_bytes() {
+        let raw = b"\xffalpha\r\nbeta\nfinal\x80";
+        let (state, cmd_id, dir) = recorded_trace(
+            "slice-exact-bytes",
+            "[storage]\nmax_raw_per_command = \"1mb\"\n",
+            raw,
+        );
+        let id = cmd_id.to_string();
+
+        let head = builtin_trace(&[id.clone(), "--head".into(), "1".into()], &state);
+        let range = builtin_trace(&[id.clone(), "--range".into(), "2:2".into()], &state);
+        let tail = builtin_trace(&[id.clone(), "--tail".into(), "1".into()], &state);
+        let grep = builtin_trace(&[id, "--grep".into(), "alpha".into()], &state);
+
+        assert_eq!(head.stdout, b"\xffalpha\r\n");
+        assert_eq!(range.stdout, b"beta\n");
+        assert_eq!(tail.stdout, b"final\x80");
+        assert_eq!(grep.stdout, b"\xffalpha\r\n");
+        for outcome in [head, range, tail, grep] {
+            assert_eq!(outcome.exit_code, 0);
+            assert!(outcome.stderr.is_empty());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn trace_grep_streams_a_regular_file_and_accepts_dash_pattern() {
+        let path = temp_trace("stream");
+        let mut file = std::fs::File::create(&path).unwrap();
+        for _ in 0..10_000 {
+            file.write_all(b"ordinary\n").unwrap();
+        }
+        file.write_all(b"--needle\n").unwrap();
+        drop(file);
+        let state = ShellState::from_current_process();
+
+        let outcome = trace_grep(
+            &["--needle".to_string(), path.display().to_string()],
+            &state,
+        );
+
+        assert_eq!(outcome.exit_code, 0);
+        assert!(String::from_utf8_lossy(&outcome.stdout).contains("10001: --needle"));
+        assert!(outcome.stderr.is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn trace_grep_rejects_a_regular_file_over_the_scan_ceiling() {
+        let path = temp_trace("scan-ceiling");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_TRACE_SCAN_BYTES + 1).unwrap();
+        drop(file);
+
+        let outcome = trace_grep(
+            &["needle".into(), path.display().to_string()],
+            &ShellState::from_current_process(),
+        );
+
+        assert_eq!(outcome.exit_code, 2);
+        assert!(outcome.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&outcome.stderr).contains("trace scan limit"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn trace_grep_reports_an_incomplete_oversized_line_search() {
+        let path = temp_trace("oversized-line");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        file.write_all(b"\nordinary\n").unwrap();
+        drop(file);
+        let state = ShellState::from_current_process();
+
+        let outcome = trace_grep(&["absent".to_string(), path.display().to_string()], &state);
+
+        assert_eq!(outcome.exit_code, 2);
+        assert!(String::from_utf8_lossy(&outcome.stdout).contains("incomplete search"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_grep_rejects_non_regular_inputs_without_reading() {
+        let state = ShellState::from_current_process();
+        let outcome = trace_grep(&["x".to_string(), "/dev/zero".to_string()], &state);
+
+        assert_eq!(outcome.exit_code, 2);
+        assert!(String::from_utf8_lossy(&outcome.stderr).contains("not a regular file"));
+    }
+}
+
+#[cfg(test)]
+mod declaration_tests {
+    use super::{format_declaration, ShellState};
+
+    #[test]
+    fn printed_declarations_escape_all_double_quote_expansions() {
+        let mut state = ShellState::from_current_process();
+        state.export_var("AGSH_DECL_ESCAPE", "\\\"$HOME`echo bad`!literal");
+
+        let declaration = format_declaration("AGSH_DECL_ESCAPE", &state, None).unwrap();
+
+        assert_eq!(
+            declaration,
+            "declare -x AGSH_DECL_ESCAPE=\"\\\\\\\"\\$HOME\\`echo bad\\`\\!literal\"\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+
+    #[test]
+    fn intercept_mode_reports_install_failure_and_remains_off() {
+        let mut state = ShellState::from_current_process();
+        state.export_var("PATH", "");
+        state.export_var("SHELL", "/original/shell");
+
+        let outcome = mode_intercept(Some("semantic"), &mut state);
+
+        assert_eq!(outcome.exit_code, 1);
+        assert!(outcome.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&outcome.stderr).contains("cannot install shell interception")
+        );
+        assert!(!crate::executor::intercept_active(&state));
+        assert_eq!(state.lookup("PATH"), Some(""));
+        assert_eq!(state.lookup("SHELL"), Some("/original/shell"));
+    }
 }
 
 #[cfg(test)]

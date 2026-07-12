@@ -3,6 +3,12 @@ name = "agsh-compat"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+authors.workspace = true
+description = "Command resolution and POSIX compatibility support for agsh."
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish.workspace = true
 
 [dependencies]
 agsh-core = { path = "../agsh-core" }

@@ -13,7 +13,7 @@ crates/
   agsh-render/   rich rendering: markdown, JSON, CSV, code, images
   agsh-style/    theme, palette, color levels, roles
   agsh-tty/      line editor, completion, history, syntax highlighting
-  agsh-agent/    agent protocol / server
+  agsh-agent/    bounded agent-protocol codec + session path model (server planned)
   agsh-broker/   keep broker: PTY-owning daemon, protocol, attach client
   agsh-store/    trace, history, and session-journal store
   agsh-index/    project / filesystem indexer
@@ -31,15 +31,22 @@ crates/
 4. **Execute** (`agsh-exec`): processes, pipes, and redirections with exact
    byte-for-byte stream semantics; optional `confine` capability sandbox.
 5. **Observe** (`agsh-output`): in a non-raw output mode, the raw stream is captured
-   and rendered into a compact observation, with the raw bytes recoverable via a
-   `trace://` reference.
+   and rendered into a compact observation. When persistence succeeds, a
+   `complete` private backing path contains exact bytes within the configured
+   cap; live sessions additionally address indexed streams as `trace://`.
+   Persistence failure, expiry, truncation, and disabled storage are explicit;
+   `agtrace` reads are themselves bounded.
 
 ## Design contract
 
 - Developers type normal commands; external commands execute normally.
 - Environment variables, pipes, and redirects behave normally and receive **exact
-  bytes** — rich rendering and native accelerations are always opt-in and TTY-gated.
-- Agents receive compact structured observations; raw output stays recoverable.
+  bytes**. Observation modes are opt-in for noninteractive use; automatic rich
+  rendering is additionally TTY-gated.
+- Supported foreground captures give agents compact structured observations;
+  parsed asynchronous graphs currently use the documented raw fallback.
+  Retained raw output is status-addressable and never mislabeled exact after
+  storage truncation.
 - The shell never silently rewrites standard commands (`ls`, `git`, `python`, …)
   into custom alternatives.
 
@@ -49,10 +56,12 @@ crates/
   The one exception is the optional `agsh-intercept` preload library (Tier 2 shell
   interception), which needs `execve`/`posix_spawn` FFI; it is isolated, opt-in, and
   not linked into the shell.
-- The parser/executor are fuzzed for panic-freedom; security behavior is
-  deterministic.
-- `confine` is fail-closed: it never runs a payload it cannot actually restrict
-  (see [`CONFINE.md`](CONFINE.md)).
+- Regression tests cover deeply nested parser/executor inputs that previously
+  risked stack exhaustion; security behavior is deterministic.
+- Kernel-backed `confine` presets are fail-closed: without a supported backend
+  they refuse. The explicitly requested `--best-effort` shim and sticky
+  allowlist are guardrails, not security boundaries (see
+  [`CONFINE.md`](CONFINE.md)).
 
 ## Testing
 

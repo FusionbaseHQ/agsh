@@ -17,12 +17,13 @@
 
 use crate::summary::{CommandContext, SemanticSummary};
 use crate::util::{clip, command_basename};
-use regex::Regex;
 
 /// Maximum characters kept for any single captured line.
 const MAX_LINE: usize = 200;
 /// Soft cap on entries collected into a single detail section.
 const MAX_DETAIL: usize = 50;
+
+static_regex!(DOCKER_STEP_RE, r"^Step (\d+)/(\d+)");
 
 /// Produce a semantic summary for a container / orchestration command.
 pub fn summarize(cx: &CommandContext) -> SemanticSummary {
@@ -72,14 +73,13 @@ fn docker(cx: &CommandContext) -> SemanticSummary {
 }
 
 fn docker_build(cx: &CommandContext, s: &mut SemanticSummary) {
-    let step_re = Regex::new(r"^Step (\d+)/(\d+)").unwrap();
     let mut steps = 0i64;
     let mut total_steps = 0i64;
     let mut layers = 0i64;
 
     for line in cx.all_lines() {
         let t = line.trim_start();
-        if let Some(caps) = step_re.captures(t) {
+        if let Some(caps) = DOCKER_STEP_RE.captures(t) {
             steps += 1;
             if let Ok(n) = caps[2].parse::<i64>() {
                 total_steps = total_steps.max(n);
@@ -269,8 +269,8 @@ fn kubectl_get(cx: &CommandContext, s: &mut SemanticSummary) {
         }
     }
 
-    let lines: Vec<&str> = cx.stdout.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.is_empty() {
+    let mut lines = cx.stdout.lines().filter(|line| !line.trim().is_empty());
+    let Some(first) = lines.next() else {
         s.set_count("resources", 0);
         let headline = if s.status == "ok" {
             "kubectl get: 0 resources".to_string()
@@ -279,30 +279,35 @@ fn kubectl_get(cx: &CommandContext, s: &mut SemanticSummary) {
         };
         s.set_headline(headline);
         return;
-    }
+    };
 
-    let header = lines[0];
-    let has_header = header.contains("NAME");
+    let has_header = first.contains("NAME");
     let status_idx = if has_header {
-        header.split_whitespace().position(|c| c == "STATUS")
+        first
+            .split_whitespace()
+            .position(|column| column == "STATUS")
     } else {
         None
     };
-    let data: &[&str] = if has_header { &lines[1..] } else { &lines[..] };
 
     let mut count = 0i64;
     let mut unhealthy = 0i64;
-    for row in data {
-        count += 1;
+    let mut inspect_row = |row: &str| {
+        count = count.saturating_add(1);
         if let Some(idx) = status_idx {
-            let cols: Vec<&str> = row.split_whitespace().collect();
-            if let Some(status) = cols.get(idx) {
+            if let Some(status) = row.split_whitespace().nth(idx) {
                 if !is_healthy_status(status) {
-                    unhealthy += 1;
+                    unhealthy = unhealthy.saturating_add(1);
                     add_warning_capped(s, clip(row, MAX_LINE));
                 }
             }
         }
+    };
+    if !has_header {
+        inspect_row(first);
+    }
+    for row in lines {
+        inspect_row(row);
     }
 
     s.set_count("resources", count);
@@ -334,14 +339,16 @@ fn kubectl_apply(cx: &CommandContext, s: &mut SemanticSummary, op: &str) {
         }
         // Lines look like `resource/name created`, optionally `(dry run)`; match
         // the verb token so trailing suffixes don't break counting.
-        let toks: Vec<&str> = t.split_whitespace().collect();
-        if toks.contains(&"created") {
+        let action = t
+            .split_whitespace()
+            .find(|token| matches!(*token, "created" | "configured" | "unchanged" | "deleted"));
+        if action == Some("created") {
             created += 1;
-        } else if toks.contains(&"configured") {
+        } else if action == Some("configured") {
             configured += 1;
-        } else if toks.contains(&"unchanged") {
+        } else if action == Some("unchanged") {
             unchanged += 1;
-        } else if toks.contains(&"deleted") {
+        } else if action == Some("deleted") {
             deleted += 1;
         }
     }
@@ -449,12 +456,12 @@ fn nonflag_args(argv: &[String]) -> Vec<&str> {
 /// Count non-empty rows in tabular output, dropping the header line when the
 /// first row contains the expected column marker.
 fn count_rows(stdout: &str, header_needle: &str) -> i64 {
-    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.is_empty() {
+    let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+    let Some(first) = lines.next() else {
         return 0;
-    }
-    let has_header = lines[0].contains(header_needle);
-    (lines.len() as i64 - i64::from(has_header)).max(0)
+    };
+    let initial = i64::from(!first.contains(header_needle));
+    lines.fold(initial, |count, _| count.saturating_add(1))
 }
 
 /// kubectl resource statuses that should not be flagged.

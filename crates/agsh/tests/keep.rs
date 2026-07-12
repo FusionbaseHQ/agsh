@@ -3,6 +3,7 @@
 //! the real `agsh` binary. Each test runs its own daemon on a private socket
 //! (no env races; nothing touches the developer's real broker).
 
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -41,6 +42,7 @@ impl Daemon {
         let dir = std::env::temp_dir().join(format!("agshb_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_agsh"))
             .arg("--broker-daemon")
             .env("AGSH_BROKER_DIR", &dir)
@@ -67,6 +69,7 @@ impl Daemon {
                     "PATH".into(),
                     std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
                 )],
+                opaque_env: Vec::new(),
                 rows: 24,
                 cols: 80,
                 kind: JobKind::Job,
@@ -122,6 +125,70 @@ fn broker_spawns_lists_logs_and_tracks_exit() {
     daemon.client.remove(&info.id).expect("remove");
     let jobs = daemon.client.list().expect("list");
     assert!(!jobs.iter().any(|j| j.id == info.id));
+}
+
+#[test]
+fn broker_rejects_a_missing_requested_cwd_without_spawning_a_job() {
+    if !broker_runtime_available() {
+        return;
+    }
+    let daemon = Daemon::start("missing-cwd");
+    let missing = daemon.dir.join("does-not-exist");
+
+    let error = daemon
+        .client
+        .spawn_job(SpawnSpec {
+            cmd: vec!["true".into()],
+            cwd: missing.display().to_string(),
+            env: vec![(
+                "PATH".into(),
+                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+            )],
+            opaque_env: Vec::new(),
+            rows: 24,
+            cols: 80,
+            kind: JobKind::Job,
+            title: "invalid cwd".into(),
+        })
+        .unwrap_err();
+
+    assert!(error.to_string().contains("spawn:"), "{error}");
+    assert!(daemon.client.list().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn broker_preserves_non_utf8_environment_values() {
+    if !broker_runtime_available() {
+        return;
+    }
+    let daemon = Daemon::start("opaque-env");
+    let info = daemon
+        .client
+        .spawn_job(SpawnSpec {
+            cmd: vec!["sh".into(), "-c".into(), "env".into()],
+            cwd: std::env::temp_dir().display().to_string(),
+            env: vec![(
+                "PATH".into(),
+                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+            )],
+            opaque_env: vec![(b"AGSH_KEEP_OPAQUE".to_vec(), vec![b'a', 0xff, b'z'])],
+            rows: 24,
+            cols: 80,
+            kind: JobKind::Job,
+            title: "opaque env".into(),
+        })
+        .expect("spawn opaque environment job");
+    assert_eq!(daemon.wait_exit(&info.id), 0);
+    let tail = daemon
+        .client
+        .tail(&info.id, 64 * 1024)
+        .expect("read opaque environment output");
+    assert!(
+        tail.windows(b"AGSH_KEEP_OPAQUE=a\xffz".len())
+            .any(|window| window == b"AGSH_KEEP_OPAQUE=a\xffz"),
+        "broker dropped or changed opaque environment bytes: {tail:?}"
+    );
 }
 
 #[test]

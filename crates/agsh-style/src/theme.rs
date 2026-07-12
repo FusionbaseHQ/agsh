@@ -4,12 +4,40 @@
 //! and degrades to the terminal's color level.
 
 use std::path::{Path, PathBuf};
+use std::{io::Read, io::Result};
 
 use serde::Deserialize;
 
 use crate::color::{Color, ColorLevel};
 use crate::icons::Icons;
 use crate::style::Style;
+
+const MAX_THEME_BYTES: usize = 256 * 1024;
+
+fn read_theme_file(path: &Path) -> Option<String> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .ok()?;
+    let file = std::fs::File::from(descriptor);
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_THEME_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let read: Result<usize> = file
+        .take((MAX_THEME_BYTES + 1) as u64)
+        .read_to_end(&mut bytes);
+    read.ok()?;
+    if bytes.len() > MAX_THEME_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
 
 /// A named role a piece of text can play in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,7 +288,7 @@ struct PaletteConfig {
 
 impl ThemeConfig {
     fn load() -> Option<ThemeConfig> {
-        let text = std::fs::read_to_string(theme_path()?).ok()?;
+        let text = read_theme_file(&theme_path()?)?;
         toml::from_str(&text).ok()
     }
 
@@ -300,6 +328,28 @@ fn theme_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temporary_file(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "agsh-style-{name}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
+
+    #[test]
+    fn theme_file_read_is_bounded() {
+        let path = temporary_file("oversized-theme");
+        std::fs::write(&path, vec![b'x'; MAX_THEME_BYTES + 1]).unwrap();
+        assert!(read_theme_file(&path).is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn theme_file_rejects_non_regular_files() {
+        assert!(read_theme_file(Path::new("/dev/zero")).is_none());
+    }
 
     #[test]
     fn plain_theme_paints_nothing() {

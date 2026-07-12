@@ -1,0 +1,3 @@
+# RUN: %agsh %s
+false
+# CHECKEXIT: 1

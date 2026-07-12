@@ -9,6 +9,7 @@ Each `tests/checks/*.agsh` file is an agsh script with embedded directives in
     # REQUIRES: <cond>    skip the file unless `sh -c <cond>` succeeds.
     # CHECK: <pattern>    expected stdout line (matched in order, 1:1).
     # CHECKERR: <pattern> expected stderr line (matched as an ordered subsequence).
+    # CHECKEXIT: <code>   expected process exit code (defaults to 0).
 
 Patterns are literal except for `{{regex}}` placeholders, which match as a
 regular expression (e.g. `{{\\d+}}`, `{{.*}}`).
@@ -20,6 +21,7 @@ Exit:   0 if every file passes, else 1.
 import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,7 +31,7 @@ _REPO = os.path.dirname(os.path.dirname(_HERE))
 AGSH = os.environ.get("AGSH", os.path.join(_REPO, "target", "debug", "agsh"))
 VERBOSE = os.environ.get("VERBOSE")
 
-DIRECTIVE = re.compile(r"^\s*#\s*(RUN|REQUIRES|CHECK|CHECKERR):\s?(.*)$")
+DIRECTIVE = re.compile(r"^\s*#\s*(RUN|REQUIRES|CHECK|CHECKERR|CHECKEXIT):\s?(.*)$")
 
 
 def pattern_to_regex(pat):
@@ -50,6 +52,7 @@ def parse(path):
     requires = []
     checks = []
     checkerrs = []
+    checkexit = 0
     with open(path) as f:
         for line in f:
             m = DIRECTIVE.match(line.rstrip("\n"))
@@ -64,7 +67,9 @@ def parse(path):
                 checks.append(rest)
             elif kind == "CHECKERR":
                 checkerrs.append(rest)
-    return run, requires, checks, checkerrs
+            elif kind == "CHECKEXIT":
+                checkexit = int(rest)
+    return run, requires, checks, checkerrs, checkexit
 
 
 def out_lines(text):
@@ -75,7 +80,7 @@ def out_lines(text):
 
 
 def run_file(path):
-    run, requires, checks, checkerrs = parse(path)
+    run, requires, checks, checkerrs, checkexit = parse(path)
     for cond in requires:
         if subprocess.run(["sh", "-c", cond], capture_output=True).returncode != 0:
             return ("skip", f"REQUIRES not met: {cond}")
@@ -84,11 +89,20 @@ def run_file(path):
     # Run in an isolated temp HOME so user config/history can't leak in.
     env = dict(os.environ)
     home = tempfile.mkdtemp(prefix="agsh-golden-")
+    for key in list(env):
+        if key.startswith("AGSH_") or key in {
+            "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+            "BASH_ENV", "ENV",
+        }:
+            env.pop(key, None)
     env.update(
         HOME=home,
         XDG_CONFIG_HOME=os.path.join(home, ".config"),
         XDG_DATA_HOME=os.path.join(home, ".local", "share"),
+        XDG_STATE_HOME=os.path.join(home, ".local", "state"),
         AGSH_HISTORY_FILE=os.path.join(home, "history.jsonl"),
+        AGSH_SESSION_DIR=os.path.join(home, "sessions"),
+        AGSH_BROKER_DIR=os.path.join(home, "broker"),
         LANG="C",
     )
     for noisy in ("TERM", "COLORTERM", "AGSH_OUTPUT_MODE", "AGSH_ICONS", "NO_COLOR"):
@@ -98,7 +112,16 @@ def run_file(path):
             ["sh", "-c", cmd], capture_output=True, text=True, env=env, timeout=20
         )
     except subprocess.TimeoutExpired:
+        shutil.rmtree(home, ignore_errors=True)
         return ("fail", "timeout")
+    shutil.rmtree(home, ignore_errors=True)
+
+    if p.returncode != checkexit:
+        return (
+            "fail",
+            f"exit code {p.returncode} != {checkexit} expected\n"
+            f"  stdout: {out_lines(p.stdout)}\n  stderr: {out_lines(p.stderr)}",
+        )
 
     got = out_lines(p.stdout)
     if [c for c in checks] != [] or got != []:
@@ -112,7 +135,8 @@ def run_file(path):
             if not pattern_to_regex(pat).match(line):
                 return ("fail", f"stdout mismatch:\n  expected: {pat!r}\n  got:      {line!r}")
 
-    # stderr: ordered subsequence (forgiving of incidental diagnostics).
+    # stderr is empty by default. Files that intentionally diagnose may specify
+    # CHECKERR lines, matched as an ordered subsequence.
     if checkerrs:
         err = out_lines(p.stderr)
         idx = 0
@@ -123,6 +147,8 @@ def run_file(path):
             if idx >= len(err):
                 return ("fail", f"stderr missing match for {pat!r}\n  stderr: {err}")
             idx += 1
+    elif p.stderr:
+        return ("fail", f"unexpected stderr: {out_lines(p.stderr)}")
     return ("pass", "")
 
 

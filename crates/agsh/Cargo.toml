@@ -3,6 +3,14 @@ name = "agsh"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 agsh-broker = { path = "../agsh-broker" }
@@ -11,6 +19,7 @@ agsh-exec = { path = "../agsh-exec" }
 agsh-output = { path = "../agsh-output" }
 agsh-policy = { path = "../agsh-policy" }
 agsh-tty = { path = "../agsh-tty" }
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
 agsh-broker = { path = "../agsh-broker" }

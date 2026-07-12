@@ -16,8 +16,10 @@ Run the full local check suite — CI runs the same on Linux and macOS:
 
 ```sh
 cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+scripts/validate-release.sh
+tests/install/run.sh
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 
 # Behavioral suites:
 python3 tests/checks/run.py tests/checks/*.agsh   # golden output checks

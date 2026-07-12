@@ -18,6 +18,11 @@
 //!   the reference), a cleaner replacement for rtk's temp-file tee.
 //! - A safe fallback never returns empty when the input was non-empty.
 
+use std::collections::VecDeque;
+
+const MAX_RETAINED_LINES: usize = 1_024;
+const MAX_RETAINED_LINE_CHARS: usize = 4 * 1_024;
+
 /// Options controlling generic line reduction.
 #[derive(Debug, Clone)]
 pub struct ReduceOptions {
@@ -69,106 +74,178 @@ pub struct Reduced {
 /// Reduce `text` line-by-line per `opts`. Never returns empty for non-empty
 /// input (safe filter→raw fallback).
 pub fn reduce(text: &str, opts: &ReduceOptions) -> Reduced {
-    let original_count = text.lines().count();
+    let mut original_count = 0usize;
+    let (capacity, head, tail) = retained_limits(opts);
+    let mut window = ReducedWindow::new(capacity, head, tail);
+    let mut pending_blank = false;
+    let mut seen_content = false;
+    let mut run_line: Option<String> = None;
+    let mut run_count = 0usize;
 
-    // Stage 1: per-line transforms (CR-collapse, ANSI strip, noise drop, clip).
-    let mut lines: Vec<String> = Vec::new();
     for raw in text.lines() {
-        let mut line = raw.to_string();
-        if opts.collapse_cr {
-            if let Some(idx) = line.rfind('\r') {
-                line = line[idx + 1..].to_string();
-            }
-        }
+        original_count = original_count.saturating_add(1);
+        let raw = if opts.collapse_cr {
+            raw.rsplit('\r').next().unwrap_or(raw)
+        } else {
+            raw
+        };
+        let mut line = clip(raw, MAX_RETAINED_LINE_CHARS);
         if opts.strip_ansi {
             line = strip_ansi(&line);
         }
         if opts.drop_noise && is_noise_line(&line) {
             continue;
         }
-        if let Some(limit) = opts.truncate_line {
-            line = clip(&line, limit);
-        }
-        lines.push(line);
-    }
+        let truncate = opts
+            .truncate_line
+            .unwrap_or(MAX_RETAINED_LINE_CHARS)
+            .min(MAX_RETAINED_LINE_CHARS);
+        line = clip(&line, truncate);
 
-    // Stage 2: collapse blank runs.
-    if opts.collapse_blanks {
-        let mut collapsed: Vec<String> = Vec::with_capacity(lines.len());
-        let mut prev_blank = false;
-        for line in lines {
-            let blank = line.trim().is_empty();
-            if blank && prev_blank {
-                continue;
-            }
-            prev_blank = blank;
-            collapsed.push(line);
+        if opts.collapse_blanks && line.trim().is_empty() {
+            pending_blank |= seen_content;
+            continue;
         }
-        // Trim leading/trailing blank lines.
-        while collapsed.first().is_some_and(|l| l.trim().is_empty()) {
-            collapsed.remove(0);
+        if pending_blank {
+            push_reduced_line(
+                String::new(),
+                opts.dedup_consecutive,
+                &mut window,
+                &mut run_line,
+                &mut run_count,
+            );
+            pending_blank = false;
         }
-        while collapsed.last().is_some_and(|l| l.trim().is_empty()) {
-            collapsed.pop();
-        }
-        lines = collapsed;
+        seen_content |= !line.trim().is_empty();
+        push_reduced_line(
+            line,
+            opts.dedup_consecutive,
+            &mut window,
+            &mut run_line,
+            &mut run_count,
+        );
     }
-
-    // Stage 3: collapse consecutive duplicate lines to `line  (×N)`.
-    if opts.dedup_consecutive {
-        let mut deduped: Vec<String> = Vec::with_capacity(lines.len());
-        let mut run_count: usize = 0;
-        let mut run_line: Option<String> = None;
-        let flush = |out: &mut Vec<String>, line: &Option<String>, count: usize| {
-            if let Some(l) = line {
-                if count > 1 {
-                    out.push(format!("{l}  (×{count})"));
-                } else {
-                    out.push(l.clone());
-                }
-            }
-        };
-        for line in lines {
-            if run_line.as_deref() == Some(line.as_str()) {
-                run_count += 1;
-            } else {
-                flush(&mut deduped, &run_line, run_count);
-                run_line = Some(line);
-                run_count = 1;
-            }
-        }
-        flush(&mut deduped, &run_line, run_count);
-        lines = deduped;
-    }
-
-    // Stage 4: head/tail window when over the cap.
-    if lines.len() > opts.max_lines && opts.max_lines > 0 {
-        let head = opts.head.min(lines.len());
-        let tail = opts.tail.min(lines.len().saturating_sub(head));
-        if head + tail < lines.len() {
-            let omitted = lines.len() - head - tail;
-            let mut windowed: Vec<String> = Vec::with_capacity(head + tail + 1);
-            windowed.extend(lines[..head].iter().cloned());
-            windowed.push(format!("… ({omitted} lines omitted) …"));
-            windowed.extend(lines[lines.len() - tail..].iter().cloned());
-            lines = windowed;
-        } else {
-            lines.truncate(opts.max_lines);
-        }
-    }
+    flush_run(&mut window, &mut run_line, &mut run_count);
+    let mut lines = window.finish();
 
     // Safe fallback: never produce empty output from non-empty input.
     if lines.is_empty() && original_count > 0 {
         lines = text
             .lines()
-            .take(opts.max_lines.max(1))
-            .map(str::to_string)
+            .take(capacity)
+            .map(|line| clip(line, MAX_RETAINED_LINE_CHARS))
             .collect();
     }
 
     let kept_real = lines.iter().filter(|l| !l.starts_with("… (")).count();
     let dropped = original_count.saturating_sub(kept_real);
     Reduced { lines, dropped }
+}
+
+fn push_reduced_line(
+    line: String,
+    dedup: bool,
+    window: &mut ReducedWindow,
+    run_line: &mut Option<String>,
+    run_count: &mut usize,
+) {
+    if !dedup {
+        window.push(line);
+        return;
+    }
+    if run_line.as_deref() == Some(line.as_str()) {
+        *run_count = run_count.saturating_add(1);
+    } else {
+        flush_run(window, run_line, run_count);
+        *run_line = Some(line);
+        *run_count = 1;
+    }
+}
+
+fn flush_run(window: &mut ReducedWindow, run_line: &mut Option<String>, run_count: &mut usize) {
+    if let Some(line) = run_line.take() {
+        let line = if *run_count > 1 {
+            clip(
+                &format!("{line}  (×{})", *run_count),
+                MAX_RETAINED_LINE_CHARS,
+            )
+        } else {
+            line
+        };
+        window.push(line);
+    }
+    *run_count = 0;
+}
+
+fn retained_limits(opts: &ReduceOptions) -> (usize, usize, usize) {
+    let capacity = if opts.max_lines == 0 || opts.max_lines == usize::MAX {
+        MAX_RETAINED_LINES
+    } else {
+        opts.max_lines.min(MAX_RETAINED_LINES)
+    }
+    .max(1);
+    let mut head = opts.head.min(capacity);
+    let tail = opts.tail.min(capacity.saturating_sub(head));
+    if head == 0 && tail == 0 {
+        head = capacity;
+    }
+    (capacity, head, tail)
+}
+
+struct ReducedWindow {
+    capacity: usize,
+    head: usize,
+    tail_capacity: usize,
+    total: usize,
+    prefix: Vec<String>,
+    tail: VecDeque<String>,
+}
+
+impl ReducedWindow {
+    fn new(capacity: usize, head: usize, tail_capacity: usize) -> Self {
+        Self {
+            capacity,
+            head,
+            tail_capacity,
+            total: 0,
+            prefix: Vec::with_capacity(capacity),
+            tail: VecDeque::with_capacity(tail_capacity),
+        }
+    }
+
+    fn push(&mut self, line: String) {
+        self.total = self.total.saturating_add(1);
+        if self.prefix.len() < self.capacity {
+            if self.tail_capacity == 0 {
+                self.prefix.push(line);
+                return;
+            }
+            self.prefix.push(line.clone());
+        }
+        if self.tail_capacity > 0 {
+            if self.tail.len() == self.tail_capacity {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(line);
+        }
+    }
+
+    fn finish(self) -> Vec<String> {
+        if self.total <= self.capacity {
+            return self.prefix;
+        }
+        let head = self.head.min(self.prefix.len());
+        let tail = self.tail_capacity.min(self.tail.len());
+        let omitted = self.total.saturating_sub(head).saturating_sub(tail);
+        let mut lines = Vec::with_capacity(head + tail + usize::from(omitted > 0));
+        lines.extend(self.prefix.into_iter().take(head));
+        if omitted > 0 {
+            lines.push(format!("… ({omitted} lines omitted) …"));
+        }
+        let skip = self.tail.len().saturating_sub(tail);
+        lines.extend(self.tail.into_iter().skip(skip));
+        lines
+    }
 }
 
 /// Strip ANSI escape sequences (CSI `ESC [ … letter` and OSC `ESC ] … BEL/ST`).
@@ -362,5 +439,33 @@ mod tests {
             r.lines,
             vec!["a".to_string(), String::new(), "b".to_string()]
         );
+    }
+
+    #[test]
+    fn unlimited_options_still_have_a_hard_retention_bound() {
+        let opts = ReduceOptions {
+            max_lines: usize::MAX,
+            head: usize::MAX,
+            tail: usize::MAX,
+            dedup_consecutive: false,
+            ..Default::default()
+        };
+        let input = (0..MAX_RETAINED_LINES + 1_000)
+            .map(|i| format!("line-{i}\n"))
+            .collect::<String>();
+        let reduced = reduce(&input, &opts);
+        assert!(reduced.lines.len() <= MAX_RETAINED_LINES + 1);
+        assert!(reduced.lines.iter().any(|line| line.contains("omitted")));
+    }
+
+    #[test]
+    fn absent_line_truncation_still_has_a_hard_width_bound() {
+        let opts = ReduceOptions {
+            truncate_line: None,
+            ..Default::default()
+        };
+        let reduced = reduce(&"x".repeat(MAX_RETAINED_LINE_CHARS * 4), &opts);
+        assert_eq!(reduced.lines.len(), 1);
+        assert!(reduced.lines[0].chars().count() <= MAX_RETAINED_LINE_CHARS);
     }
 }

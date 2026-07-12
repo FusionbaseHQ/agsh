@@ -1,9 +1,12 @@
 #!/usr/bin/env sh
 set -eu
+scripts/validate-release.sh
+tests/release/run.sh
+tests/install/run.sh
 cargo fmt --all -- --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --locked
 echo "== golden checks =="
 python3 tests/checks/run.py
 echo "== differential (vs ${REF:-bash}) =="

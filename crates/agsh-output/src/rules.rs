@@ -5,25 +5,251 @@
 //! - `group`  — collapse matching lines into a `group_name` count.
 //! - `keep_tail` — keep the last `lines` lines of output.
 
+use std::collections::VecDeque;
+use std::sync::{Arc, LazyLock, Mutex};
+
 use regex::{Regex, RegexSet};
 
 use crate::config::{CompactorRuleSet, RuleSpec};
-use crate::reduce::{reduce, ReduceOptions};
+use crate::redact::{
+    compile_config_regex, compile_config_regex_set, MAX_CONFIG_REGEX_BYTES, MAX_CONFIG_REGEX_COUNT,
+};
+use crate::reduce::strip_ansi;
 use crate::summary::{CommandContext, SemanticSummary};
 use crate::util::clip;
 
 const MAX_LINE: usize = 200;
+const MAX_RULE_ACTIONS: usize = 64;
+const MAX_RULE_DETAILS: usize = 50;
+const MAX_TOTAL_REGEX_BYTES: usize = 128 * 1024;
+const MAX_RULESET_CACHE_ENTRIES: usize = 4;
+const MAX_REPLACEMENT_BYTES: usize = 256;
+const MAX_REPLACEMENTS_PER_LINE: usize = 128;
+const MAX_INTERMEDIATE_LINE_CHARS: usize = 16 * 1024;
+const MAX_REDUCED_LINE_CHARS: usize = 4 * 1024;
+const MAX_REDUCED_BODY_LINES: usize = 512;
+
+static RULESET_CACHE: LazyLock<Mutex<RuleProgramCache>> =
+    LazyLock::new(|| Mutex::new(RuleProgramCache::default()));
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuleProgramKey {
+    line_rules: Vec<Option<String>>,
+    match_output: Vec<Option<(String, Option<String>)>>,
+    replacers: Vec<Option<String>>,
+    strip_lines: Vec<String>,
+    keep_lines: Vec<String>,
+}
+
+impl RuleProgramKey {
+    fn new(ruleset: &CompactorRuleSet) -> Self {
+        let mut budget = PatternBudget::default();
+        let line_rules = ruleset
+            .rule
+            .iter()
+            .take(MAX_RULE_ACTIONS)
+            .map(|rule| {
+                if !matches!(rule.action.as_str(), "keep" | "group") {
+                    return None;
+                }
+                let pattern = rule.match_spec.line_regex.as_ref()?;
+                budget
+                    .reserve(std::slice::from_ref(&pattern.as_str()))
+                    .then(|| pattern.clone())
+            })
+            .collect();
+
+        let match_output = ruleset
+            .match_output
+            .iter()
+            .take(MAX_RULE_ACTIONS)
+            .map(|rule| {
+                let accepted = match rule.unless.as_deref() {
+                    Some(unless) => budget.reserve(&[rule.pattern.as_str(), unless]),
+                    None => budget.reserve(&[rule.pattern.as_str()]),
+                };
+                accepted.then(|| (rule.pattern.clone(), rule.unless.clone()))
+            })
+            .collect();
+
+        let replacers = ruleset
+            .replace
+            .iter()
+            .take(MAX_RULE_ACTIONS)
+            .map(|rule| {
+                (rule.replacement.len() <= MAX_REPLACEMENT_BYTES
+                    && budget.reserve(std::slice::from_ref(&rule.pattern.as_str())))
+                .then(|| rule.pattern.clone())
+            })
+            .collect();
+
+        let strip_lines = ruleset
+            .strip_lines
+            .iter()
+            .filter(|pattern| budget.reserve(std::slice::from_ref(&pattern.as_str())))
+            .cloned()
+            .collect();
+        let keep_lines = ruleset
+            .keep_lines
+            .iter()
+            .filter(|pattern| budget.reserve(std::slice::from_ref(&pattern.as_str())))
+            .cloned()
+            .collect();
+
+        Self {
+            line_rules,
+            match_output,
+            replacers,
+            strip_lines,
+            keep_lines,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PatternBudget {
+    count: usize,
+    bytes: usize,
+}
+
+impl PatternBudget {
+    /// Reserve a group atomically. In particular, a `match_output` pattern is
+    /// never enabled when its `unless` error guard could not also be compiled.
+    fn reserve(&mut self, patterns: &[&str]) -> bool {
+        let Some(bytes) = patterns
+            .iter()
+            .try_fold(0usize, |total, pattern| total.checked_add(pattern.len()))
+        else {
+            return false;
+        };
+        if patterns
+            .iter()
+            .any(|pattern| pattern.len() > MAX_CONFIG_REGEX_BYTES)
+            || self.count.saturating_add(patterns.len()) > MAX_CONFIG_REGEX_COUNT
+            || self.bytes.saturating_add(bytes) > MAX_TOTAL_REGEX_BYTES
+        {
+            return false;
+        }
+        self.count += patterns.len();
+        self.bytes += bytes;
+        true
+    }
+}
+
+struct CompiledMatchOutput {
+    pattern: Regex,
+    unless: Option<Regex>,
+}
+
+struct CompiledRuleProgram {
+    line_rules: Vec<Option<Regex>>,
+    match_output: Vec<Option<CompiledMatchOutput>>,
+    replacers: Vec<Option<Regex>>,
+    strip_lines: Option<RegexSet>,
+    keep_lines: Option<RegexSet>,
+}
+
+impl CompiledRuleProgram {
+    fn new(key: &RuleProgramKey) -> Self {
+        let line_rules = key
+            .line_rules
+            .iter()
+            .map(|pattern| pattern.as_deref().and_then(compile_config_regex))
+            .collect();
+        let match_output = key
+            .match_output
+            .iter()
+            .map(|entry| {
+                let (pattern, unless) = entry.as_ref()?;
+                let pattern = compile_config_regex(pattern)?;
+                let unless = match unless {
+                    Some(unless) => Some(compile_config_regex(unless)?),
+                    None => None,
+                };
+                Some(CompiledMatchOutput { pattern, unless })
+            })
+            .collect();
+        let replacers = key
+            .replacers
+            .iter()
+            .map(|pattern| pattern.as_deref().and_then(compile_config_regex))
+            .collect();
+        Self {
+            line_rules,
+            match_output,
+            replacers,
+            strip_lines: compile_config_regex_set(&key.strip_lines),
+            keep_lines: compile_config_regex_set(&key.keep_lines),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RuleProgramCache {
+    entries: VecDeque<(RuleProgramKey, Arc<CompiledRuleProgram>)>,
+}
+
+impl RuleProgramCache {
+    fn get(&mut self, key: &RuleProgramKey) -> Option<Arc<CompiledRuleProgram>> {
+        let position = self.entries.iter().position(|(cached, _)| cached == key)?;
+        let entry = self.entries.remove(position)?;
+        let compiled = Arc::clone(&entry.1);
+        self.entries.push_back(entry);
+        Some(compiled)
+    }
+
+    fn insert(
+        &mut self,
+        key: RuleProgramKey,
+        compiled: Arc<CompiledRuleProgram>,
+    ) -> Arc<CompiledRuleProgram> {
+        if let Some(existing) = self.get(&key) {
+            return existing;
+        }
+        if self.entries.len() == MAX_RULESET_CACHE_ENTRIES {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, Arc::clone(&compiled)));
+        compiled
+    }
+}
+
+fn compiled_program(ruleset: &CompactorRuleSet) -> Arc<CompiledRuleProgram> {
+    let key = RuleProgramKey::new(ruleset);
+    if let Ok(mut cache) = RULESET_CACHE.lock() {
+        if let Some(compiled) = cache.get(&key) {
+            return compiled;
+        }
+    }
+
+    // Compile outside the global cache lock. A first-use custom grammar may be
+    // moderately expensive even under the hard regex limits; unrelated output
+    // rendering should not wait for it.
+    let compiled = Arc::new(CompiledRuleProgram::new(&key));
+    match RULESET_CACHE.lock() {
+        Ok(mut cache) => cache.insert(key, compiled),
+        Err(_) => compiled,
+    }
+}
 
 /// Build a semantic summary by applying a compactor's rules to the output.
 pub fn apply_compactor(ruleset: &CompactorRuleSet, cx: &CommandContext) -> SemanticSummary {
     let mut summary = SemanticSummary::new(cx, &ruleset.name);
-    let lines: Vec<&str> = cx.all_lines().collect();
+    let compiled = compiled_program(ruleset);
 
-    for rule in &ruleset.rule {
+    for (index, rule) in ruleset.rule.iter().take(MAX_RULE_ACTIONS).enumerate() {
         match rule.action.as_str() {
-            "keep" => apply_keep(rule, &lines, &mut summary),
-            "group" => apply_group(rule, &lines, &mut summary),
-            "keep_tail" => apply_keep_tail(rule, &lines, &mut summary),
+            "keep" => {
+                if let Some(regex) = compiled.line_rules.get(index).and_then(Option::as_ref) {
+                    apply_keep(rule, regex, cx, &mut summary);
+                }
+            }
+            "group" => {
+                if let Some(regex) = compiled.line_rules.get(index).and_then(Option::as_ref) {
+                    apply_group(rule, regex, cx, &mut summary);
+                }
+            }
+            "keep_tail" => apply_keep_tail(rule, cx, &mut summary),
             _ => {}
         }
     }
@@ -36,7 +262,7 @@ pub fn apply_compactor(ruleset: &CompactorRuleSet, cx: &CommandContext) -> Seman
 
     // Declarative line reduction (rtk-style): produce a reduced body.
     if ruleset.has_reduce() {
-        if let Some(empty_msg) = apply_declarative_reduce(ruleset, cx, &mut summary) {
+        if let Some(empty_msg) = apply_declarative_reduce(ruleset, &compiled, cx, &mut summary) {
             headline = empty_msg;
         }
     }
@@ -50,158 +276,277 @@ pub fn apply_compactor(ruleset: &CompactorRuleSet, cx: &CommandContext) -> Seman
 /// Returns `Some(on_empty headline)` if the result is empty and `on_empty` is set.
 fn apply_declarative_reduce(
     ruleset: &CompactorRuleSet,
+    compiled: &CompiledRuleProgram,
     cx: &CommandContext,
     summary: &mut SemanticSummary,
 ) -> Option<String> {
-    // `filter_stderr` merges stderr into the reducer input; otherwise prefer
-    // stdout (falling back to stderr when stdout is empty).
-    let merged;
-    let source: &str = if ruleset.filter_stderr {
-        merged = format!("{}\n{}", cx.stdout, cx.stderr);
-        &merged
-    } else if cx.stdout.trim().is_empty() {
+    // Treat both streams as reducer input without concatenating another copy of
+    // potentially multi-megabyte observations. Regexes still see multiline
+    // content within each stream; only a match spanning the artificial stream
+    // boundary is intentionally unsupported.
+    let both = [cx.stdout, cx.stderr];
+    let primary = [if cx.stdout.trim().is_empty() {
         cx.stderr
     } else {
         cx.stdout
+    }];
+    let sources: &[&str] = if ruleset.filter_stderr {
+        &both
+    } else {
+        &primary
     };
 
     // Stage 0: match_output short-circuit — collapse the whole output to a
     // message when matched, unless an error guard also matches.
-    for rule in &ruleset.match_output {
-        let Ok(re) = Regex::new(&rule.pattern) else {
+    for (index, rule) in ruleset
+        .match_output
+        .iter()
+        .take(MAX_RULE_ACTIONS)
+        .enumerate()
+    {
+        let Some(entry) = compiled.match_output.get(index).and_then(Option::as_ref) else {
             continue;
         };
-        if !re.is_match(source) {
+        if !sources.iter().any(|source| entry.pattern.is_match(source)) {
             continue;
         }
-        let guarded = rule
+        let guarded = entry
             .unless
-            .as_deref()
-            .and_then(|u| Regex::new(u).ok())
-            .is_some_and(|g| g.is_match(source));
+            .as_ref()
+            .is_some_and(|guard| sources.iter().any(|source| guard.is_match(source)));
         if !guarded {
             return Some(rule.message.clone());
         }
     }
 
-    // Stage A: per-line regex substitutions, in order.
-    let replacers: Vec<(Regex, &str)> = ruleset
-        .replace
-        .iter()
-        .filter_map(|r| {
-            Regex::new(&r.pattern)
-                .ok()
-                .map(|re| (re, r.replacement.as_str()))
-        })
-        .collect();
-    let mut text_lines: Vec<String> = source
-        .lines()
-        .map(|line| {
-            let mut s = line.to_string();
-            for (re, repl) in &replacers {
-                s = re.replace_all(&s, *repl).into_owned();
+    let (capacity, overflow_head, overflow_tail) = window_limits(ruleset);
+    let mut window = LineWindow::new(capacity, overflow_head, overflow_tail);
+    let mut original_lines = 0usize;
+    let mut seen_content = false;
+    let mut pending_blank = false;
+
+    for source in sources {
+        for raw_line in source.lines() {
+            original_lines = original_lines.saturating_add(1);
+            let Some(line) = transform_line(ruleset, compiled, raw_line) else {
+                continue;
+            };
+
+            // Collapse blank runs while streaming. Delaying the blank until a
+            // following content line also removes leading/trailing blanks
+            // without ever retaining the whole input.
+            if line.trim().is_empty() {
+                pending_blank |= seen_content;
+                continue;
             }
-            s
-        })
-        .collect();
-
-    // Stage B: strip_lines (drop matching), then keep_lines (keep only matching).
-    if let Ok(strip) = RegexSet::new(&ruleset.strip_lines) {
-        if !ruleset.strip_lines.is_empty() {
-            text_lines.retain(|l| !strip.is_match(l));
-        }
-    }
-    if let Ok(keep) = RegexSet::new(&ruleset.keep_lines) {
-        if !ruleset.keep_lines.is_empty() {
-            text_lines.retain(|l| keep.is_match(l));
+            if pending_blank {
+                window.push(String::new());
+                pending_blank = false;
+            }
+            seen_content = true;
+            window.push(line);
         }
     }
 
-    // Stage C: generic reduce with the declared knobs (no auto noise-drop/dedup —
-    // the user controls filtering explicitly here).
-    let (head, tail) = match (ruleset.head_lines, ruleset.tail_lines) {
-        (None, None) => (ruleset.max_lines.unwrap_or(0), 0),
-        (h, t) => (h.unwrap_or(0), t.unwrap_or(0)),
-    };
-    let max_lines = ruleset.max_lines.unwrap_or(head + tail);
-    let opts = ReduceOptions {
-        strip_ansi: ruleset.strip_ansi.unwrap_or(true),
-        collapse_blanks: true,
-        dedup_consecutive: false,
-        collapse_cr: true,
-        drop_noise: false,
-        truncate_line: ruleset.truncate_lines_at,
-        head,
-        tail,
-        max_lines: if max_lines == 0 {
-            usize::MAX
-        } else {
-            max_lines
-        },
-    };
-    let reduced = reduce(&text_lines.join("\n"), &opts);
-
-    if reduced.lines.is_empty() {
+    let reduced = window.finish();
+    if reduced.is_empty() {
         return ruleset.on_empty.clone();
     }
     // Count everything removed (strip + window), relative to the original output.
-    let kept_real = reduced
-        .lines
-        .iter()
-        .filter(|l| !l.starts_with("… ("))
-        .count();
-    let dropped = source.lines().count().saturating_sub(kept_real);
+    let kept_real = reduced.iter().filter(|l| !l.starts_with("… (")).count();
+    let dropped = original_lines.saturating_sub(kept_real);
     if dropped > 0 {
-        summary.set_count("reduced_out", dropped as i64);
+        summary.set_count("reduced_out", i64::try_from(dropped).unwrap_or(i64::MAX));
     }
-    summary.set_body(reduced.lines);
+    summary.set_body(reduced);
     None
 }
 
-fn apply_keep(rule: &RuleSpec, lines: &[&str], summary: &mut SemanticSummary) {
-    let Some(re) = compiled(rule) else { return };
-    let limit = parse_limit(rule.limit.as_deref());
+fn transform_line(
+    ruleset: &CompactorRuleSet,
+    compiled: &CompiledRuleProgram,
+    raw_line: &str,
+) -> Option<String> {
+    // Cap before substitution so `$0$0...` replacements cannot amplify one
+    // enormous captured line into an equally enormous temporary allocation.
+    let mut line = clip(raw_line, MAX_INTERMEDIATE_LINE_CHARS);
+    for (index, rule) in ruleset.replace.iter().take(MAX_RULE_ACTIONS).enumerate() {
+        let Some(regex) = compiled.replacers.get(index).and_then(Option::as_ref) else {
+            continue;
+        };
+        line = regex
+            .replacen(&line, MAX_REPLACEMENTS_PER_LINE, rule.replacement.as_str())
+            .into_owned();
+        line = clip(&line, MAX_INTERMEDIATE_LINE_CHARS);
+    }
+
+    if compiled
+        .strip_lines
+        .as_ref()
+        .is_some_and(|set| set.is_match(&line))
+    {
+        return None;
+    }
+    if compiled
+        .keep_lines
+        .as_ref()
+        .is_some_and(|set| !set.is_match(&line))
+    {
+        return None;
+    }
+
+    if let Some(last) = line.rsplit('\r').next() {
+        if last.len() != line.len() {
+            line = last.to_string();
+        }
+    }
+    if ruleset.strip_ansi.unwrap_or(true) {
+        line = strip_ansi(&line);
+    }
+    let truncate_at = ruleset
+        .truncate_lines_at
+        .unwrap_or(MAX_REDUCED_LINE_CHARS)
+        .min(MAX_REDUCED_LINE_CHARS);
+    Some(clip(&line, truncate_at))
+}
+
+fn window_limits(ruleset: &CompactorRuleSet) -> (usize, usize, usize) {
+    let has_window = ruleset.head_lines.is_some() || ruleset.tail_lines.is_some();
+    let requested = ruleset.max_lines.unwrap_or_else(|| {
+        if has_window {
+            ruleset
+                .head_lines
+                .unwrap_or(0)
+                .saturating_add(ruleset.tail_lines.unwrap_or(0))
+        } else {
+            0
+        }
+    });
+    if requested == 0 {
+        return (MAX_REDUCED_BODY_LINES, MAX_REDUCED_BODY_LINES, 0);
+    }
+
+    let capacity = requested.min(MAX_REDUCED_BODY_LINES);
+    if !has_window {
+        return (capacity, capacity, 0);
+    }
+    let head = ruleset.head_lines.unwrap_or(0).min(capacity);
+    let tail = ruleset
+        .tail_lines
+        .unwrap_or(0)
+        .min(capacity.saturating_sub(head));
+    (capacity, head, tail)
+}
+
+struct LineWindow {
+    capacity: usize,
+    overflow_head: usize,
+    overflow_tail: usize,
+    total: usize,
+    prefix: Vec<String>,
+    tail: VecDeque<String>,
+}
+
+impl LineWindow {
+    fn new(capacity: usize, overflow_head: usize, overflow_tail: usize) -> Self {
+        Self {
+            capacity,
+            overflow_head,
+            overflow_tail,
+            total: 0,
+            prefix: Vec::with_capacity(capacity),
+            tail: VecDeque::with_capacity(overflow_tail),
+        }
+    }
+
+    fn push(&mut self, line: String) {
+        self.total = self.total.saturating_add(1);
+        if self.prefix.len() < self.capacity {
+            if self.overflow_tail == 0 {
+                self.prefix.push(line);
+                return;
+            }
+            self.prefix.push(line.clone());
+        }
+        if self.overflow_tail > 0 {
+            if self.tail.len() == self.overflow_tail {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(line);
+        }
+    }
+
+    fn finish(self) -> Vec<String> {
+        if self.total <= self.capacity {
+            return self.prefix;
+        }
+
+        let head = self.overflow_head.min(self.prefix.len());
+        let tail = self.overflow_tail.min(self.tail.len());
+        let omitted = self.total.saturating_sub(head).saturating_sub(tail);
+        let mut lines = Vec::with_capacity(head + tail + usize::from(omitted > 0));
+        lines.extend(self.prefix.into_iter().take(head));
+        if omitted > 0 {
+            lines.push(format!("… ({omitted} lines omitted) …"));
+        }
+        let tail_skip = self.tail.len().saturating_sub(tail);
+        lines.extend(self.tail.into_iter().skip(tail_skip));
+        lines
+    }
+}
+
+fn apply_keep(rule: &RuleSpec, regex: &Regex, cx: &CommandContext, summary: &mut SemanticSummary) {
+    let limit = parse_limit(rule.limit.as_deref()).min(MAX_RULE_DETAILS);
     let errorish = rule_targets_errors(rule);
     let mut kept = 0usize;
-    for line in lines {
+    for line in cx.all_lines() {
         if kept >= limit {
             break;
         }
-        if re.is_match(line) {
+        if regex.is_match(line) {
             if errorish {
-                summary.add_failure(clip(line, MAX_LINE));
+                if summary.failures.len() < MAX_RULE_DETAILS {
+                    summary.add_failure(clip(line, MAX_LINE));
+                }
             } else {
-                summary.add_note(clip(line, MAX_LINE));
+                if summary.notes.len() < MAX_RULE_DETAILS {
+                    summary.add_note(clip(line, MAX_LINE));
+                }
             }
             kept += 1;
         }
     }
 }
 
-fn apply_group(rule: &RuleSpec, lines: &[&str], summary: &mut SemanticSummary) {
-    let Some(re) = compiled(rule) else { return };
-    let count = lines.iter().filter(|l| re.is_match(l)).count();
+fn apply_group(rule: &RuleSpec, regex: &Regex, cx: &CommandContext, summary: &mut SemanticSummary) {
+    let count = cx
+        .all_lines()
+        .filter(|line| regex.is_match(line))
+        .fold(0i64, |count, _| count.saturating_add(1));
     if count > 0 {
         let name = rule.group_name.clone().unwrap_or_else(|| rule.name.clone());
-        summary.set_count(&name, count as i64);
+        summary.set_count(&name, count);
     }
 }
 
-fn apply_keep_tail(rule: &RuleSpec, lines: &[&str], summary: &mut SemanticSummary) {
-    let n = rule.lines.unwrap_or(80);
-    let start = lines.len().saturating_sub(n);
-    for line in &lines[start..] {
+fn apply_keep_tail(rule: &RuleSpec, cx: &CommandContext, summary: &mut SemanticSummary) {
+    let n = rule.lines.unwrap_or(80).min(MAX_RULE_DETAILS);
+    let mut tail = VecDeque::with_capacity(n);
+    for line in cx.all_lines() {
         if !line.trim().is_empty() {
+            if tail.len() == n {
+                tail.pop_front();
+            }
+            if n > 0 {
+                tail.push_back(line);
+            }
+        }
+    }
+    for line in tail {
+        if summary.notes.len() < MAX_RULE_DETAILS {
             summary.add_note(clip(line, MAX_LINE));
         }
     }
-}
-
-fn compiled(rule: &RuleSpec) -> Option<Regex> {
-    rule.match_spec
-        .line_regex
-        .as_deref()
-        .and_then(|p| Regex::new(p).ok())
 }
 
 fn parse_limit(limit: Option<&str>) -> usize {
@@ -366,5 +711,179 @@ match_output = [{ pattern = "total size is", message = "ok (synced)", unless = "
         assert!(s.failures.iter().any(|f| f.contains("ERROR: x failed")));
         assert_eq!(s.counts.get("progress"), Some(&2));
         assert!(s.notes.iter().any(|n| n.contains("final line")));
+    }
+
+    #[test]
+    fn simple_rule_details_are_bounded_while_group_counts_remain_exact() {
+        let toml = r#"
+[[compactor]]
+name = "bounded"
+match.argv = ["bounded"]
+
+[[compactor.rule]]
+name = "keep-errors"
+match.line_regex = "^ERROR"
+action = "keep"
+limit = "all"
+
+[[compactor.rule]]
+name = "count-errors"
+match.line_regex = "^ERROR"
+action = "group"
+group_name = "errors_seen"
+
+[[compactor.rule]]
+name = "tail"
+action = "keep_tail"
+lines = 1000000
+"#;
+        let ruleset = CompactorConfig::from_toml(toml).compactors.remove(0);
+        let stdout = (0..10_000)
+            .map(|i| format!("ERROR unique-{i}\n"))
+            .collect::<String>();
+        let argv = vec!["bounded".to_string()];
+        let cx = CommandContext {
+            cmd_id: "cmd_1".to_string(),
+            argv: &argv,
+            exit_code: 1,
+            stdout: &stdout,
+            stderr: "",
+        };
+
+        let summary = apply_compactor(&ruleset, &cx);
+        assert!(summary.failures.len() <= MAX_RULE_DETAILS);
+        assert!(summary.notes.len() <= MAX_RULE_DETAILS);
+        assert_eq!(summary.counts.get("errors_seen"), Some(&10_000));
+        assert!(summary
+            .notes
+            .last()
+            .is_some_and(|line| line.contains("9999")));
+    }
+
+    #[test]
+    fn declarative_window_keeps_exact_head_tail_and_omission_count() {
+        let toml = r#"
+[[compactor]]
+name = "window"
+match.argv = ["window"]
+head_lines = 2
+tail_lines = 2
+max_lines = 4
+"#;
+        let ruleset = CompactorConfig::from_toml(toml).compactors.remove(0);
+        let stdout = (0..1_000)
+            .map(|i| format!("line-{i}\n"))
+            .collect::<String>();
+        let argv = vec!["window".to_string()];
+        let cx = CommandContext {
+            cmd_id: "cmd_1".to_string(),
+            argv: &argv,
+            exit_code: 0,
+            stdout: &stdout,
+            stderr: "",
+        };
+
+        let summary = apply_compactor(&ruleset, &cx);
+        assert_eq!(
+            summary.body,
+            [
+                "line-0",
+                "line-1",
+                "… (996 lines omitted) …",
+                "line-998",
+                "line-999"
+            ]
+        );
+        assert_eq!(summary.counts.get("reduced_out"), Some(&996));
+    }
+
+    #[test]
+    fn replacement_expansion_and_default_body_are_hard_bounded() {
+        let replacement = "$1".repeat(MAX_REPLACEMENT_BYTES / 2);
+        let toml = format!(
+            r#"
+[[compactor]]
+name = "replace"
+match.argv = ["replace"]
+replace = [{{ pattern = "(.+)", replacement = {replacement:?} }}]
+"#
+        );
+        let ruleset = CompactorConfig::from_toml(&toml).compactors.remove(0);
+        let long_line = "x".repeat(MAX_INTERMEDIATE_LINE_CHARS * 4);
+        let remaining = (0..MAX_REDUCED_BODY_LINES + 100)
+            .map(|i| format!("line-{i}\n"))
+            .collect::<String>();
+        let stdout = format!("{long_line}\n{remaining}");
+        let argv = vec!["replace".to_string()];
+        let cx = CommandContext {
+            cmd_id: "cmd_1".to_string(),
+            argv: &argv,
+            exit_code: 0,
+            stdout: &stdout,
+            stderr: "",
+        };
+
+        let summary = apply_compactor(&ruleset, &cx);
+        assert!(summary.body.len() <= MAX_REDUCED_BODY_LINES + 1);
+        assert!(summary
+            .body
+            .iter()
+            .filter(|line| !line.starts_with("… ("))
+            .all(|line| line.chars().count() <= MAX_REDUCED_LINE_CHARS));
+    }
+
+    #[test]
+    fn over_budget_unless_guard_disables_the_short_circuit() {
+        let oversized_guard = "x".repeat(MAX_CONFIG_REGEX_BYTES + 1);
+        let toml = format!(
+            r#"
+[[compactor]]
+name = "guarded"
+match.argv = ["guarded"]
+max_lines = 10
+match_output = [{{ pattern = "success", message = "hidden", unless = {oversized_guard:?} }}]
+"#
+        );
+        let ruleset = CompactorConfig::from_toml(&toml).compactors.remove(0);
+        let argv = vec!["guarded".to_string()];
+        let cx = CommandContext {
+            cmd_id: "cmd_1".to_string(),
+            argv: &argv,
+            exit_code: 1,
+            stdout: "success\nERROR: must remain visible\n",
+            stderr: "",
+        };
+
+        let summary = apply_compactor(&ruleset, &cx);
+        assert_ne!(summary.headline, "hidden");
+        assert!(summary.body.iter().any(|line| line.contains("ERROR")));
+    }
+
+    #[test]
+    fn compiled_rule_cache_is_exact_lru_and_bounded() {
+        let mut cache = RuleProgramCache::default();
+        let mut first_key = None;
+        for i in 0..MAX_RULESET_CACHE_ENTRIES + 2 {
+            let toml = format!(
+                r#"
+[[compactor]]
+name = "cache-{i}"
+match.argv = ["cache"]
+strip_lines = ["^{i}$"]
+"#
+            );
+            let ruleset = CompactorConfig::from_toml(&toml).compactors.remove(0);
+            let key = RuleProgramKey::new(&ruleset);
+            if i == 0 {
+                first_key = Some(key.clone());
+            }
+            let compiled = Arc::new(CompiledRuleProgram::new(&key));
+            let inserted = cache.insert(key.clone(), Arc::clone(&compiled));
+            assert!(Arc::ptr_eq(&inserted, &compiled));
+            assert!(Arc::ptr_eq(&cache.get(&key).unwrap(), &compiled));
+        }
+
+        assert_eq!(cache.entries.len(), MAX_RULESET_CACHE_ENTRIES);
+        assert!(cache.get(&first_key.unwrap()).is_none());
     }
 }

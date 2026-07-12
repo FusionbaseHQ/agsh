@@ -7,7 +7,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::paths;
-use crate::protocol::{read_line, write_line, JobInfo, Request, Response, SpawnSpec};
+use crate::protocol::{
+    read_line, write_line, JobInfo, Request, Response, SpawnSpec, MAX_TAIL_BYTES,
+};
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -58,6 +62,8 @@ impl Client {
 
     fn roundtrip(&self, request: &Request) -> std::io::Result<Response> {
         let stream = self.connect()?;
+        stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
+        stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
         let mut writer = stream.try_clone()?;
         write_line(&mut writer, request)?;
         let mut reader = BufReader::new(stream);
@@ -117,6 +123,8 @@ impl Client {
     /// Last `bytes` of a job's output log.
     pub fn tail(&self, id: &str, bytes: u64) -> std::io::Result<Vec<u8>> {
         let stream = self.connect()?;
+        stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
+        stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
         let mut writer = stream.try_clone()?;
         write_line(
             &mut writer,
@@ -130,6 +138,12 @@ impl Client {
             .ok_or_else(|| std::io::Error::other("broker closed connection"))?;
         match header {
             Response::Tail { len } => {
+                if len > MAX_TAIL_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "broker tail response exceeds size limit",
+                    ));
+                }
                 let mut buf = vec![0u8; len as usize];
                 reader.read_exact(&mut buf)?;
                 Ok(buf)
@@ -175,6 +189,8 @@ impl Client {
         replay: u64,
     ) -> std::io::Result<(UnixStream, JobInfo)> {
         let stream = self.connect()?;
+        stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
+        stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
         let mut writer = stream.try_clone()?;
         write_line(
             &mut writer,
@@ -205,7 +221,11 @@ impl Client {
         }
         let header: Response = serde_json::from_slice(&line).map_err(std::io::Error::other)?;
         match header {
-            Response::Attached { info } => Ok((stream, info)),
+            Response::Attached { info } => {
+                stream.set_read_timeout(None)?;
+                stream.set_write_timeout(None)?;
+                Ok((stream, info))
+            }
             Response::Err { message } => Err(std::io::Error::other(message)),
             other => Err(std::io::Error::other(format!(
                 "unexpected broker reply: {other:?}"

@@ -1,6 +1,6 @@
 use crate::ir::{
     Assignment, CommandGraph, CommandInvocation, CommandList, CommandListItem, ListOperator,
-    Pipeline, Redirection, RedirectionMode, RedirectionTarget,
+    Pipeline, Redirection, RedirectionMode, RedirectionTarget, INLINE_HEREDOC_PREFIX,
 };
 use crate::lexer::{lex, WordSegment};
 use crate::{ShellError, SourceSpan};
@@ -21,13 +21,14 @@ pub fn parse_line(input: &str) -> Result<CommandGraph, ShellError> {
     let mut subshell_depth: isize = 0;
     let mut brace_group_depth: isize = 0;
     let mut in_double_bracket = false;
+    let mut pending_pipeline_span = None;
 
     for token in tokens {
         // `[[ ... ]]`: collect every inner token as a word so operators like
         // `<`, `>`, `&&`, `||`, `(`, `)` are conditional operators, not shell
         // redirections/separators. push_command builds it specially.
         if in_double_bracket {
-            let ends = token.text == "]]" && token.quote == crate::QuoteKind::None;
+            let ends = token_is_unquoted_word(&token, "]]");
             current.push(token);
             if ends {
                 in_double_bracket = false;
@@ -36,12 +37,19 @@ pub fn parse_line(input: &str) -> Result<CommandGraph, ShellError> {
         }
 
         if subshell_depth > 0 {
-            subshell_depth += paren_delta(&token);
+            let (delta, minimum) = paren_balance(&token);
+            if subshell_depth + minimum < 0 {
+                return Err(unexpected_token(&token));
+            }
+            subshell_depth += delta;
             current.push(token);
             continue;
         }
         if brace_group_depth > 0 {
             brace_group_depth += brace_group_delta(&token);
+            if brace_group_depth < 0 {
+                return Err(unexpected_token(&token));
+            }
             current.push(token);
             continue;
         }
@@ -75,14 +83,24 @@ pub fn parse_line(input: &str) -> Result<CommandGraph, ShellError> {
             continue;
         }
 
+        if paren_balance(&token).1 < 0 && !is_test_expression(&current) {
+            return Err(unexpected_token(&token));
+        }
+        if current.is_empty() && token_is_unquoted_word(&token, "()") {
+            return Err(unexpected_token(&token));
+        }
+        if current.is_empty() && token_is_unquoted_reserved_closer(&token) {
+            return Err(unexpected_token(&token));
+        }
+
         match token.text.as_str() {
-            "!" if token.quote == crate::QuoteKind::None
+            "!" if token_is_unquoted_word(&token, "!")
                 && current.is_empty()
                 && commands.is_empty() =>
             {
                 negated = !negated;
             }
-            "|" if token.quote == crate::QuoteKind::None => {
+            "|" if token_is_operator(&token, "|") => {
                 if current.is_empty() {
                     return Err(
                         ShellError::parse("empty command in pipeline").with_span(token.span)
@@ -90,8 +108,14 @@ pub fn parse_line(input: &str) -> Result<CommandGraph, ShellError> {
                 }
                 push_command(&mut commands, &current)?;
                 current.clear();
+                pending_pipeline_span = Some(token.span);
             }
-            ";" | "&&" | "||" | "&" if token.quote == crate::QuoteKind::None => {
+            ";" | "&&" | "||" | "&" if token_is_operator(&token, &token.text) => {
+                if current.is_empty() && !commands.is_empty() {
+                    return Err(ShellError::parse("empty command in pipeline")
+                        .with_span(pending_pipeline_span.unwrap_or(token.span))
+                        .with_code("agsh::parse::empty_pipeline_command"));
+                }
                 if current.is_empty() && commands.is_empty() {
                     if negated {
                         return Err(
@@ -112,6 +136,7 @@ pub fn parse_line(input: &str) -> Result<CommandGraph, ShellError> {
                 let background = token.text == "&";
                 push_command(&mut commands, &current)?;
                 current.clear();
+                pending_pipeline_span = None;
                 if !commands.is_empty() {
                     items.push(CommandListItem {
                         operator,
@@ -128,26 +153,21 @@ pub fn parse_line(input: &str) -> Result<CommandGraph, ShellError> {
                 };
             }
             _ => {
-                let starts_if_block = token.text == "if"
-                    && token.quote == crate::QuoteKind::None
-                    && current.is_empty();
+                let starts_if_block = token_is_unquoted_word(&token, "if") && current.is_empty();
                 let starts_while_block = matches!(token.text.as_str(), "while" | "until")
-                    && token.quote == crate::QuoteKind::None
+                    && token_is_fully_unquoted(&token)
                     && current.is_empty();
                 let starts_for_block = matches!(token.text.as_str(), "for" | "select")
-                    && token.quote == crate::QuoteKind::None
+                    && token_is_fully_unquoted(&token)
                     && current.is_empty();
-                let starts_case_block = token.text == "case"
-                    && token.quote == crate::QuoteKind::None
-                    && current.is_empty();
+                let starts_case_block =
+                    token_is_unquoted_word(&token, "case") && current.is_empty();
                 let starts_subshell = current.is_empty() && token_starts_subshell(&token);
-                let starts_brace_group = current.is_empty()
-                    && token.text == "{"
-                    && token.quote == crate::QuoteKind::None;
-                let starts_double_bracket = current.is_empty()
-                    && token.text == "[["
-                    && token.quote == crate::QuoteKind::None;
+                let starts_brace_group = current.is_empty() && token_is_unquoted_word(&token, "{");
+                let starts_double_bracket =
+                    current.is_empty() && token_is_unquoted_word(&token, "[[");
                 current.push(token);
+                pending_pipeline_span = None;
                 if starts_double_bracket {
                     in_double_bracket = true;
                 } else if starts_subshell {
@@ -170,6 +190,22 @@ pub fn parse_line(input: &str) -> Result<CommandGraph, ShellError> {
         }
     }
 
+    if in_double_bracket {
+        return Err(ShellError::parse("unterminated [[ conditional")
+            .with_code("agsh::parse::unterminated_compound"));
+    }
+    if function_body_depth > 0
+        || if_block_depth > 0
+        || while_block_depth > 0
+        || for_block_depth > 0
+        || case_block_depth > 0
+        || subshell_depth > 0
+        || brace_group_depth > 0
+    {
+        return Err(ShellError::parse("unterminated compound command")
+            .with_code("agsh::parse::unterminated_compound"));
+    }
+
     if current.is_empty() && commands.is_empty() && negated {
         return Err(ShellError::parse("missing command after !"));
     }
@@ -179,6 +215,15 @@ pub fn parse_line(input: &str) -> Result<CommandGraph, ShellError> {
         && matches!(operator, ListOperator::And | ListOperator::Or)
     {
         return Err(ShellError::parse("missing command after list operator"));
+    }
+
+    if current.is_empty() && !commands.is_empty() {
+        let mut error = ShellError::parse("empty command in pipeline")
+            .with_code("agsh::parse::empty_pipeline_command");
+        if let Some(span) = pending_pipeline_span {
+            error = error.with_span(span);
+        }
+        return Err(error);
     }
 
     push_command(&mut commands, &current)?;
@@ -193,6 +238,138 @@ pub fn parse_line(input: &str) -> Result<CommandGraph, ShellError> {
     attach_heredoc_bodies(&mut items, heredoc_bodies)?;
 
     Ok(CommandGraph::with_list(input, CommandList { items }))
+}
+
+fn token_is_fully_unquoted(token: &crate::lexer::Token) -> bool {
+    token.quote == crate::QuoteKind::None
+        && token
+            .segments
+            .iter()
+            .all(|segment| segment.quote == crate::QuoteKind::None)
+}
+
+fn token_is_unquoted_word(token: &crate::lexer::Token, text: &str) -> bool {
+    token.text == text && !token.segments.is_empty() && token_is_fully_unquoted(token)
+}
+
+fn token_is_operator(token: &crate::lexer::Token, text: &str) -> bool {
+    token.text == text && token.quote == crate::QuoteKind::None && token.segments.is_empty()
+}
+
+fn token_is_unquoted_reserved_closer(token: &crate::lexer::Token) -> bool {
+    token_is_fully_unquoted(token)
+        && matches!(token.text.as_str(), ")" | "}" | "fi" | "done" | "esac")
+}
+
+fn unexpected_token(token: &crate::lexer::Token) -> ShellError {
+    ShellError::parse(format!("unexpected token `{}`", token.text))
+        .with_span(token.span)
+        .with_code("agsh::parse::unexpected_token")
+}
+
+fn is_test_expression(tokens: &[crate::lexer::Token]) -> bool {
+    tokens.first().is_some_and(|token| {
+        token_is_fully_unquoted(token) && matches!(token.text.as_str(), "[" | "test")
+    })
+}
+
+/// Return the net and minimum parenthesis depth contributed by unquoted shell
+/// syntax in a token. Parentheses protected inside substitutions and extglobs
+/// are skipped because they cannot close an enclosing subshell.
+fn paren_balance(token: &crate::lexer::Token) -> (isize, isize) {
+    let mut depth = 0isize;
+    let mut minimum = 0isize;
+    for segment in token
+        .segments
+        .iter()
+        .filter(|segment| segment.quote == crate::QuoteKind::None)
+    {
+        update_paren_balance(&segment.text, &mut depth, &mut minimum);
+    }
+    if token.segments.is_empty() && token.quote == crate::QuoteKind::None {
+        update_paren_balance(&token.text, &mut depth, &mut minimum);
+    }
+    (depth, minimum)
+}
+
+fn update_paren_balance(text: &str, depth: &mut isize, minimum: &mut isize) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let protected = match (chars[index], chars.get(index + 1).copied()) {
+            ('$', Some('(')) => Some(('(', ')')),
+            ('$', Some('{')) => Some(('{', '}')),
+            ('=', Some('(')) => Some(('(', ')')),
+            ('?' | '*' | '+' | '@' | '!', Some('(')) => Some(('(', ')')),
+            ('<' | '>', Some('(')) => Some(('(', ')')),
+            _ => None,
+        };
+        if let Some((open, close)) = protected {
+            index = skip_balanced(&chars, index + 1, open, close);
+            continue;
+        }
+        if chars[index] == '`' {
+            index += 1;
+            let mut escaped = false;
+            while index < chars.len() {
+                let ch = chars[index];
+                index += 1;
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '`' {
+                    break;
+                }
+            }
+            continue;
+        }
+        match chars[index] {
+            '(' => *depth += 1,
+            ')' => {
+                *depth -= 1;
+                *minimum = (*minimum).min(*depth);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+}
+
+fn skip_balanced(chars: &[char], open_index: usize, open: char, close: char) -> usize {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = open_index;
+    while index < chars.len() {
+        let ch = chars[index];
+        index += 1;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+    index
 }
 
 /// True when `input` is a syntactically incomplete command that needs more
@@ -268,27 +445,24 @@ pub fn is_incomplete(input: &str) -> bool {
             continue;
         }
 
-        if token.quote == crate::QuoteKind::None
-            && matches!(token.text.as_str(), "|" | ";" | "&&" | "||" | "&")
+        if matches!(token.text.as_str(), "|" | ";" | "&&" | "||" | "&")
+            && token_is_operator(&token, &token.text)
         {
             trailing_operator = Some(token.text.clone());
             current.clear();
             continue;
         }
 
-        let starts_if_block =
-            token.text == "if" && token.quote == crate::QuoteKind::None && current.is_empty();
+        let starts_if_block = token_is_unquoted_word(&token, "if") && current.is_empty();
         let starts_while_block = matches!(token.text.as_str(), "while" | "until")
-            && token.quote == crate::QuoteKind::None
+            && token_is_fully_unquoted(&token)
             && current.is_empty();
         let starts_for_block = matches!(token.text.as_str(), "for" | "select")
-            && token.quote == crate::QuoteKind::None
+            && token_is_fully_unquoted(&token)
             && current.is_empty();
-        let starts_case_block =
-            token.text == "case" && token.quote == crate::QuoteKind::None && current.is_empty();
+        let starts_case_block = token_is_unquoted_word(&token, "case") && current.is_empty();
         let starts_subshell = current.is_empty() && token_starts_subshell(&token);
-        let starts_brace_group =
-            current.is_empty() && token.text == "{" && token.quote == crate::QuoteKind::None;
+        let starts_brace_group = current.is_empty() && token_is_unquoted_word(&token, "{");
         current.push(token);
         trailing_operator = None;
         if starts_subshell {
@@ -401,8 +575,18 @@ fn scan_heredoc_ops(input: &str) -> Vec<HeredocOp> {
     while i < chars.len() {
         let c = chars[i];
         if let Some(q) = quote {
-            if c == q {
-                quote = None;
+            match (q, c) {
+                ('\'', '\'') => quote = None,
+                ('"', '"') => quote = None,
+                ('"', '\\')
+                    if chars
+                        .get(i + 1)
+                        .is_some_and(|next| matches!(next, '$' | '`' | '"' | '\\')) =>
+                {
+                    i += 2;
+                    continue;
+                }
+                _ => {}
             }
             i += 1;
             continue;
@@ -413,34 +597,26 @@ fn scan_heredoc_ops(input: &str) -> Vec<HeredocOp> {
                 i += 1;
             }
             '\\' => i += 2,
+            '#' if i == 0
+                || chars
+                    .get(i.wrapping_sub(1))
+                    .is_some_and(|previous| previous.is_whitespace()) =>
+            {
+                break;
+            }
+            // A parameter expansion word may itself contain `<<`. It is data,
+            // not a here-document operator on this command line.
+            '$' if chars.get(i + 1) == Some(&'{') => {
+                i = skip_balanced_braces(&chars, i + 1);
+            }
             // Skip `$(...)` / `$((...))` command and arithmetic substitutions so a
             // left-shift `<<` inside arithmetic is not mistaken for a heredoc.
             '$' if chars.get(i + 1) == Some(&'(') => {
-                let mut depth = 0usize;
-                let mut j = i + 1;
-                while j < chars.len() {
-                    match chars[j] {
-                        '(' => depth += 1,
-                        ')' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                j += 1;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    j += 1;
-                }
-                i = j;
+                i = skip_balanced_parens(&chars, i + 1);
             }
             // Skip backtick command substitutions.
             '`' => {
-                let mut j = i + 1;
-                while j < chars.len() && chars[j] != '`' {
-                    j += 1;
-                }
-                i = j + 1;
+                i = skip_backticks(&chars, i);
             }
             // `<<<` is a herestring, not a heredoc: skip all three characters so
             // the trailing `<<` is not mistaken for a heredoc operator.
@@ -453,11 +629,10 @@ fn scan_heredoc_ops(input: &str) -> Vec<HeredocOp> {
                 while chars.get(j).is_some_and(|c| *c == ' ' || *c == '\t') {
                     j += 1;
                 }
-                let (delimiter, expand, next) = read_heredoc_delimiter(&chars, j);
-                if delimiter.is_empty() {
-                    i = next.max(i + 1);
+                let Some((delimiter, expand, next)) = read_heredoc_delimiter(&chars, j) else {
+                    i = j.max(i + 1);
                     continue;
-                }
+                };
                 ops.push(HeredocOp {
                     delimiter,
                     strip_tabs,
@@ -472,26 +647,165 @@ fn scan_heredoc_ops(input: &str) -> Vec<HeredocOp> {
     ops
 }
 
+fn skip_balanced_parens(chars: &[char], open: usize) -> usize {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut i = open;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            match (q, c) {
+                ('\'', '\'') => quote = None,
+                ('"', '"') => quote = None,
+                ('"', '\\')
+                    if chars
+                        .get(i + 1)
+                        .is_some_and(|next| matches!(next, '$' | '`' | '"' | '\\')) =>
+                {
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '\\' => {
+                i += 2;
+                continue;
+            }
+            '`' => {
+                i = skip_backticks(chars, i);
+                continue;
+            }
+            '(' => depth += 1,
+            ')' => {
+                let Some(next_depth) = depth.checked_sub(1) else {
+                    return i + 1;
+                };
+                depth = next_depth;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    chars.len()
+}
+
+fn skip_balanced_braces(chars: &[char], open: usize) -> usize {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut i = open;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            match (q, c) {
+                ('\'', '\'') => quote = None,
+                ('"', '"') => quote = None,
+                ('"', '\\')
+                    if chars
+                        .get(i + 1)
+                        .is_some_and(|next| matches!(next, '$' | '`' | '"' | '\\')) =>
+                {
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '\\' => {
+                i += 2;
+                continue;
+            }
+            '`' => {
+                i = skip_backticks(chars, i);
+                continue;
+            }
+            '$' if chars.get(i + 1) == Some(&'(') => {
+                i = skip_balanced_parens(chars, i + 1);
+                continue;
+            }
+            '{' => depth += 1,
+            '}' => {
+                let Some(next_depth) = depth.checked_sub(1) else {
+                    return i + 1;
+                };
+                depth = next_depth;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    chars.len()
+}
+
+fn skip_backticks(chars: &[char], open: usize) -> usize {
+    let mut i = open + 1;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if chars.get(i + 1).is_some() => i += 2,
+            '`' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    chars.len()
+}
+
 /// Read a heredoc delimiter word starting at `start`. A quoted (or
 /// backslash-prefixed) delimiter disables body expansion.
-fn read_heredoc_delimiter(chars: &[char], start: usize) -> (String, bool, usize) {
+fn read_heredoc_delimiter(chars: &[char], start: usize) -> Option<(String, bool, usize)> {
     let mut i = start;
     let mut delimiter = String::new();
     let mut expand = true;
+    let mut consumed = false;
 
     while i < chars.len() {
         match chars[i] {
-            '\'' | '"' => {
+            '\'' => {
+                consumed = true;
                 expand = false;
-                let quote = chars[i];
                 i += 1;
-                while i < chars.len() && chars[i] != quote {
+                while i < chars.len() && chars[i] != '\'' {
                     delimiter.push(chars[i]);
                     i += 1;
                 }
-                i += 1; // closing quote
+                if i < chars.len() {
+                    i += 1;
+                }
+            }
+            '"' => {
+                consumed = true;
+                expand = false;
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\'
+                        && chars
+                            .get(i + 1)
+                            .is_some_and(|next| matches!(next, '$' | '`' | '"' | '\\'))
+                    {
+                        i += 1;
+                    }
+                    delimiter.push(chars[i]);
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1;
+                }
             }
             '\\' => {
+                consumed = true;
                 expand = false;
                 i += 1;
                 if i < chars.len() {
@@ -501,13 +815,14 @@ fn read_heredoc_delimiter(chars: &[char], start: usize) -> (String, bool, usize)
             }
             c if c.is_whitespace() || matches!(c, '<' | '>' | '|' | ';' | '&' | '(' | ')') => break,
             c => {
+                consumed = true;
                 delimiter.push(c);
                 i += 1;
             }
         }
     }
 
-    (delimiter, expand, i)
+    consumed.then_some((delimiter, expand, i))
 }
 
 /// Attach extracted heredoc bodies to `HereDoc` redirections in source order.
@@ -518,6 +833,41 @@ fn attach_heredoc_bodies(
     let mut bodies = bodies.into_iter();
     for item in items.iter_mut() {
         for command in item.pipeline.commands.iter_mut() {
+            // Redirections inside compound bodies remain argv words because the
+            // executor reconstructs and reparses that body. Convert them to an
+            // internal exact here-string now so the removed body lines survive
+            // that second parse without a process-global side table.
+            let mut index = 0;
+            while index < command.argv.len() {
+                let is_embedded = matches!(command.argv[index].as_str(), "<<" | "<<-")
+                    && command.argv_quote.get(index) == Some(&crate::QuoteKind::None);
+                if !is_embedded {
+                    index += 1;
+                    continue;
+                }
+                let Some((body, expand)) = bodies.next() else {
+                    return Err(ShellError::parse("heredoc body missing for redirection"));
+                };
+                let target_index = index + 1;
+                if target_index >= command.argv.len() {
+                    return Err(ShellError::parse(
+                        "heredoc delimiter missing in compound body",
+                    ));
+                }
+                let payload = format!(
+                    "{INLINE_HEREDOC_PREFIX}{}:{body}",
+                    if expand { 'e' } else { 'l' }
+                );
+                command.argv[index] = "<<<".to_string();
+                command.argv_quote[index] = crate::QuoteKind::None;
+                command.argv_segments[index].clear();
+                command.argv[target_index] = payload.clone();
+                command.argv_quote[target_index] = crate::QuoteKind::Single;
+                command.argv_segments[target_index] =
+                    vec![WordSegment::new(payload, crate::QuoteKind::Single)];
+                index += 2;
+            }
+
             for redirection in command.redirections.iter_mut() {
                 if redirection.mode != RedirectionMode::HereDoc {
                     continue;
@@ -538,11 +888,16 @@ fn attach_heredoc_bodies(
             }
         }
     }
+    if bodies.next().is_some() {
+        return Err(ShellError::parse(
+            "heredoc body was not associated with a redirection",
+        ));
+    }
     Ok(())
 }
 
 fn update_if_block_depth(token: &crate::lexer::Token, depth: &mut usize, command_position: bool) {
-    if token.quote != crate::QuoteKind::None {
+    if !token_is_fully_unquoted(token) {
         return;
     }
     match token.text.as_str() {
@@ -557,7 +912,7 @@ fn update_while_block_depth(
     depth: &mut usize,
     command_position: bool,
 ) {
-    if token.quote != crate::QuoteKind::None {
+    if !token_is_fully_unquoted(token) {
         return;
     }
     match token.text.as_str() {
@@ -568,7 +923,7 @@ fn update_while_block_depth(
 }
 
 fn update_for_block_depth(token: &crate::lexer::Token, depth: &mut usize, command_position: bool) {
-    if token.quote != crate::QuoteKind::None {
+    if !token_is_fully_unquoted(token) {
         return;
     }
     match token.text.as_str() {
@@ -579,7 +934,7 @@ fn update_for_block_depth(token: &crate::lexer::Token, depth: &mut usize, comman
 }
 
 fn update_case_block_depth(token: &crate::lexer::Token, depth: &mut usize, command_position: bool) {
-    if token.quote != crate::QuoteKind::None {
+    if !token_is_fully_unquoted(token) {
         return;
     }
     match token.text.as_str() {
@@ -590,33 +945,28 @@ fn update_case_block_depth(token: &crate::lexer::Token, depth: &mut usize, comma
 }
 
 fn is_reserved_command_position(tokens: &[crate::lexer::Token]) -> bool {
-    let Some(previous) = tokens
-        .iter()
-        .rev()
-        .find(|token| token.quote == crate::QuoteKind::None)
-    else {
+    let Some(previous) = tokens.last() else {
         return true;
     };
 
-    matches!(
-        previous.text.as_str(),
-        ";" | "&&" | "||" | "|" | "then" | "elif" | "else" | "do"
-    )
+    matches!(previous.text.as_str(), ";" | "&&" | "||" | "|" | "&")
+        && token_is_operator(previous, &previous.text)
+        || matches!(previous.text.as_str(), "then" | "elif" | "else" | "do")
+            && token_is_fully_unquoted(previous)
 }
 
 fn is_case_reserved_command_position(tokens: &[crate::lexer::Token]) -> bool {
-    let Some(previous) = tokens
-        .iter()
-        .rev()
-        .find(|token| token.quote == crate::QuoteKind::None)
-    else {
+    let Some(previous) = tokens.last() else {
         return true;
     };
 
-    matches!(
-        previous.text.as_str(),
-        ";" | "&&" | "||" | "|" | "then" | "elif" | "else" | "do"
-    ) || previous.text.ends_with(')')
+    is_reserved_command_position(tokens) || token_ends_with_unquoted(previous, ')')
+}
+
+fn token_ends_with_unquoted(token: &crate::lexer::Token, expected: char) -> bool {
+    token.segments.last().is_some_and(|segment| {
+        segment.quote == crate::QuoteKind::None && segment.text.ends_with(expected)
+    })
 }
 
 /// For a compound command (subshell, brace group, or function definition),
@@ -625,8 +975,20 @@ fn is_case_reserved_command_position(tokens: &[crate::lexer::Token]) -> bool {
 /// Returns `None` for non-compound commands.
 fn compound_body_end(tokens: &[crate::lexer::Token]) -> Option<usize> {
     let first = tokens.first()?;
-    if first.quote != crate::QuoteKind::None {
+    if !token_is_fully_unquoted(first) {
         return None;
+    }
+
+    let closing_reserved = match first.text.as_str() {
+        "if" => Some("fi"),
+        "while" | "until" | "for" | "select" => Some("done"),
+        "case" => Some("esac"),
+        _ => None,
+    };
+    if let Some(closing_reserved) = closing_reserved {
+        return tokens
+            .iter()
+            .rposition(|token| token_is_unquoted_word(token, closing_reserved));
     }
 
     // Subshell: balance parentheses across token text.
@@ -685,34 +1047,12 @@ fn token_starts_subshell(token: &crate::lexer::Token) -> bool {
 /// unquoted `(`/`)` characters. Balanced `$(...)`/`$((...))` substitutions live
 /// in a single unquoted segment and net to zero, so they are naturally ignored.
 fn paren_delta(token: &crate::lexer::Token) -> isize {
-    let count_in = |text: &str| -> isize {
-        text.chars()
-            .map(|c| match c {
-                '(' => 1,
-                ')' => -1,
-                _ => 0,
-            })
-            .sum()
-    };
-    if token.segments.is_empty() {
-        if token.quote == crate::QuoteKind::None {
-            count_in(&token.text)
-        } else {
-            0
-        }
-    } else {
-        token
-            .segments
-            .iter()
-            .filter(|segment| segment.quote == crate::QuoteKind::None)
-            .map(|segment| count_in(&segment.text))
-            .sum()
-    }
+    paren_balance(token).0
 }
 
 /// Net change in brace-group depth: unquoted `{`/`}` tokens.
 fn brace_group_delta(token: &crate::lexer::Token) -> isize {
-    if token.quote != crate::QuoteKind::None {
+    if !token_is_fully_unquoted(token) {
         return 0;
     }
     match token.text.as_str() {
@@ -723,7 +1063,7 @@ fn brace_group_delta(token: &crate::lexer::Token) -> isize {
 }
 
 fn update_function_body_depth(token: &crate::lexer::Token, depth: &mut usize) {
-    if token.quote != crate::QuoteKind::None {
+    if !token_is_fully_unquoted(token) {
         return;
     }
     match token.text.as_str() {
@@ -737,15 +1077,15 @@ fn starts_function_body(tokens: &[crate::lexer::Token]) -> bool {
     let Some(last) = tokens.last() else {
         return false;
     };
-    if last.text != "{" || last.quote != crate::QuoteKind::None {
+    if !token_is_unquoted_word(last, "{") {
         return false;
     }
     if tokens.len() == 2 {
-        return tokens[0].text.ends_with("()") && tokens[0].quote == crate::QuoteKind::None;
+        return tokens[0].text.ends_with("()") && token_is_fully_unquoted(&tokens[0]);
     }
     if tokens.len() == 3
-        && tokens[0].quote == crate::QuoteKind::None
-        && tokens[1].quote == crate::QuoteKind::None
+        && token_is_fully_unquoted(&tokens[0])
+        && token_is_fully_unquoted(&tokens[1])
     {
         // `function name {` or `name () {` (space before the parentheses).
         return tokens[0].text == "function"
@@ -764,7 +1104,7 @@ fn push_command(
 
     // `[[ ... ]]`: every token is a conditional operand/operator word; do not
     // parse redirections or assignments inside it.
-    if tokens[0].text == "[[" && tokens[0].quote == crate::QuoteKind::None {
+    if token_is_unquoted_word(&tokens[0], "[[") {
         commands.push(CommandInvocation {
             assignments: Vec::new(),
             argv: tokens.iter().map(|t| t.text.clone()).collect(),
@@ -804,49 +1144,65 @@ fn push_command(
         let token = &tokens[index];
         // A quoted operator (e.g. `echo ">"`) is a literal argument, not a
         // redirection.
-        if token.quote == crate::QuoteKind::None && index >= redir_start {
-            if let Some((fd, mode, inline_target, needs_target)) =
+        if token_is_redirection_operator(token) && index >= redir_start {
+            let Some((fd, mode, inline_target, needs_target)) =
                 parse_redirection_operator(&token.text)
-            {
-                let target = if let Some(inline_target) = inline_target {
-                    inline_target
-                } else if needs_target {
-                    index += 1;
-                    let Some(target_token) = tokens.get(index) else {
-                        return Err(ShellError::parse(format!(
-                            "missing target for redirection {}",
-                            token.text
+            else {
+                return Err(
+                    ShellError::parse(format!("invalid redirection {}", token.text))
+                        .with_span(token.span)
+                        .with_code("agsh::parse::invalid_redirection"),
+                );
+            };
+            let target = if let Some(inline_target) = inline_target {
+                inline_target
+            } else if needs_target {
+                index += 1;
+                let Some(target_token) = tokens.get(index) else {
+                    return Err(ShellError::parse(format!(
+                        "missing target for redirection {}",
+                        token.text
+                    ))
+                    .with_span(token.span));
+                };
+                if is_control_operator_token(target_token)
+                    || token_is_redirection_operator(target_token)
+                {
+                    return Err(ShellError::parse(format!(
+                        "missing target for redirection {}",
+                        token.text
+                    ))
+                    .with_span(target_token.span));
+                }
+                if mode == RedirectionMode::DupFd {
+                    parse_fd_redirection_target(&target_token.text).ok_or_else(|| {
+                        ShellError::parse(format!(
+                            "invalid file descriptor target {} for redirection {}",
+                            target_token.text, token.text
                         ))
-                        .with_span(token.span));
-                    };
-                    if is_control_operator(&target_token.text)
-                        || parse_redirection_operator(&target_token.text).is_some()
-                    {
-                        return Err(ShellError::parse(format!(
-                            "missing target for redirection {}",
-                            token.text
-                        ))
-                        .with_span(target_token.span));
-                    }
+                        .with_span(target_token.span)
+                        .with_code("agsh::parse::invalid_redirection")
+                    })?
+                } else {
                     RedirectionTarget::Word {
                         text: target_token.text.clone(),
                         quote: target_token.quote,
                         segments: target_token.segments.clone(),
                     }
-                } else {
-                    return Err(
-                        ShellError::parse(format!("invalid redirection {}", token.text))
-                            .with_span(token.span),
-                    );
-                };
-                redirections.push(Redirection::new(fd, mode, target));
-                index += 1;
-                continue;
-            }
+                }
+            } else {
+                return Err(
+                    ShellError::parse(format!("invalid redirection {}", token.text))
+                        .with_span(token.span),
+                );
+            };
+            redirections.push(Redirection::new(fd, mode, target));
+            index += 1;
+            continue;
         }
 
         if !saw_argv {
-            if let Some((name, value)) = parse_assignment(&token.text) {
+            if let Some((name, value)) = parse_assignment(token) {
                 assignments.push(Assignment::with_segments(
                     name,
                     value,
@@ -879,13 +1235,52 @@ fn push_command(
     Ok(())
 }
 
-fn is_control_operator(text: &str) -> bool {
-    matches!(text, "|" | ";" | "&&" | "||")
+fn is_control_operator_token(token: &crate::lexer::Token) -> bool {
+    matches!(token.text.as_str(), "|" | ";" | "&&" | "||" | "&")
+        && token_is_operator(token, &token.text)
 }
 
-fn parse_assignment(text: &str) -> Option<(&str, &str)> {
-    let (name, value) = text.split_once('=')?;
-    is_assignment_target(name).then_some((name, value))
+fn token_is_redirection_operator(token: &crate::lexer::Token) -> bool {
+    token.quote == crate::QuoteKind::None
+        && token.segments.is_empty()
+        && token.text.bytes().any(|byte| matches!(byte, b'<' | b'>'))
+}
+
+fn parse_assignment(token: &crate::lexer::Token) -> Option<(&str, &str)> {
+    let separator = assignment_separator(token)?;
+    let name = &token.text[..separator];
+    let value = &token.text[separator + 1..];
+    if !is_assignment_target(name) {
+        return None;
+    }
+    Some((name, value))
+}
+
+/// Locate the assignment `=` while allowing quoted text only inside an array
+/// subscript. An `=` within a quoted associative key is data, not the separator;
+/// quoting the variable name or the separator still makes the word a command.
+fn assignment_separator(token: &crate::lexer::Token) -> Option<usize> {
+    let mut offset = 0usize;
+    let mut bracket_depth = 0usize;
+    for segment in &token.segments {
+        if segment.quote != crate::QuoteKind::None {
+            if bracket_depth == 0 {
+                return None;
+            }
+            offset += segment.text.len();
+            continue;
+        }
+        for (index, character) in segment.text.char_indices() {
+            match character {
+                '[' => bracket_depth = bracket_depth.saturating_add(1),
+                ']' if bracket_depth > 0 => bracket_depth -= 1,
+                '=' if bracket_depth == 0 => return Some(offset + index),
+                _ => {}
+            }
+        }
+        offset += segment.text.len();
+    }
+    None
 }
 
 /// A valid assignment left-hand side: a plain identifier, an append (`name+`),
@@ -917,7 +1312,7 @@ fn parse_redirection_operator(
         // `>&` / `<&` with no leading fd default to stdout / stdin. A bare
         // `>&`/`<&` redirects to a following word (both streams for `>&`).
         ">&" => Some((1, RedirectionMode::WriteBoth, None, true)),
-        "<&" => Some((0, RedirectionMode::Read, None, true)),
+        "<&" => Some((0, RedirectionMode::DupFd, None, true)),
         _ if text.starts_with(">&") => {
             let target = parse_fd_redirection_target(&text[2..])?;
             Some((1, RedirectionMode::DupFd, Some(target), false))
@@ -934,6 +1329,7 @@ fn parse_redirection_operator(
                 ">|" => Some((fd, RedirectionMode::WriteClobber, None, true)),
                 ">>" => Some((fd, RedirectionMode::Append, None, true)),
                 "<" => Some((fd, RedirectionMode::Read, None, true)),
+                ">&" | "<&" => Some((fd, RedirectionMode::DupFd, None, true)),
                 _ if rest.starts_with(">&") || rest.starts_with("<&") => {
                     let target = parse_fd_redirection_target(&rest[2..])?;
                     Some((fd, RedirectionMode::DupFd, Some(target), false))
@@ -1026,6 +1422,45 @@ mod tests {
         assert_eq!(bodies.len(), 2);
         assert_eq!(bodies[0].0, "aaa\n");
         assert_eq!(bodies[1].0, "bbb\n");
+    }
+
+    #[test]
+    fn heredoc_delimiter_quote_removal_tracks_expansion() {
+        for source in [
+            "cat <<'EOF'\n$HOME\nEOF",
+            "cat <<E'O'F\n$HOME\nEOF",
+            "cat <<E\\OF\n$HOME\nEOF",
+            "cat <<\"E\\\"OF\"\n$HOME\nE\"OF",
+        ] {
+            let (_cmd, bodies) = extract_heredoc_bodies(source).unwrap();
+            assert_eq!(bodies, [("$HOME\n".to_string(), false)], "{source}");
+        }
+    }
+
+    #[test]
+    fn heredoc_accepts_empty_quoted_delimiter() {
+        let (_cmd, bodies) = extract_heredoc_bodies("cat <<''\nbody\n\n").unwrap();
+        assert_eq!(bodies, [("body\n".to_string(), false)]);
+    }
+
+    #[test]
+    fn heredoc_dash_strips_leading_tabs_only() {
+        let (_cmd, bodies) =
+            extract_heredoc_bodies("cat <<-EOF\n\tfirst\n  second\n\tEOF").unwrap();
+        assert_eq!(bodies, [("first\n  second\n".to_string(), true)]);
+    }
+
+    #[test]
+    fn heredoc_scanner_ignores_operators_inside_expansions_and_quotes() {
+        for source in [
+            r#"echo "escaped \" <<not_a_heredoc""#,
+            r#"echo ${value:-<<not_a_heredoc}"#,
+            r#"echo $((1 << 4))"#,
+        ] {
+            let (command, bodies) = extract_heredoc_bodies(source).unwrap();
+            assert_eq!(command, source);
+            assert!(bodies.is_empty(), "{source}: {bodies:?}");
+        }
     }
 
     #[test]
@@ -1367,9 +1802,112 @@ mod tests {
     }
 
     #[test]
+    fn ampersand_terminates_commands_before_compound_closers() {
+        for (source, closer) in [
+            ("if true; then true & fi", "fi"),
+            ("while false; do true & done", "done"),
+            ("for item in one; do true & done", "done"),
+            ("case x in x) true & esac", "esac"),
+        ] {
+            let graph = parse_line(source).unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            assert_eq!(graph.list.items.len(), 1, "{source}: {graph:?}");
+            let invocation = &graph.list.items[0].pipeline.commands[0];
+            assert!(invocation.argv.iter().any(|word| word == "&"), "{source}");
+            assert!(
+                invocation.argv.iter().any(|word| word == closer),
+                "{source}"
+            );
+            assert!(!is_incomplete(source), "complete syntax: {source}");
+        }
+    }
+
+    #[test]
     fn rejects_missing_commands_around_boolean_list_operators() {
         assert!(parse_line("&& echo bad").is_err());
         assert!(parse_line("echo bad ||").is_err());
+    }
+
+    #[test]
+    fn rejects_missing_command_after_pipeline_operator() {
+        for source in ["echo bad |", "echo bad | ;", "echo bad | &"] {
+            let error = parse_line(source).expect_err(source);
+            assert!(error.message.contains("pipeline"), "{source}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_incomplete_redirections() {
+        for source in ["echo bad >", "echo bad 2>&", "echo bad 0<&"] {
+            let error = parse_line(source).expect_err(source);
+            assert!(error.message.contains("redirection"), "{source}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_stray_closing_delimiters() {
+        for source in [
+            ")",
+            "echo bad)",
+            "echo ok; }",
+            "echo ok | }",
+            "fi",
+            "done",
+            "esac",
+        ] {
+            let error = parse_line(source).expect_err(source);
+            assert!(error.message.contains("unexpected"), "{source}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn quoted_assignment_prefixes_remain_command_words() {
+        for source in ["'FOO'=bar", r#""FOO"=bar"#, "FOO'='bar", "''FOO=bar"] {
+            let graph = parse_line(source).unwrap();
+            let command = &graph.pipeline.commands[0];
+            assert!(command.assignments.is_empty(), "{source}: {command:?}");
+            assert_eq!(command.argv, ["FOO=bar"], "{source}: {command:?}");
+        }
+    }
+
+    #[test]
+    fn quoted_redirection_characters_remain_arguments() {
+        let graph = parse_line("echo hi 2'>' out").unwrap();
+        let command = &graph.pipeline.commands[0];
+        assert!(command.redirections.is_empty());
+        assert_eq!(command.argv, ["echo", "hi", "2>", "out"]);
+    }
+
+    #[test]
+    fn quoted_reserved_word_characters_do_not_open_compound_commands() {
+        let graph = parse_line("'i'f true").unwrap();
+        assert_eq!(graph.pipeline.commands[0].argv, ["if", "true"]);
+    }
+
+    #[test]
+    fn valid_substitutions_can_contain_closing_parentheses() {
+        for source in ["echo ${value:-)}", "echo $(printf ')')"] {
+            assert!(parse_line(source).is_ok(), "{source}");
+        }
+    }
+
+    #[test]
+    fn parses_spaced_file_descriptor_duplication() {
+        let graph = parse_line("echo hi 2>& 1 0<& 0").unwrap();
+        let redirections = &graph.pipeline.commands[0].redirections;
+        assert_eq!(redirections.len(), 2);
+        assert_eq!(redirections[0].target, RedirectionTarget::Fd(1));
+        assert_eq!(redirections[1].target, RedirectionTarget::Fd(0));
+    }
+
+    #[test]
+    fn parse_line_rejects_unterminated_compound_commands() {
+        for source in ["(echo hi", "{ echo hi", "if true; then echo hi", "[[ x = x"] {
+            let error = parse_line(source).expect_err(source);
+            assert!(
+                error.message.contains("unterminated"),
+                "{source}: {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -1384,6 +1922,31 @@ mod tests {
         let assignment = &graph.pipeline.commands[0].assignments[0];
         assert_eq!(assignment.value, "hello world");
         assert_eq!(assignment.value_segments[0].quote, crate::QuoteKind::Double);
+    }
+
+    #[test]
+    fn array_assignment_balance_ignores_escaped_quote_and_quoted_paren() {
+        let graph = parse_line(r#"arr=("a\")b" c)"#).unwrap();
+        let command = &graph.pipeline.commands[0];
+
+        assert!(command.argv.is_empty());
+        assert_eq!(command.assignments.len(), 1);
+        assert_eq!(command.assignments[0].name, "arr");
+        assert_eq!(command.assignments[0].value, r#"("a\")b" c)"#);
+    }
+
+    #[test]
+    fn parses_quoted_associative_subscripts_as_assignments() {
+        for (source, expected_name) in [
+            (r#"sp["a b"]=spaced"#, "sp[a b]"),
+            (r#"sp["a=b"]=equals"#, "sp[a=b]"),
+        ] {
+            let graph = parse_line(source).unwrap();
+            let command = &graph.pipeline.commands[0];
+            assert!(command.argv.is_empty(), "{source}: {command:?}");
+            assert_eq!(command.assignments.len(), 1, "{source}: {command:?}");
+            assert_eq!(command.assignments[0].name, expected_name);
+        }
     }
 
     #[test]

@@ -10,38 +10,59 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+permissions:
+  contents: read
+
 jobs:
   # Formatting + lints are fast and platform-independent: run once.
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust (stable + rustfmt + clippy)
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
-          rustup default stable
-      - uses: Swatinem/rust-cache@v2
+          toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt,clippy
+          rustup default "$toolchain"
       - name: cargo fmt --check
         run: cargo fmt --all --check
       - name: cargo clippy -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: release checks
+        run: |
+          scripts/validate-release.sh
+          tests/release/run.sh
 
   # Build + the full test matrix on both supported platforms.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            installer_fixture: linux-x86_64
+          - os: macos-latest
+            installer_fixture: darwin-arm64
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust (stable)
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: offline installer fixture (${{ matrix.installer_fixture }})
+        run: tests/install/run.sh "${{ matrix.installer_fixture }}"
+      - name: Install pinned Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-      - uses: Swatinem/rust-cache@v2
+          toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
       - name: cargo build
         run: cargo build --workspace --locked --verbose
       - name: cargo test

@@ -9,12 +9,19 @@
 
 use crate::summary::{CommandContext, SemanticSummary};
 use crate::util::{clip, command_basename};
-use regex::Regex;
 
 /// Longest single detail line kept before truncation.
 const MAX_LINE: usize = 200;
 /// Cap on how many entries we collect into any one detail list.
 const CAP: usize = 50;
+
+static_regex!(
+    GIT_STAT_RE,
+    r"(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?"
+);
+static_regex!(DIFF_HEADER_RE, r"^diff --git a/(.+) b/(.+)$");
+static_regex!(COMMIT_HEADER_RE, r"^\[(.+?) ([0-9a-f]{7,40})\] (.+)$");
+static_regex!(SYNC_UPDATE_RE, r"[0-9a-f]{7,}\.\.\.?[0-9a-f]{7,}");
 
 /// git subcommands this compactor understands; used to locate the subcommand
 /// even when global options like `git -C <dir>` shift its argv position.
@@ -61,12 +68,6 @@ fn git_subcommand(argv: &[String]) -> Option<&str> {
         .skip(1)
         .map(String::as_str)
         .find(|t| KNOWN.contains(t))
-}
-
-/// `N files changed[, X insertions(+)][, Y deletions(-)]` summary line.
-fn stat_regex() -> Regex {
-    Regex::new(r"(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?")
-        .unwrap()
 }
 
 fn cap_group(c: &regex::Captures<'_>, i: usize) -> i64 {
@@ -345,14 +346,12 @@ fn entry_path(raw: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn diff(cx: &CommandContext, s: &mut SemanticSummary) {
-    let stat_re = stat_regex();
     let unified = cx.stdout.lines().any(|l| l.starts_with("diff --git"));
     let (mut files, mut ins, mut del) = (0i64, 0i64, 0i64);
 
     if unified {
-        let git_re = Regex::new(r"^diff --git a/(.+) b/(.+)$").unwrap();
         for line in cx.stdout.lines() {
-            if let Some(c) = git_re.captures(line) {
+            if let Some(c) = DIFF_HEADER_RE.captures(line) {
                 files += 1;
                 push_path(s, &c[2]);
             } else if line.starts_with("+++") || line.starts_with("---") {
@@ -365,7 +364,7 @@ fn diff(cx: &CommandContext, s: &mut SemanticSummary) {
         }
     } else {
         for line in cx.stdout.lines() {
-            if let Some(c) = stat_re.captures(line) {
+            if let Some(c) = GIT_STAT_RE.captures(line) {
                 files = c[1].parse::<i64>().unwrap_or(0);
                 ins = cap_group(&c, 2);
                 del = cap_group(&c, 3);
@@ -437,18 +436,16 @@ fn log(cx: &CommandContext, s: &mut SemanticSummary) {
 // ---------------------------------------------------------------------------
 
 fn commit(cx: &CommandContext, s: &mut SemanticSummary) {
-    let bracket_re = Regex::new(r"^\[(.+?) ([0-9a-f]{7,40})\] (.+)$").unwrap();
-    let stat_re = stat_regex();
     let mut found = false;
     let mut nothing = false;
 
     for line in cx.all_lines() {
         let t = line.trim();
-        if let Some(c) = bracket_re.captures(t) {
+        if let Some(c) = COMMIT_HEADER_RE.captures(t) {
             found = true;
             s.set_headline(clip(t, MAX_LINE));
             push_note(s, &format!("{} {}", &c[2], &c[3]));
-        } else if let Some(c) = stat_re.captures(t) {
+        } else if let Some(c) = GIT_STAT_RE.captures(t) {
             s.set_count("files_changed", c[1].parse::<i64>().unwrap_or(0));
             s.set_count("insertions", cap_group(&c, 2));
             s.set_count("deletions", cap_group(&c, 3));
@@ -475,9 +472,6 @@ fn commit(cx: &CommandContext, s: &mut SemanticSummary) {
 // ---------------------------------------------------------------------------
 
 fn sync(cx: &CommandContext, s: &mut SemanticSummary, sub: &str) {
-    let stat_re = stat_regex();
-    let upd_re = Regex::new(r"[0-9a-f]{7,}\.\.\.?[0-9a-f]{7,}").unwrap();
-
     let mut remote: Option<String> = None;
     let mut up_to_date = false;
     let mut conflict = false;
@@ -506,9 +500,12 @@ fn sync(cx: &CommandContext, s: &mut SemanticSummary, sub: &str) {
         } else if let Some(r) = t.strip_prefix("From ") {
             remote = Some(r.trim().to_string());
             push_note(s, t);
-        } else if upd_re.is_match(t) || t.contains("[new branch]") || t.contains("[new tag]") {
+        } else if SYNC_UPDATE_RE.is_match(t)
+            || t.contains("[new branch]")
+            || t.contains("[new tag]")
+        {
             push_note(s, t);
-        } else if let Some(c) = stat_re.captures(t) {
+        } else if let Some(c) = GIT_STAT_RE.captures(t) {
             files = c[1].parse::<i64>().unwrap_or(0);
             ins = cap_group(&c, 2);
             del = cap_group(&c, 3);

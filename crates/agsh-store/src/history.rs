@@ -6,7 +6,7 @@
 //! session can be reconstructed. Ranking helpers take `now` explicitly so they
 //! are deterministic and testable.
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -151,14 +151,110 @@ pub struct HistoryStats {
 }
 
 /// In-memory history with optional JSONL persistence.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct HistoryStore {
     entries: Vec<HistoryEntry>,
     path: Option<PathBuf>,
     max: usize,
+    retained_bytes: usize,
+}
+
+impl Default for HistoryStore {
+    fn default() -> Self {
+        Self::in_memory()
+    }
 }
 
 const DEFAULT_MAX: usize = 50_000;
+const MAX_HISTORY_LINE_BYTES: usize = 1024 * 1024;
+const MAX_HISTORY_COMMAND_BYTES: usize = 256 * 1024;
+const MAX_HISTORY_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_HISTORY_MEMORY_BYTES: usize = 32 * 1024 * 1024;
+
+fn history_entry_bytes(entry: &HistoryEntry) -> usize {
+    entry
+        .command
+        .len()
+        .saturating_add(entry.cwd.len())
+        .saturating_add(entry.hostname.len())
+        .saturating_add(entry.user.as_ref().map_or(0, String::len))
+        .saturating_add(entry.project.as_ref().map_or(0, String::len))
+        .saturating_add(entry.session_id.as_ref().map_or(0, String::len))
+        .saturating_add(entry.git_root.as_ref().map_or(0, String::len))
+        .saturating_add(entry.git_branch.as_ref().map_or(0, String::len))
+        .saturating_add(entry.output_mode.as_ref().map_or(0, String::len))
+        .saturating_add(entry.trace_id.as_ref().map_or(0, String::len))
+        .saturating_add(entry.command_family.as_ref().map_or(0, String::len))
+        .saturating_add(std::mem::size_of::<HistoryEntry>())
+}
+
+fn trim_entries_to_bytes(
+    entries: &mut Vec<HistoryEntry>,
+    retained_bytes: &mut usize,
+    limit: usize,
+) {
+    if *retained_bytes <= limit {
+        return;
+    }
+    let target = limit.saturating_mul(9) / 10;
+    let mut drop_count = 0usize;
+    let mut dropped_bytes = 0usize;
+    while retained_bytes.saturating_sub(dropped_bytes) > target && drop_count < entries.len() {
+        dropped_bytes = dropped_bytes.saturating_add(history_entry_bytes(&entries[drop_count]));
+        drop_count += 1;
+    }
+    entries.drain(0..drop_count);
+    *retained_bytes = retained_bytes.saturating_sub(dropped_bytes);
+}
+
+enum BoundedLine {
+    Eof,
+    Line,
+    Oversized,
+}
+
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    output: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<BoundedLine> {
+    output.clear();
+    let mut oversized = false;
+
+    loop {
+        let (consumed, ended) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(if oversized {
+                    BoundedLine::Oversized
+                } else if output.is_empty() {
+                    BoundedLine::Eof
+                } else {
+                    BoundedLine::Line
+                });
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map_or(available.len(), |index| index + 1);
+            if !oversized {
+                let remaining = limit.saturating_add(1).saturating_sub(output.len());
+                output.extend_from_slice(&available[..consumed.min(remaining)]);
+                if output.len() > limit {
+                    output.clear();
+                    oversized = true;
+                }
+            }
+            (consumed, newline.is_some())
+        };
+        reader.consume(consumed);
+        if ended {
+            return Ok(if oversized {
+                BoundedLine::Oversized
+            } else {
+                BoundedLine::Line
+            });
+        }
+    }
+}
 
 fn ensure_parent_dir(path: &Path) -> io::Result<()> {
     let Some(parent) = path
@@ -194,23 +290,170 @@ fn make_file_private(_file: &std::fs::File) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn open_history_for_read(path: &Path) -> io::Result<std::fs::File> {
-    let file = std::fs::File::open(path)?;
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let file = std::fs::File::from(descriptor);
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "history path is not a regular file",
+        ));
+    }
     make_file_private(&file)?;
     Ok(file)
 }
 
-fn open_history_for_append(path: &Path) -> io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+#[cfg(not(unix))]
+fn open_history_for_read(path: &Path) -> io::Result<std::fs::File> {
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "history path is not a regular file",
+        ));
     }
-    let file = options.open(path)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_history_for_append(path: &Path) -> io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::WRONLY
+            | OFlags::CREATE
+            | OFlags::APPEND
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let file = std::fs::File::from(descriptor);
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "history path is not a regular file",
+        ));
+    }
     make_file_private(&file)?;
     Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_history_for_append(path: &Path) -> io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "history path is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn history_lock_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "history".into());
+    path.with_file_name(format!(".{name}.lock"))
+}
+
+struct HistoryLock {
+    file: std::fs::File,
+}
+
+impl Drop for HistoryLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+#[cfg(unix)]
+fn lock_history(path: &Path) -> io::Result<HistoryLock> {
+    use rustix::fs::{FlockOperation, Mode, OFlags};
+
+    ensure_parent_dir(path)?;
+    let descriptor = rustix::fs::open(
+        history_lock_path(path),
+        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let file = std::fs::File::from(descriptor);
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "history lock path is not a regular file",
+        ));
+    }
+    make_file_private(&file)?;
+    loop {
+        match rustix::fs::flock(&file, FlockOperation::LockExclusive) {
+            Ok(()) => break,
+            Err(error) => {
+                let error = io::Error::from_raw_os_error(error.raw_os_error());
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Ok(HistoryLock { file })
+}
+
+#[cfg(unix)]
+fn try_lock_history(path: &Path) -> io::Result<HistoryLock> {
+    use rustix::fs::{FlockOperation, Mode, OFlags};
+
+    ensure_parent_dir(path)?;
+    let descriptor = rustix::fs::open(
+        history_lock_path(path),
+        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let file = std::fs::File::from(descriptor);
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "history lock path is not a regular file",
+        ));
+    }
+    make_file_private(&file)?;
+    rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive)
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    Ok(HistoryLock { file })
+}
+
+#[cfg(not(unix))]
+fn lock_history(path: &Path) -> io::Result<HistoryLock> {
+    ensure_parent_dir(path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(history_lock_path(path))?;
+    Ok(HistoryLock { file })
+}
+
+#[cfg(not(unix))]
+fn try_lock_history(path: &Path) -> io::Result<HistoryLock> {
+    lock_history(path)
 }
 
 fn create_rewrite_temp(path: &Path) -> io::Result<(PathBuf, std::fs::File)> {
@@ -269,6 +512,7 @@ impl HistoryStore {
             entries: Vec::new(),
             path: None,
             max: DEFAULT_MAX,
+            retained_bytes: 0,
         }
     }
 
@@ -280,50 +524,116 @@ impl HistoryStore {
     /// the on-disk log has grown well past the retained window it is compacted
     /// in place, so it cannot grow without bound across sessions.
     pub fn with_file(path: PathBuf, max: usize) -> Self {
+        Self::with_file_load_limit(path, max, MAX_HISTORY_FILE_BYTES)
+    }
+
+    fn with_file_load_limit(path: PathBuf, max: usize, load_limit: u64) -> Self {
         let max = max.max(1);
+        // Loading is allowed to proceed from its open-file snapshot when another
+        // shell is writing. Only optional compaction requires the nonblocking
+        // guard, so startup never waits behind another process.
+        let rewrite_guard = try_lock_history(&path).ok();
         let mut entries: Vec<HistoryEntry> = Vec::new();
+        let mut retained_bytes = 0usize;
         let mut total = 0usize;
-        if let Ok(file) = open_history_for_read(&path) {
+        let mut needs_rewrite = false;
+        if let Ok(mut file) = open_history_for_read(&path) {
             // Read line-by-line as bytes and lossy-decode: a corrupt/non-UTF8 line
             // just fails to parse and is skipped, instead of truncating the whole
             // (newest) history the way `.lines().map_while(Result::ok)` did at the
             // first bad byte. (Also avoids the `lines_filter_map_ok` lint, whose
             // suggested `map_while` is exactly that truncating behavior.)
-            let mut reader = BufReader::new(file);
+            // Oversized files are read from a bounded tail so startup work cannot
+            // be amplified by a sparse/corrupt file or a writer that ignores the
+            // lock. The first partial tail line is discarded before JSON parsing.
+            let file_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            let start = file_len.saturating_sub(load_limit);
+            let discard_partial_line = if start > 0 {
+                let mut previous = [0u8; 1];
+                file.seek(SeekFrom::Start(start - 1))
+                    .and_then(|_| file.read_exact(&mut previous))
+                    .is_err()
+                    || previous[0] != b'\n'
+            } else {
+                false
+            };
+            if file.seek(SeekFrom::Start(start)).is_err() {
+                return Self {
+                    entries,
+                    path: Some(path),
+                    max,
+                    retained_bytes,
+                };
+            }
+            let mut reader = BufReader::new(file).take(load_limit);
             let mut buf: Vec<u8> = Vec::new();
-            loop {
-                buf.clear();
-                match reader.read_until(b'\n', &mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+            if start > 0 {
+                needs_rewrite = true;
+            }
+            if discard_partial_line {
+                match read_bounded_line(&mut reader, &mut buf, MAX_HISTORY_LINE_BYTES) {
+                    Ok(BoundedLine::Eof) | Err(_) => {}
+                    Ok(BoundedLine::Line | BoundedLine::Oversized) => {}
                 }
-                let line = String::from_utf8_lossy(&buf);
+            }
+            loop {
+                match read_bounded_line(&mut reader, &mut buf, MAX_HISTORY_LINE_BYTES) {
+                    Ok(BoundedLine::Eof) | Err(_) => break,
+                    Ok(BoundedLine::Oversized) => {
+                        needs_rewrite = true;
+                        continue;
+                    }
+                    Ok(BoundedLine::Line) => {}
+                }
+                let Ok(line) = std::str::from_utf8(&buf) else {
+                    needs_rewrite = true;
+                    continue;
+                };
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
                 }
                 if let Ok(entry) = serde_json::from_str::<HistoryEntry>(line) {
                     total += 1;
+                    retained_bytes = retained_bytes.saturating_add(history_entry_bytes(&entry));
                     entries.push(entry);
                     // Keep load memory bounded: never hold much more than `max`.
                     if entries.len() > max.saturating_mul(2) {
                         let drop = entries.len() - max;
+                        let dropped = entries[..drop]
+                            .iter()
+                            .map(history_entry_bytes)
+                            .fold(0usize, usize::saturating_add);
                         entries.drain(0..drop);
+                        retained_bytes = retained_bytes.saturating_sub(dropped);
                     }
+                    trim_entries_to_bytes(
+                        &mut entries,
+                        &mut retained_bytes,
+                        MAX_HISTORY_MEMORY_BYTES,
+                    );
+                } else {
+                    needs_rewrite = true;
                 }
             }
         }
         if entries.len() > max {
             let drop = entries.len() - max;
+            let dropped = entries[..drop]
+                .iter()
+                .map(history_entry_bytes)
+                .fold(0usize, usize::saturating_add);
             entries.drain(0..drop);
+            retained_bytes = retained_bytes.saturating_sub(dropped);
         }
         let store = Self {
             entries,
             path: Some(path),
             max,
+            retained_bytes,
         };
         // Compact a log that has outgrown the retained window down to `max`.
-        if total > max.saturating_mul(2) {
+        if rewrite_guard.is_some() && (needs_rewrite || total > max.saturating_mul(2)) {
             store.rewrite();
         }
         store
@@ -334,20 +644,23 @@ impl HistoryStore {
     /// half-written log.
     fn rewrite(&self) {
         let Some(path) = &self.path else { return };
-        let mut buf = String::new();
-        for entry in &self.entries {
-            if let Ok(line) = serde_json::to_string(entry) {
-                buf.push_str(&line);
-                buf.push('\n');
-            }
-        }
         let _ = (|| -> io::Result<()> {
             ensure_parent_dir(path)?;
             let (temp, mut file) = create_rewrite_temp(path)?;
-            if let Err(error) = file
-                .write_all(buf.as_bytes())
-                .and_then(|()| file.sync_all())
-            {
+            for entry in &self.entries {
+                let Ok(mut line) = serde_json::to_string(entry) else {
+                    continue;
+                };
+                line.push('\n');
+                if line.len() > MAX_HISTORY_LINE_BYTES {
+                    continue;
+                }
+                if let Err(error) = file.write_all(line.as_bytes()) {
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(error);
+                }
+            }
+            if let Err(error) = file.sync_all() {
                 let _ = std::fs::remove_file(&temp);
                 return Err(error);
             }
@@ -367,12 +680,30 @@ impl HistoryStore {
     }
 
     /// Append a new (not-yet-finalized) entry; returns its index.
-    pub fn push(&mut self, entry: HistoryEntry) -> usize {
+    pub fn push(&mut self, mut entry: HistoryEntry) -> usize {
+        if entry.command.len() > MAX_HISTORY_COMMAND_BYTES {
+            entry.command = format!(
+                "# agsh: command omitted from history (exceeded {MAX_HISTORY_COMMAND_BYTES} bytes)"
+            );
+        }
         self.entries.push(entry);
+        self.retained_bytes = self.retained_bytes.saturating_add(history_entry_bytes(
+            self.entries.last().expect("just pushed"),
+        ));
         if self.entries.len() > self.max {
             let drop = self.entries.len() - self.max;
+            let dropped = self.entries[..drop]
+                .iter()
+                .map(history_entry_bytes)
+                .fold(0usize, usize::saturating_add);
             self.entries.drain(0..drop);
+            self.retained_bytes = self.retained_bytes.saturating_sub(dropped);
         }
+        trim_entries_to_bytes(
+            &mut self.entries,
+            &mut self.retained_bytes,
+            MAX_HISTORY_MEMORY_BYTES,
+        );
         self.entries.len() - 1
     }
 
@@ -388,11 +719,28 @@ impl HistoryStore {
     }
 
     fn persist(&self, entry: &HistoryEntry) {
+        self.persist_with_file_limit(entry, MAX_HISTORY_FILE_BYTES);
+    }
+
+    fn persist_with_file_limit(&self, entry: &HistoryEntry, file_limit: u64) {
         let Some(path) = &self.path else { return };
         let _ = ensure_parent_dir(path);
+        let Ok(_guard) = lock_history(path) else {
+            return;
+        };
         if let Ok(mut line) = serde_json::to_string(entry) {
             line.push('\n');
+            if line.len() > MAX_HISTORY_LINE_BYTES {
+                return;
+            }
             if let Ok(mut file) = open_history_for_append(path) {
+                let current_len = file
+                    .metadata()
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(u64::MAX);
+                if current_len.saturating_add(line.len() as u64) > file_limit {
+                    return;
+                }
                 // One write_all of the whole line (not writeln!'s two writes): with
                 // O_APPEND this lands atomically, so concurrent sessions can't
                 // interleave a half-line.
@@ -416,6 +764,7 @@ impl HistoryStore {
     /// Clear the in-memory list (does not erase the persisted file).
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.retained_bytes = 0;
     }
 
     /// The most recent command (excluding an exact `prefix` match) that begins
@@ -840,6 +1189,165 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn oversized_history_line_is_skipped_without_losing_newer_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "agsh_histlinecap_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&vec![b'x'; MAX_HISTORY_LINE_BYTES + 1])
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        serde_json::to_writer(&mut file, &entry("newer", "/x", 2)).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+
+        let store = HistoryStore::with_file(path.clone(), 10);
+
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.entries()[0].command, "newer");
+        assert!(std::fs::metadata(&path).unwrap().len() < MAX_HISTORY_LINE_BYTES as u64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_history_file_load_is_bounded_to_its_newest_tail() {
+        use std::io::{Seek, SeekFrom};
+
+        let dir = std::env::temp_dir().join(format!(
+            "agsh_histfilecap_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        serde_json::to_writer(&mut file, &entry("too-old", "/x", 1)).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.seek(SeekFrom::Start(8 * 1024)).unwrap();
+        file.write_all(b"discard this partial record\n").unwrap();
+        serde_json::to_writer(&mut file, &entry("newest", "/x", 2)).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+
+        let store = HistoryStore::with_file_load_limit(path.clone(), 10, 1024);
+
+        assert_eq!(
+            store
+                .entries()
+                .iter()
+                .map(|entry| entry.command.as_str())
+                .collect::<Vec<_>>(),
+            ["newest"]
+        );
+        assert!(std::fs::metadata(&path).unwrap().len() <= 1024);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_append_waits_for_lock_contention_instead_of_dropping_the_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "agsh_histlockwait_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.jsonl");
+        let held = lock_history(&path).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let thread_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let store = HistoryStore {
+                entries: Vec::new(),
+                path: Some(thread_path),
+                max: 10,
+                retained_bytes: 0,
+            };
+            started_tx.send(()).unwrap();
+            store.persist_with_file_limit(&entry("retained", "/x", 1), 1024);
+            finished_tx.send(()).unwrap();
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            finished_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        drop(held);
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        writer.join().unwrap();
+
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains("retained"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_load_does_not_wait_for_the_optional_compaction_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "agsh_histloadlock_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        serde_json::to_writer(&mut file, &entry("visible", "/x", 1)).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+        let held = lock_history(&path).unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let thread_path = path.clone();
+        let loader = std::thread::spawn(move || {
+            let store = HistoryStore::with_file_load_limit(thread_path, 10, 1024);
+            finished_tx.send(store.len()).unwrap();
+        });
+
+        let loaded = finished_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        loader.join().unwrap();
+
+        assert_eq!(loaded.unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_history_stops_persisting_at_file_ceiling() {
+        let dir = std::env::temp_dir().join(format!("agsh_histactive_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.jsonl");
+        let mut store = HistoryStore::with_file(path.clone(), 100);
+        for index in 0..100 {
+            let item = entry(&format!("command-{index}-with-some-payload"), "/x", index);
+            store.push(item.clone());
+            store.persist_with_file_limit(&item, 1024);
+        }
+
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        assert!(bytes <= 1024, "history exceeded its file ceiling: {bytes}");
+        assert!(
+            store.len() > 10,
+            "in-memory history was unexpectedly capped by disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn persisted_history_files_are_private() {
@@ -876,6 +1384,61 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "history file mode was {mode:o}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_never_follows_a_configured_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("agsh_histpathlink_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        let path = dir.join("history.jsonl");
+        std::fs::write(&victim, b"do not append\n").unwrap();
+        symlink(&victim, &path).unwrap();
+
+        let mut store = HistoryStore::with_file(path, 10);
+        store.push(entry("secret command", "/x", 1));
+        store.finalize_last(0, 1);
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not append\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_history_input_is_rejected_without_reading() {
+        let store = HistoryStore::with_file(PathBuf::from("/dev/zero"), 10);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn giant_command_is_replaced_with_a_non_executable_history_marker() {
+        let mut store = HistoryStore::in_memory();
+        store.push(entry(&"x".repeat(MAX_HISTORY_COMMAND_BYTES + 1), "/x", 1));
+
+        let command = &store.entries()[0].command;
+        assert!(command.starts_with("# agsh:"));
+        assert!(command.len() < 256);
+    }
+
+    #[test]
+    fn retained_history_has_an_aggregate_memory_ceiling() {
+        let mut entries = (0..20)
+            .map(|index| entry(&format!("{index}:{}", "x".repeat(200)), "/x", index))
+            .collect::<Vec<_>>();
+        let mut retained = entries
+            .iter()
+            .map(history_entry_bytes)
+            .fold(0usize, usize::saturating_add);
+
+        trim_entries_to_bytes(&mut entries, &mut retained, 1024);
+
+        assert!(retained <= 1024);
+        assert!(!entries.is_empty());
+        assert!(entries.last().unwrap().command.starts_with("19:"));
     }
 
     #[cfg(unix)]

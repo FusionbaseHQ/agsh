@@ -26,7 +26,12 @@ journal the moment they are observed (diffed at every command boundary):
 This is **crash-only design**: there is no save-on-exit step to miss. A clean
 exit appends an `exit` record; a journal *without* one, whose shell pid is
 gone, marks a session that died — crash, closed terminal (recorded as `hup`),
-or reboot. At most the command in flight is lost.
+or reboot. Records are appended in bounded single writes so a partial final
+record does not prevent the loader from continuing at later complete lines.
+Journaling is best effort: oversized events, a full journal, lock contention,
+and I/O errors drop a record without failing the shell. Appends are not
+synchronously flushed at every command boundary, so abrupt power loss can also
+lose recent deltas that the OS had not yet made durable.
 
 Journaling is strictly interactive (TTY-gated). `agsh -c`, scripts, and piped
 sessions never journal, so non-interactive behavior is byte-identical.
@@ -53,7 +58,7 @@ it.) Even when enabled it is conservative: it fires only for a crash (no `hup`
 record — SIGKILL, panic, power loss) or a hangup/termination while something
 was still running, and only for deaths in the last 48 hours. A hangup at an
 idle prompt is how most people close a terminal window — those sessions never
-banner. Banner or no banner, everything stays available:
+banner. Banner or no banner, retained records remain discoverable:
 
 ```sh
 resume          # restore the most recent dead session
@@ -70,11 +75,14 @@ key; commands are never re-run, so restoring has no side effects. Afterwards:
   rerun suggestion.
 - background jobs are probed: a job whose process is alive *and* whose start
   time matches the journal (guarding against pid reuse) is reported as a
-  survivor with a signal hint; the rest are reported as lost.
+  survivor with a signal hint; mismatches are reported as lost, while a
+  transient or permission-denied probe is reported as unverifiable.
 
-A restored journal is marked consumed (`restored` record) so it is never
-offered twice. The next command boundary re-journals the applied state into
-the *new* session's journal, so restore chains across repeated crashes.
+After replay, agsh best-effort appends a `restored` marker. A successfully
+persisted marker prevents the journal from being offered twice; write failure
+can leave it eligible again. Resume is therefore not transactional. The next
+command boundary similarly attempts to journal the applied state in the new
+session.
 
 ## Wake-from-standby detection
 
@@ -91,14 +99,20 @@ agsh: system was asleep ~2h — 1 background job still running
 Journals live in `$AGSH_SESSION_DIR`, else `$XDG_STATE_HOME/agsh/sessions`,
 else `~/.local/state/agsh/sessions` — one `<id>.jsonl` per session, directory
 `0700`, files `0600` (they can carry exported secrets), capped at 40 files
-(oldest pruned at startup). Corrupt lines are skipped, never truncating the
-newer events after them. `$AGSH_SESSION` carries the session id into child
-processes.
+(oldest pruned at startup). Journal paths are opened without following their
+final symlink and only regular files are accepted, so FIFOs and devices cannot
+block shell startup or command-boundary writes. An encoded event is capped at
+1 MiB, a load or append inspects at most 64 MiB per journal, and at most 16,384
+decoded events are retained in memory. Oversized or corrupt lines are skipped,
+never truncating newer valid events after them. `$AGSH_SESSION` carries the
+session id into child processes.
 
-Two security properties hold across restore:
+Two replay properties apply to records that are present:
 
-- **Confinement cannot widen.** `AGSH_CONFINE` replays through the narrow-only
-  `set_confine` path, so a session that died confined comes back confined.
+- **A recorded confinement cannot widen during replay.** `AGSH_CONFINE` uses
+  the narrow-only `set_confine` path. A missing/non-durable record can omit
+  confinement entirely, so `resume` is not a security boundary; re-establish
+  confinement explicitly before running untrusted work.
 - **Session identity is never replayed.** `AGSH_SESSION`, `PWD`/`OLDPWD`,
   `SHLVL`, and positional parameters are excluded from journaling and replay.
 
@@ -142,21 +156,35 @@ running children, everything. Plain interactive startup prints a breadcrumb
 when detached sessions exist. Typing `exit` inside the session ends it for
 real, and the client reports the exit code.
 
-The layers compose: a kept session still journals its state deltas, so even if
-the *broker* dies (reboot), `resume` restores the session's state on the next
-start. Terminal death → broker keeps the process; host death → journal
-restores the state.
+The layers compose: a kept session still journals its state deltas, so if the
+*broker* dies (for example on reboot), `resume` can restore records that reached
+durable storage. Terminal death keeps the broker-owned process alive; host
+death leaves only the durable journal state to restore.
 
 ### Broker storage & security
 
 Broker state lives in `$AGSH_BROKER_DIR` (else `$XDG_STATE_HOME/agsh/broker`,
 else `~/.local/state/agsh/broker`): a 0700 directory holding the 0600 control
-socket (`agshd.sock` — the ssh-agent model: only the owning user can reach
-it), per-job logs (rotated at 8 MiB, ≤2 generations), and the daemon log.
+socket (`agshd.sock` — the ssh-agent model: only the owning user can reach it),
+per-job logs (rotated at 8 MiB, ≤2 generations), and the daemon log. The socket
+is private from bind time and the daemon verifies the peer UID of every accepted
+connection. An `AGSH_BROKER_SOCKET` override is accepted only when its existing
+parent is a real directory owned by the current user with mode 0700; unsafe
+shared parents such as `/tmp` fail closed rather than being chmodded.
 Job environments are passed explicitly by the spawning shell, so confinement
 (`AGSH_CONFINE`) propagates into kept jobs like any child. Stopping the broker
 hangs up its jobs (their PTYs close) — that is the documented `keep stop`
 contract, never an accident.
+
+Broker clients are same-UID peers, not separately authenticated principals.
+Control traffic is capped at 64 concurrent connections and 4 MiB per JSON line,
+with 5-second control I/O deadlines; one tail response is capped at 16 MiB.
+Logs and job environments are unredacted and may contain secrets. Each job log
+rotates locally, but old jobs' logs, the daemon log, and the number of running
+jobs have no aggregate count/byte/age ceiling. `keep rm` removes the job record,
+not its log files, so long-lived installations need external cleanup until
+global retention is implemented. Logging is best effort and is not fsynced for
+every write.
 
 ## Boundaries (what this does not do)
 
@@ -164,10 +192,18 @@ contract, never an accident.
 retroactively — a command you didn't `keep` (or a session not under `--keep`)
 still dies with its terminal, and the journal's flight recorder + resume
 recipes are the fallback. The broker holds one attached client per job (last
-attach wins), and killing the daemon degrades kept jobs to orphans (alive but
-unreachable) — they are their own sessions, so they keep running. Reattach is
+attach wins). Any broker exit closes its controller PTYs and normally delivers
+SIGHUP; a command that ignores SIGHUP may survive but is unreachable. Reattach is
 byte-replay, not screen reconstruction: a full-screen TUI may look garbled for
-a moment until it repaints on the resize signal. And a *frozen* attached
-client (e.g. a SIGSTOP'd terminal) currently stalls its job's output pump
-until it detaches — hardening (non-blocking writes, detach-on-stall) is
-planned.
+a moment until it repaints on the resize signal. Writes to an attached client
+have a 250 ms deadline: if a client freezes or stops consuming output, the
+broker drops that attachment and continues draining the PTY into its bounded
+scrollback and rotating log. The process keeps running and can be reattached;
+a persistently slow client may therefore be detached rather than allowed to
+stall the job.
+
+The broker currently represents `cwd` as a JSON string. A requested UTF-8 cwd
+must exist and be an openable directory or spawning fails explicitly; it never
+falls back to the daemon's cwd. Non-UTF-8 working-directory bytes are not yet
+representable by this protocol version, even though opaque environment entries
+are preserved byte-for-byte.

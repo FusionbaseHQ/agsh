@@ -1,5 +1,16 @@
 //! Family compactors: turn a command's output into a structured summary.
 
+/// Define a lazily compiled regex for a built-in, constant pattern. These
+/// parsers run for every observed command in their family, so compiling their
+/// grammars per invocation is avoidable hot-path work.
+macro_rules! static_regex {
+    ($name:ident, $pattern:literal) => {
+        static $name: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new($pattern).expect(concat!("valid built-in regex: ", $pattern))
+        });
+    };
+}
+
 pub mod compilers;
 pub mod container;
 pub mod generic;

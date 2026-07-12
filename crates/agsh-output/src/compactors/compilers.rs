@@ -20,8 +20,6 @@
 //!   indented `line:col  severity  message  rule` rows and a
 //!   `✖ N problems (X errors, Y warnings)` summary).
 
-use regex::Regex;
-
 use crate::summary::{CommandContext, SemanticSummary};
 use crate::util::{clip, command_basename};
 
@@ -29,6 +27,34 @@ use crate::util::{clip, command_basename};
 const MAX_LINE: usize = 200;
 /// Maximum detail entries collected per section before the framework caps it.
 const MAX_DETAIL: usize = 50;
+
+static_regex!(
+    CC_DIAG_RE,
+    r"^(.*?):(\d+):(?:(\d+):)?\s*(error|warning|note|fatal error):\s*(.*)$"
+);
+static_regex!(CC_DRIVER_RE, r"^(?:.+?:\s+)?(error|warning):\s+(.*)$");
+static_regex!(CARGO_ERROR_RE, r"^error(\[[^\]]+\])?:\s*(.*)$");
+static_regex!(CARGO_WARNING_RE, r"^warning(\[[^\]]+\])?:\s*(.*)$");
+static_regex!(CARGO_LOCATION_RE, r"^\s*-->\s*(\S+)");
+static_regex!(
+    TSC_DIAG_RE,
+    r"^(.*?)\((\d+),(\d+)\):\s*(error|warning)\s+TS\d+:\s*(.*)$"
+);
+static_regex!(FOUND_ERRORS_RE, r"^Found (\d+) error");
+static_regex!(
+    MYPY_DIAG_RE,
+    r"^(.*?):(\d+):(?:(\d+):)?\s*(error|warning|note):\s*(.*)$"
+);
+static_regex!(
+    LINT_DIAG_RE,
+    r"^(.*?):(\d+):(\d+):\s+([A-Za-z]+\d+):?\s+(.*)$"
+);
+static_regex!(ESLINT_DIAG_RE, r"^\s+(\d+):(\d+)\s+(error|warning)\s+(.*)$");
+static_regex!(
+    ESLINT_SUMMARY_RE,
+    r"(\d+)\s+errors?\s*,\s*(\d+)\s+warnings?"
+);
+static_regex!(STRIP_LINE_COL_RE, r"^(.*?):\d+(?::\d+)?$");
 
 #[derive(Debug, Clone, Copy)]
 enum Tool {
@@ -94,14 +120,11 @@ pub fn summarize(cx: &CommandContext) -> SemanticSummary {
 // ---------------------------------------------------------------------------
 
 fn parse_cc(cx: &CommandContext, summary: &mut SemanticSummary) {
-    let diag = Regex::new(r"^(.*?):(\d+):(?:(\d+):)?\s*(error|warning|note|fatal error):\s*(.*)$")
-        .unwrap();
-    let driver = Regex::new(r"^(?:.+?:\s+)?(error|warning):\s+(.*)$").unwrap();
     let mut errors = 0i64;
     let mut warnings = 0i64;
 
     for line in cx.all_lines() {
-        if let Some(c) = diag.captures(line) {
+        if let Some(c) = CC_DIAG_RE.captures(line) {
             let file = c[1].trim();
             if !file.is_empty() {
                 push_path(summary, file);
@@ -117,7 +140,7 @@ fn parse_cc(cx: &CommandContext, summary: &mut SemanticSummary) {
                     push_failure(summary, line);
                 }
             }
-        } else if let Some(c) = driver.captures(line) {
+        } else if let Some(c) = CC_DRIVER_RE.captures(line) {
             match &c[1] {
                 "warning" => {
                     warnings += 1;
@@ -136,26 +159,23 @@ fn parse_cc(cx: &CommandContext, summary: &mut SemanticSummary) {
 }
 
 fn parse_cargo(cx: &CommandContext, summary: &mut SemanticSummary) {
-    let err_re = Regex::new(r"^error(\[[^\]]+\])?:\s*(.*)$").unwrap();
-    let warn_re = Regex::new(r"^warning(\[[^\]]+\])?:\s*(.*)$").unwrap();
-    let loc_re = Regex::new(r"^\s*-->\s*(\S+)").unwrap();
     let mut errors = 0i64;
     let mut warnings = 0i64;
 
     for line in cx.all_lines() {
-        if let Some(c) = loc_re.captures(line) {
+        if let Some(c) = CARGO_LOCATION_RE.captures(line) {
             let file = strip_line_col(&c[1]);
             push_path(summary, &file);
             continue;
         }
-        if let Some(c) = err_re.captures(line) {
+        if let Some(c) = CARGO_ERROR_RE.captures(line) {
             if !is_aggregate_error(&c[2]) {
                 errors += 1;
                 push_failure(summary, line);
             }
             continue;
         }
-        if let Some(c) = warn_re.captures(line) {
+        if let Some(c) = CARGO_WARNING_RE.captures(line) {
             if !is_aggregate_warning(&c[2]) {
                 warnings += 1;
                 push_warning(summary, line);
@@ -168,13 +188,11 @@ fn parse_cargo(cx: &CommandContext, summary: &mut SemanticSummary) {
 }
 
 fn parse_tsc(cx: &CommandContext, summary: &mut SemanticSummary) {
-    let re = Regex::new(r"^(.*?)\((\d+),(\d+)\):\s*(error|warning)\s+TS\d+:\s*(.*)$").unwrap();
-    let found_re = Regex::new(r"^Found (\d+) error").unwrap();
     let mut errors = 0i64;
     let mut warnings = 0i64;
 
     for line in cx.all_lines() {
-        if let Some(c) = re.captures(line) {
+        if let Some(c) = TSC_DIAG_RE.captures(line) {
             let file = c[1].trim();
             if !file.is_empty() {
                 push_path(summary, file);
@@ -186,7 +204,7 @@ fn parse_tsc(cx: &CommandContext, summary: &mut SemanticSummary) {
                 errors += 1;
                 push_failure(summary, line);
             }
-        } else if found_re.is_match(line) {
+        } else if FOUND_ERRORS_RE.is_match(line) && summary.notes.len() < MAX_DETAIL {
             summary.add_note(clip(line, MAX_LINE));
         }
     }
@@ -196,14 +214,12 @@ fn parse_tsc(cx: &CommandContext, summary: &mut SemanticSummary) {
 }
 
 fn parse_mypy(cx: &CommandContext, summary: &mut SemanticSummary) {
-    let re = Regex::new(r"^(.*?):(\d+):(?:(\d+):)?\s*(error|warning|note):\s*(.*)$").unwrap();
-    let found_re = Regex::new(r"^Found (\d+) error").unwrap();
     let mut errors = 0i64;
     let mut warnings = 0i64;
     let mut found: Option<i64> = None;
 
     for line in cx.all_lines() {
-        if let Some(c) = re.captures(line) {
+        if let Some(c) = MYPY_DIAG_RE.captures(line) {
             let file = c[1].trim();
             if !file.is_empty() {
                 push_path(summary, file);
@@ -219,9 +235,11 @@ fn parse_mypy(cx: &CommandContext, summary: &mut SemanticSummary) {
                     push_failure(summary, line);
                 }
             }
-        } else if let Some(c) = found_re.captures(line) {
+        } else if let Some(c) = FOUND_ERRORS_RE.captures(line) {
             found = c[1].parse::<i64>().ok();
-            summary.add_note(clip(line, MAX_LINE));
+            if summary.notes.len() < MAX_DETAIL {
+                summary.add_note(clip(line, MAX_LINE));
+            }
         }
     }
 
@@ -230,13 +248,11 @@ fn parse_mypy(cx: &CommandContext, summary: &mut SemanticSummary) {
 }
 
 fn parse_ruff(cx: &CommandContext, summary: &mut SemanticSummary) {
-    let re = Regex::new(r"^(.*?):(\d+):(\d+):\s+([A-Za-z]+\d+):?\s+(.*)$").unwrap();
-    let found_re = Regex::new(r"^Found (\d+) error").unwrap();
     let mut errors = 0i64;
     let mut warnings = 0i64;
 
     for line in cx.all_lines() {
-        if let Some(c) = re.captures(line) {
+        if let Some(c) = LINT_DIAG_RE.captures(line) {
             let file = c[1].trim();
             if !file.is_empty() {
                 push_path(summary, file);
@@ -248,7 +264,7 @@ fn parse_ruff(cx: &CommandContext, summary: &mut SemanticSummary) {
                 errors += 1;
                 push_failure(summary, line);
             }
-        } else if found_re.is_match(line) {
+        } else if FOUND_ERRORS_RE.is_match(line) && summary.notes.len() < MAX_DETAIL {
             summary.add_note(clip(line, MAX_LINE));
         }
     }
@@ -258,15 +274,13 @@ fn parse_ruff(cx: &CommandContext, summary: &mut SemanticSummary) {
 }
 
 fn parse_eslint(cx: &CommandContext, summary: &mut SemanticSummary) {
-    let diag_re = Regex::new(r"^\s+(\d+):(\d+)\s+(error|warning)\s+(.*)$").unwrap();
-    let sum_re = Regex::new(r"(\d+)\s+errors?\s*,\s*(\d+)\s+warnings?").unwrap();
     let mut errors = 0i64;
     let mut warnings = 0i64;
     let mut totals: Option<(i64, i64)> = None;
     let mut current: Option<String> = None;
 
     for line in cx.all_lines() {
-        if let Some(c) = diag_re.captures(line) {
+        if let Some(c) = ESLINT_DIAG_RE.captures(line) {
             let detail = match &current {
                 Some(file) => format!("{}:{}:{} {}", file, &c[1], &c[2], c[4].trim_end()),
                 None => line.trim().to_string(),
@@ -280,7 +294,7 @@ fn parse_eslint(cx: &CommandContext, summary: &mut SemanticSummary) {
             }
             continue;
         }
-        if let Some(c) = sum_re.captures(line) {
+        if let Some(c) = ESLINT_SUMMARY_RE.captures(line) {
             let e = c[1].parse::<i64>().unwrap_or(0);
             let w = c[2].parse::<i64>().unwrap_or(0);
             totals = Some((e, w));
@@ -305,14 +319,11 @@ fn parse_eslint(cx: &CommandContext, summary: &mut SemanticSummary) {
 /// emit either gcc-style `error:`/`warning:` lines or `file:line:col: CODE`
 /// lint diagnostics.
 fn parse_generic(cx: &CommandContext, summary: &mut SemanticSummary) {
-    let cc_re = Regex::new(r"^(.*?):(\d+):(?:(\d+):)?\s*(error|warning|note|fatal error):\s*(.*)$")
-        .unwrap();
-    let lint_re = Regex::new(r"^(.*?):(\d+):(\d+):\s+([A-Za-z]+\d+):?\s+(.*)$").unwrap();
     let mut errors = 0i64;
     let mut warnings = 0i64;
 
     for line in cx.all_lines() {
-        if let Some(c) = cc_re.captures(line) {
+        if let Some(c) = CC_DIAG_RE.captures(line) {
             let file = c[1].trim();
             if !file.is_empty() {
                 push_path(summary, file);
@@ -328,7 +339,7 @@ fn parse_generic(cx: &CommandContext, summary: &mut SemanticSummary) {
                     push_failure(summary, line);
                 }
             }
-        } else if let Some(c) = lint_re.captures(line) {
+        } else if let Some(c) = LINT_DIAG_RE.captures(line) {
             let file = c[1].trim();
             if !file.is_empty() {
                 push_path(summary, file);
@@ -371,8 +382,7 @@ fn pluralize(n: i64, word: &str) -> String {
 
 /// Strip a trailing `:line` or `:line:col` suffix from a location token.
 fn strip_line_col(loc: &str) -> String {
-    let re = Regex::new(r"^(.*?):\d+(?::\d+)?$").unwrap();
-    match re.captures(loc) {
+    match STRIP_LINE_COL_RE.captures(loc) {
         Some(c) => c[1].to_string(),
         None => loc.to_string(),
     }

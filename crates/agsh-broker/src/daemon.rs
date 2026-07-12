@@ -8,12 +8,14 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::paths;
-use crate::protocol::{read_line, write_line, JobInfo, JobKind, Request, Response, SpawnSpec};
+use crate::protocol::{
+    read_line, write_line, JobInfo, JobKind, Request, Response, SpawnSpec, MAX_TAIL_BYTES,
+};
 
 /// In-memory scrollback kept per job, replayed on attach.
 const SCROLLBACK_CAP: usize = 64 * 1024;
@@ -21,6 +23,209 @@ const SCROLLBACK_CAP: usize = 64 * 1024;
 const LOG_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
 /// Keep at most this many finished jobs listed (oldest pruned on spawn).
 const FINISHED_CAP: usize = 20;
+const MAX_CONNECTIONS: usize = 64;
+const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const ATTACH_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+
+struct ActiveConnection {
+    count: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn reserve_connection(count: &Arc<AtomicUsize>, limit: usize) -> Option<ActiveConnection> {
+    count
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < limit).then_some(current + 1)
+        })
+        .ok()?;
+    Some(ActiveConnection {
+        count: Arc::clone(count),
+    })
+}
+
+fn open_private_append(path: &Path) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::MetadataExt;
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let file = File::from(descriptor);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "broker log path is not a regular file",
+        ));
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "broker log is owned by another user",
+        ));
+    }
+    rustix::fs::fchmod(&file, Mode::RUSR | Mode::WUSR)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+    Ok(file)
+}
+
+fn configure_requested_cwd(command: &mut Command, cwd: &Path) -> std::io::Result<()> {
+    use rustix::fs::{Mode, OFlags};
+
+    if cwd.as_os_str().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "broker spawn cwd is empty",
+        ));
+    }
+    let descriptor = rustix::fs::open(
+        cwd,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+    drop(descriptor);
+    command.current_dir(cwd);
+    Ok(())
+}
+
+fn ensure_peer_uid(peer_uid: u32) -> std::io::Result<()> {
+    let expected_uid = rustix::process::geteuid().as_raw();
+    if peer_uid == expected_uid {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("broker peer uid {peer_uid} does not match daemon uid {expected_uid}"),
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn socket_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+
+    nix::sys::socket::getsockopt(
+        stream.as_raw_fd(),
+        nix::sys::socket::sockopt::PeerCredentials,
+    )
+    .map(|credentials| credentials.uid())
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+))]
+fn socket_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+
+    nix::sys::socket::getsockopt(stream.as_raw_fd(), nix::sys::socket::sockopt::LocalPeerCred)
+        .map(|credentials| credentials.uid())
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+)))]
+fn socket_peer_uid(_stream: &UnixStream) -> std::io::Result<u32> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "broker peer credentials are unsupported on this platform",
+    ))
+}
+
+fn verify_peer_uid(stream: &UnixStream) -> std::io::Result<()> {
+    ensure_peer_uid(socket_peer_uid(stream)?)
+}
+
+fn prepare_socket_path(socket: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = match std::fs::symlink_metadata(socket) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "broker socket path exists and is not a socket",
+        ));
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "broker socket is owned by another user",
+        ));
+    }
+    match UnixStream::connect(socket) {
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "broker already running",
+        )),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            std::fs::remove_file(socket)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_bound_socket(socket: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::symlink_metadata(socket)?;
+    if !metadata.file_type().is_socket() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bound broker socket path is not a socket",
+        ));
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "bound broker socket is owned by another user",
+        ));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "bound broker socket is not mode 0600",
+        ));
+    }
+    Ok(())
+}
+
+fn bind_private_listener(socket: &Path) -> std::io::Result<UnixListener> {
+    // Unix sockets start as 0777 minus umask. The daemon has no worker threads
+    // yet, so temporarily removing owner-execute is process-race-free here.
+    let previous_umask = rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o177));
+    let result = UnixListener::bind(socket);
+    rustix::process::umask(previous_umask);
+    let listener = result?;
+    validate_bound_socket(socket)?;
+    Ok(listener)
+}
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -164,6 +369,31 @@ struct Broker {
     exe: PathBuf,
 }
 
+fn existing_job_sequence(logs_dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(logs_dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let number = name.strip_prefix('k')?.strip_suffix(".log")?;
+            number.parse::<u64>().ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn allocate_job_id(sequence: &AtomicU64) -> std::io::Result<String> {
+    let previous = sequence
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| std::io::Error::other("broker job id space exhausted"))?;
+    Ok(format!("k{}", previous + 1))
+}
+
 impl Broker {
     fn find(&self, id: &str) -> Option<Arc<KeptJob>> {
         self.jobs.lock().ok()?.iter().find(|j| j.id == id).cloned()
@@ -201,6 +431,7 @@ impl Broker {
             cmd,
             cwd,
             env,
+            opaque_env,
             rows,
             cols,
             kind,
@@ -209,6 +440,10 @@ impl Broker {
         if cmd.is_empty() {
             return Err(std::io::Error::other("empty command"));
         }
+        let mut command = Command::new(&self.exe);
+        command.arg("--supervise").arg("--").args(&cmd);
+        configure_requested_cwd(&mut command, Path::new(&cwd))?;
+
         let controller = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)
             .map_err(|e| std::io::Error::other(format!("openpt: {e}")))?;
         // CLOEXEC, or the controller leaks into every job we spawn — a job
@@ -236,17 +471,21 @@ impl Broker {
         )
         .map_err(|e| std::io::Error::other(format!("open pts: {e}")))?;
 
-        let id = format!("k{}", self.next_id.fetch_add(1, Ordering::SeqCst) + 1);
+        let id = allocate_job_id(&self.next_id)?;
         paths::ensure_dir(&self.logs_dir)?;
         let log_path = self.logs_dir.join(format!("{id}.log"));
 
-        let mut command = Command::new(&self.exe);
-        command.arg("--supervise").arg("--").args(&cmd);
-        if !cwd.is_empty() && Path::new(&cwd).is_dir() {
-            command.current_dir(&cwd);
-        }
         command.env_clear();
         command.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        {
+            use std::os::unix::ffi::OsStringExt;
+            for (key, value) in opaque_env {
+                command.env(
+                    std::ffi::OsString::from_vec(key),
+                    std::ffi::OsString::from_vec(value),
+                );
+            }
+        }
         if !env.iter().any(|(k, _)| k == "TERM") {
             command.env("TERM", "xterm-256color");
         }
@@ -295,11 +534,7 @@ impl Broker {
 /// Per-job pump: PTY controller → log file + scrollback + attached client;
 /// detects exit, reaps the child, and notifies/detaches the client.
 fn pump_job(job: Arc<KeptJob>, mut controller: File) {
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&job.log_path)
-        .ok();
+    let mut log = open_private_append(&job.log_path).ok();
     let mut logged: u64 = log
         .as_ref()
         .and_then(|f| f.metadata().ok())
@@ -323,11 +558,7 @@ fn pump_job(job: Arc<KeptJob>, mut controller: File) {
                             let _ = file.flush();
                             let old = job.log_path.with_extension("log.old");
                             let _ = std::fs::rename(&job.log_path, &old);
-                            log = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(&job.log_path)
-                                .ok();
+                            log = open_private_append(&job.log_path).ok();
                             logged = 0;
                         }
                     }
@@ -396,36 +627,41 @@ pub fn run(socket: &Path) -> std::io::Result<()> {
     // HUP the broker. (Fails harmlessly if we're already a group leader.)
     let _ = rustix::process::setsid();
 
-    if socket.exists() {
-        // A live daemon answers; a stale socket (crashed daemon) gets cleaned.
-        if UnixStream::connect(socket).is_ok() {
-            return Err(std::io::Error::other("broker already running"));
-        }
-        let _ = std::fs::remove_file(socket);
-    }
-    if let Some(parent) = socket.parent() {
-        paths::ensure_dir(parent)?;
-    }
-    let listener = UnixListener::bind(socket)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
-    }
+    // The daemon is a dedicated process. Keeping this umask for its lifetime
+    // makes the socket private at bind time instead of exposing a chmod race.
+    rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o077));
+
+    let parent = socket
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    paths::ensure_socket_parent(parent)?;
+    prepare_socket_path(socket)?;
+    let listener = bind_private_listener(socket)?;
 
     let logs_dir = paths::logs_dir().unwrap_or_else(|| PathBuf::from("."));
+    paths::ensure_dir(&logs_dir)?;
+    let next_id = existing_job_sequence(&logs_dir);
     let broker = Arc::new(Broker {
         jobs: Mutex::new(Vec::new()),
-        next_id: AtomicU64::new(0),
+        next_id: AtomicU64::new(next_id),
         logs_dir,
         exe: std::env::current_exe()?,
     });
 
     eprintln!("agshd: listening on {}", socket.display());
+    let active_connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        if verify_peer_uid(&stream).is_err() {
+            continue;
+        }
+        let Some(connection) = reserve_connection(&active_connections, MAX_CONNECTIONS) else {
+            continue;
+        };
         let broker = broker.clone();
         std::thread::spawn(move || {
+            let _connection = connection;
             let _ = handle_conn(&broker, stream);
         });
     }
@@ -433,11 +669,14 @@ pub fn run(socket: &Path) -> std::io::Result<()> {
 }
 
 fn handle_conn(broker: &Arc<Broker>, stream: UnixStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(CONTROL_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(CONTROL_IO_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream.try_clone()?;
     let Some(request): Option<Request> = read_line(&mut reader)? else {
         return Ok(());
     };
+    stream.set_read_timeout(None)?;
 
     match request {
         Request::Ping => write_line(
@@ -523,7 +762,7 @@ fn send_tail(writer: &mut UnixStream, log_path: &Path, bytes: u64) -> std::io::R
         return Ok(());
     };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let take = bytes.min(len);
+    let take = bytes.min(len).min(MAX_TAIL_BYTES);
     file.seek(SeekFrom::Start(len - take))?;
     write_line(writer, &Response::Tail { len: take })?;
     let mut remaining = take;
@@ -551,6 +790,7 @@ fn attach_conn(
     replay: u64,
 ) -> std::io::Result<()> {
     let mut writer = stream.try_clone()?;
+    writer.set_write_timeout(Some(ATTACH_WRITE_TIMEOUT))?;
     let Some(job) = broker.find(&id) else {
         return write_line(&mut writer, &Response::err(format!("no job {id}")));
     };
@@ -649,10 +889,7 @@ pub fn launch_detached(exe: &Path) -> std::io::Result<()> {
     if let Some(parent) = log.parent() {
         paths::ensure_dir(parent)?;
     }
-    let out = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)?;
+    let out = open_private_append(&log)?;
     Command::new(exe)
         .arg("--broker-daemon")
         .stdin(Stdio::null())
@@ -660,4 +897,217 @@ pub fn launch_detached(exe: &Path) -> std::io::Result<()> {
         .stderr(Stdio::from(out))
         .spawn()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use std::ffi::OsString;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn test_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("agsh-broker-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn private_log_open_tightens_an_existing_file() {
+        let dir = test_dir("log-mode");
+        let path = dir.join("job.log");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let mut file = open_private_append(&path).unwrap();
+        file.write_all(b"-new").unwrap();
+        drop(file);
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"old-new");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn private_log_open_rejects_a_final_symlink() {
+        let dir = test_dir("log-symlink");
+        let victim = dir.join("victim");
+        let log = dir.join("job.log");
+        std::fs::write(&victim, b"unchanged").unwrap();
+        symlink(&victim, &log).unwrap();
+
+        assert!(open_private_append(&log).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connection_reservations_are_bounded_and_released() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let first = reserve_connection(&count, 2).unwrap();
+        let second = reserve_connection(&count, 2).unwrap();
+        assert!(reserve_connection(&count, 2).is_none());
+        assert_eq!(count.load(Ordering::Acquire), 2);
+
+        drop(first);
+        let replacement = reserve_connection(&count, 2).unwrap();
+        assert_eq!(count.load(Ordering::Acquire), 2);
+
+        drop(second);
+        drop(replacement);
+        assert_eq!(count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn existing_logs_advance_job_ids_without_accepting_similar_names() {
+        let dir = test_dir("job-sequence");
+        for name in [
+            "k1.log",
+            "k19.log",
+            "k999.log.old",
+            "k20.log.tmp",
+            "other.log",
+            "knot-a-number.log",
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+
+        let sequence = AtomicU64::new(existing_job_sequence(&dir));
+
+        assert_eq!(allocate_job_id(&sequence).unwrap(), "k20");
+        assert_eq!(allocate_job_id(&sequence).unwrap(), "k21");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exhausted_job_id_space_returns_an_error_instead_of_wrapping() {
+        let sequence = AtomicU64::new(u64::MAX);
+        assert!(allocate_job_id(&sequence).is_err());
+        assert_eq!(sequence.load(Ordering::Acquire), u64::MAX);
+    }
+
+    #[test]
+    fn requested_cwd_rejects_empty_missing_and_non_directory_paths() {
+        let dir = test_dir("cwd-invalid");
+        let file = dir.join("file");
+        let missing = dir.join("missing");
+        std::fs::write(&file, b"not a directory").unwrap();
+
+        for path in [Path::new(""), &missing, &file] {
+            let mut command = Command::new("/usr/bin/true");
+            let error = configure_requested_cwd(&mut command, path).unwrap_err();
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidInput
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                ),
+                "{path:?}: {error}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deleted_requested_cwd_fails_at_spawn_instead_of_falling_back() {
+        let dir = test_dir("cwd-deleted");
+        let cwd = dir.join("requested");
+        std::fs::create_dir(&cwd).unwrap();
+        let mut command = Command::new("/usr/bin/true");
+        configure_requested_cwd(&mut command, &cwd).unwrap();
+        std::fs::remove_dir(&cwd).unwrap();
+
+        let error = command.spawn().unwrap_err();
+
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn cwd_validation_accepts_non_utf8_paths_without_lossy_conversion() {
+        let dir = test_dir("cwd-opaque");
+        let opaque = OsString::from_vec(vec![b'd', b'i', b'r', b'-', 0xff]);
+        let cwd = dir.join(opaque);
+        std::fs::create_dir(&cwd).unwrap();
+        let mut command = Command::new("/usr/bin/true");
+
+        configure_requested_cwd(&mut command, &cwd).unwrap();
+        let status = command.status().unwrap();
+
+        assert!(status.success());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn peer_uid_must_match_the_daemon_owner() {
+        let uid = rustix::process::geteuid().as_raw();
+        assert!(ensure_peer_uid(uid).is_ok());
+        assert_eq!(
+            ensure_peer_uid(uid.wrapping_add(1)).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn connected_unix_peer_credentials_are_available_and_match() {
+        let (left, _right) = UnixStream::pair().unwrap();
+        verify_peer_uid(&left).unwrap();
+    }
+
+    #[test]
+    fn socket_path_cleanup_rejects_non_socket_entries() {
+        let dir = test_dir("socket-entry");
+        let path = dir.join("agshd.sock");
+        std::fs::write(&path, b"do not remove").unwrap();
+
+        assert_eq!(
+            prepare_socket_path(&path).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"do not remove");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn listener_socket_is_private_at_bind_time() {
+        const CHILD_MARKER: &str = "AGSH_TEST_PRIVATE_SOCKET_BIND_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("daemon::tests::listener_socket_is_private_at_bind_time")
+                .arg("--nocapture")
+                .env(CHILD_MARKER, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let dir = test_dir("socket-mode");
+        let path = dir.join("agshd.sock");
+
+        let listener = bind_private_listener(&path).unwrap();
+
+        assert_eq!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

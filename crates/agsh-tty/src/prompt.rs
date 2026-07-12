@@ -2,10 +2,9 @@
 //!
 //! Segments: working directory (home-shortened), git branch + dirty marker,
 //! Python venv, AWS profile, last-command duration (when slow), and last exit
-//! status (when non-zero). Git info comes from `ShellState::git_context`, which
-//! reads the branch from `.git/HEAD` and time-bounds the dirty probe, so the
-//! prompt never blocks on a large repository. Colors honor terminal capability
-//! and `NO_COLOR`; when stdout is not a TTY the prompt is plain text.
+//! status (when non-zero). Git info uses a stale-while-refresh cache, so no Git
+//! filesystem or subprocess work runs on the prompt-rendering path. Colors honor
+//! terminal capability and `NO_COLOR`; non-TTY output uses plain text.
 
 use std::io::IsTerminal;
 
@@ -27,7 +26,7 @@ pub fn render_prompt(state: &ShellState) -> String {
     out.push_str(&theme.paint(Role::Accent, &short_cwd(state)));
 
     // Git branch + dirty marker + ahead/behind.
-    if let Some(git) = state.git_context() {
+    if let Some(git) = state.prompt_git_context() {
         if let Some(branch) = git.branch {
             let dirty = git.dirty.unwrap_or(false);
             let role = if dirty { Role::Warn } else { Role::Ok };

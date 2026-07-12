@@ -9,7 +9,7 @@ pub use error::{ShellError, ShellErrorKind, SourceSpan};
 pub use id::CommandId;
 pub use ir::{
     Assignment, CommandGraph, CommandInvocation, CommandList, CommandListItem, ListOperator,
-    Pipeline, Redirection, RedirectionMode, RedirectionTarget,
+    Pipeline, Redirection, RedirectionMode, RedirectionTarget, INLINE_HEREDOC_PREFIX,
 };
 pub use lexer::{QuoteKind, WordSegment};
 pub use parser::{is_incomplete, parse_line};

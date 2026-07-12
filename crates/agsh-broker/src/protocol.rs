@@ -3,9 +3,12 @@
 //! the connection to bidirectional raw bytes (client stdin ↔ job PTY), and
 //! `tail` sends `len` raw bytes after its header.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 
 use serde::{Deserialize, Serialize};
+
+pub const MAX_PROTOCOL_LINE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_TAIL_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -55,6 +58,10 @@ pub struct SpawnSpec {
     pub cmd: Vec<String>,
     pub cwd: String,
     pub env: Vec<(String, String)>,
+    /// Unix environment entries whose key or value is not valid UTF-8, encoded
+    /// as exact bytes for JSON transport to the broker supervisor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opaque_env: Vec<(Vec<u8>, Vec<u8>)>,
     pub rows: u16,
     pub cols: u16,
     pub kind: JobKind,
@@ -125,6 +132,12 @@ impl Response {
 pub fn write_line<T: Serialize>(writer: &mut impl Write, value: &T) -> std::io::Result<()> {
     let mut line = serde_json::to_string(value).map_err(std::io::Error::other)?;
     line.push('\n');
+    if line.len() > MAX_PROTOCOL_LINE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "broker protocol line exceeds size limit",
+        ));
+    }
     writer.write_all(line.as_bytes())?;
     writer.flush()
 }
@@ -133,11 +146,20 @@ pub fn write_line<T: Serialize>(writer: &mut impl Write, value: &T) -> std::io::
 pub fn read_line<T: for<'de> Deserialize<'de>>(
     reader: &mut impl BufRead,
 ) -> std::io::Result<Option<T>> {
-    let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
+    let mut line = Vec::new();
+    let read = reader
+        .take((MAX_PROTOCOL_LINE_BYTES + 1) as u64)
+        .read_until(b'\n', &mut line)?;
+    if read == 0 {
         return Ok(None);
     }
-    serde_json::from_str(line.trim())
+    if line.len() > MAX_PROTOCOL_LINE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "broker protocol line exceeds size limit",
+        ));
+    }
+    serde_json::from_slice(&line)
         .map(Some)
         .map_err(|e| std::io::Error::other(format!("bad protocol line: {e}")))
 }
@@ -154,6 +176,7 @@ mod tests {
                 cmd: vec!["sleep".into(), "5".into()],
                 cwd: "/w".into(),
                 env: vec![("PATH".into(), "/bin".into())],
+                opaque_env: vec![(b"OPAQUE".to_vec(), vec![b'a', 0xff, b'z'])],
                 rows: 24,
                 cols: 80,
                 kind: JobKind::Job,
@@ -211,5 +234,29 @@ mod tests {
         let empty: &[u8] = b"";
         let got: Option<Request> = read_line(&mut &*empty).unwrap();
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn oversized_protocol_lines_are_rejected_before_deserialization() {
+        let mut input = vec![b' '; MAX_PROTOCOL_LINE_BYTES + 1];
+        input.push(b'\n');
+
+        let error = read_line::<Request>(&mut input.as_slice()).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("size limit"));
+    }
+
+    #[test]
+    fn oversized_serialized_messages_are_not_written() {
+        let response = Response::Err {
+            message: "x".repeat(MAX_PROTOCOL_LINE_BYTES),
+        };
+        let mut output = Vec::new();
+
+        let error = write_line(&mut output, &response).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(output.is_empty());
     }
 }

@@ -15,11 +15,16 @@ pub mod util;
 
 pub use budget::{estimate_tokens, BudgetOptions};
 pub use classify::{classify, CommandFamily};
-pub use compact::{render_observation, render_observation_with};
-pub use config::{CompactorConfig, CompactorRuleSet};
+pub use compact::{
+    finalize_trace_status, render_observation, render_observation_with,
+    render_observation_with_raw_ref,
+};
+pub use config::{
+    CompactorConfig, CompactorRuleSet, RawStorageOptions, DEFAULT_MAX_RAW_BYTES, HARD_MAX_RAW_BYTES,
+};
 pub use context::CompactionContext;
 pub use mode::OutputMode;
 pub use normalize::{normalize, NormalizeOptions};
-pub use observation::{OutputObservation, RawStreamRef};
+pub use observation::{ObservationStreams, OutputObservation, RawStreamRef, RawTraceStatus};
 pub use redact::{is_sensitive_env_name, redact, RedactOptions};
 pub use summary::{CommandContext, SemanticSummary};

@@ -60,7 +60,7 @@ pub fn builtin_sessions(args: &[String], state: &mut ShellState) -> CommandOutco
     let sessions = find_sessions(state.cwd(), all);
 
     if let Some(n) = resume_n {
-        return resume_nth(&sessions, n);
+        return resume_nth(&sessions, n, state);
     }
 
     use std::io::IsTerminal;
@@ -417,7 +417,7 @@ fn render(sessions: &[Session], theme: &Theme, tty: bool, cwd: &str, all: bool) 
     out
 }
 
-fn resume_nth(sessions: &[Session], n: usize) -> CommandOutcome {
+fn resume_nth(sessions: &[Session], n: usize, state: &ShellState) -> CommandOutcome {
     let Some(s) = n.checked_sub(1).and_then(|i| sessions.get(i)) else {
         return CommandOutcome::captured(
             1,
@@ -426,6 +426,16 @@ fn resume_nth(sessions: &[Session], n: usize) -> CommandOutcome {
         );
     };
     let (prog, args) = s.agent.resume_command(&s.id);
+    if let Some(denied) = crate::confined_external_denial(state, prog) {
+        return denied;
+    }
+    let Some(path) = crate::resolve_shell_external(state, prog) else {
+        return CommandOutcome::captured(
+            127,
+            Vec::new(),
+            format!("sessions: failed to run {prog}: command not found\n").into_bytes(),
+        );
+    };
     let id8: String = s.id.chars().take(8).collect();
     eprintln!(
         "sessions: resuming {} {} in {}…",
@@ -433,8 +443,9 @@ fn resume_nth(sessions: &[Session], n: usize) -> CommandOutcome {
         id8,
         s.cwd
     );
-    let mut cmd = std::process::Command::new(prog);
+    let mut cmd = std::process::Command::new(path);
     cmd.args(&args);
+    state.configure_child_env(&mut cmd);
     if !s.cwd.is_empty() {
         cmd.current_dir(&s.cwd);
     }
@@ -530,5 +541,24 @@ mod tests {
         let with_summary: Vec<Value> =
             vec![serde_json::json!({"type":"summary","summary":"a nice summary"})];
         assert_eq!(claude_summary(&with_summary), "a nice summary");
+    }
+
+    #[test]
+    fn resume_respects_sticky_confinement_before_spawning_agent() {
+        let session = Session {
+            agent: Agent::Claude,
+            id: "session-id".into(),
+            cwd: "/tmp".into(),
+            modified: SystemTime::now(),
+            summary: String::new(),
+            file: PathBuf::from("/tmp/session.jsonl"),
+        };
+        let mut state = ShellState::from_current_process();
+        state.set_confine(&["true".to_string()]);
+
+        let outcome = resume_nth(&[session], 1, &state);
+
+        assert_eq!(outcome.exit_code, 126);
+        assert!(String::from_utf8_lossy(&outcome.stderr).contains("claude: not permitted"));
     }
 }

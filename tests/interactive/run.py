@@ -4,8 +4,8 @@ history, and signals. Reconstructs the visible screen and asserts on it.
 
 Usage:  python3 tests/interactive/run.py
 Env:    AGSH=<path>
-Exit:   0 if all checks pass, else 1. Requires a working PTY (skips with code 0
-        if pty.fork is unavailable).
+Exit:   0 only if every check runs and passes, else 1. Supported release hosts
+        must provide PTYs and Unix sockets; missing prerequisites are failures.
 """
 import json
 import os
@@ -23,6 +23,11 @@ PASS = 0
 FAIL = 0
 SKIP = 0
 _BROKER_RUNTIME = None
+_SUITE_TMP = tempfile.mkdtemp(prefix="agsh-pty-suite-")
+
+
+def suite_path(name):
+    return os.path.join(_SUITE_TMP, name)
 
 
 def check(name, cond, detail=""):
@@ -122,7 +127,7 @@ def scenario_completion_dropdown():
 def scenario_multiline_history_no_staircase():
     # Regression for the dropdown/ghost staircase: a multiline heredoc in history
     # must not corrupt the single-line editor when its prefix is retyped.
-    hist = "/tmp/agsh-pty-ml-history.jsonl"
+    hist = suite_path("ml-history.jsonl")
     with open(hist, "w") as f:
         f.write(json.dumps({
             "command": "cat <<EOF\nline1\nline2\nEOF", "cwd": "/x",
@@ -184,7 +189,7 @@ def _seed_history(path, commands):
 
 
 def scenario_reverse_search():
-    hist = "/tmp/agsh-pty-rsearch.jsonl"
+    hist = suite_path("rsearch.jsonl")
     _seed_history(hist, ["echo apple", "echo banana", "echo cherry"])
     s = Session(history=hist)
     try:
@@ -199,7 +204,7 @@ def scenario_reverse_search():
 
 
 def scenario_history_picker_tab_edits_and_mode_cycles():
-    hist = "/tmp/agsh-pty-history-picker.jsonl"
+    hist = suite_path("history-picker.jsonl")
     _seed_history(hist, ["echo picker-run", "echo picker-edit", "git status"])
     s = Session(history=hist)
     try:
@@ -218,7 +223,7 @@ def scenario_history_picker_tab_edits_and_mode_cycles():
 
 
 def scenario_history_tui_command_opens_picker():
-    hist = "/tmp/agsh-pty-history-tui.jsonl"
+    hist = suite_path("history-tui.jsonl")
     _seed_history(hist, ["echo tui-command", "echo other"])
     s = Session(history=hist)
     try:
@@ -233,7 +238,7 @@ def scenario_history_tui_command_opens_picker():
 
 
 def scenario_history_picker_scrolls_all_matches():
-    hist = "/tmp/agsh-pty-history-scroll.jsonl"
+    hist = suite_path("history-scroll.jsonl")
     _seed_history(hist, [f"echo scroll-{i:02d}" for i in range(20)])
     s = Session(history=hist)
     try:
@@ -250,7 +255,7 @@ def scenario_history_picker_scrolls_all_matches():
 
 
 def scenario_autosuggestion_accept():
-    hist = "/tmp/agsh-pty-suggest.jsonl"
+    hist = suite_path("suggest.jsonl")
     _seed_history(hist, ["echo suggested-tail"])
     s = Session(history=hist)
     try:
@@ -269,7 +274,7 @@ def scenario_huge_history_ghost_is_clipped():
     # thousands of chars from arithmetic fuzzing) must show as a clipped
     # one-line hint, not flood the screen with parens. Accepting with → must
     # still insert the FULL command, not the clipped display text.
-    hist = "/tmp/agsh-pty-monster.jsonl"
+    hist = suite_path("monster.jsonl")
     monster = "agmath '" + "(" * 2000 + "1" + ")" * 2000 + "'"
     _seed_history(hist, ["echo before", monster])
     s = Session(history=hist)
@@ -319,6 +324,24 @@ def scenario_sequential_commands():
         s.close()
 
 
+def scenario_frecent_jump():
+    with tempfile.TemporaryDirectory(prefix="agsh-frecent-", dir="/tmp") as base:
+        api = os.path.join(base, "backend-api")
+        web = os.path.join(base, "frontend-web")
+        os.makedirs(api)
+        os.makedirs(web)
+        s = Session(cols=160)
+        try:
+            s.send(f"cd {api}" + ENTER, 0.3)
+            s.send(f"cd {web}" + ENTER, 0.3)
+            s.send("agz backend" + ENTER, 0.4)
+            s.send("printf 'FRECENT=%s\\n' \"$PWD\"" + ENTER, 0.4)
+            scr = s.screen()
+            check("agz jumps to a frecent interactive cwd", f"FRECENT={api}" in scr, scr)
+        finally:
+            s.close()
+
+
 def _make_png(path, w=2, h=2):
     import struct
     import zlib
@@ -337,7 +360,7 @@ def _make_png(path, w=2, h=2):
 def scenario_view_image_inline_and_fallback():
     import os as _os
 
-    d = "/tmp/agsh-pty-img"
+    d = suite_path("img")
     _os.makedirs(d, exist_ok=True)
     _make_png(_os.path.join(d, "pic.png"), 8, 8)
     # 1) Image-capable terminal: `view` emits the crisp iTerm2 inline-image escape.
@@ -388,7 +411,7 @@ def scenario_mode_builtin_session_default():
 def scenario_view_code_highlighting():
     import os as _os
 
-    d = "/tmp/agsh-pty-code"
+    d = suite_path("code")
     _os.makedirs(d, exist_ok=True)
     with open(_os.path.join(d, "hello.py"), "w") as f:
         f.write('def greet(name):  # hi\n    return "hello " + name\n')
@@ -479,7 +502,7 @@ def scenario_mode_intercept_toggle():
 
 def scenario_rc_autoload():
     # An interactive session sources its rc file: aliases + exports must persist.
-    rc = "/tmp/agsh-pty-rc.agshrc"
+    rc = suite_path("rc.agshrc")
     with open(rc, "w") as f:
         f.write("alias hi='echo hello-from-rc'\nexport RCVAR=rcworks\n")
     s = Session(args=["--rcfile", rc])
@@ -769,6 +792,7 @@ SCENARIOS = [
     scenario_hooks_precmd_preexec_chpwd,
     scenario_programmable_completion,
     scenario_sequential_commands,
+    scenario_frecent_jump,
     scenario_huge_history_ghost_is_clipped,
     scenario_basic_echo,
     scenario_line_editing,
@@ -803,7 +827,8 @@ def main():
     print(
         f"\n================  interactive  PASS={PASS}  FAIL={FAIL}  SKIP={SKIP}  ================"
     )
-    sys.exit(1 if FAIL else 0)
+    shutil.rmtree(_SUITE_TMP, ignore_errors=True)
+    sys.exit(1 if FAIL or SKIP else 0)
 
 
 main()

@@ -135,6 +135,9 @@ fn spawn(cmd: &[String], state: &mut ShellState) -> CommandOutcome {
     if cmd.is_empty() {
         return fail(2, "keep: nothing to run (usage: keep -- CMD ARGS…)");
     }
+    if let Some(denied) = crate::confined_external_denial(state, &cmd[0]) {
+        return denied;
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => return fail(1, format!("keep: cannot find agsh binary: {e}")),
@@ -149,6 +152,7 @@ fn spawn(cmd: &[String], state: &mut ShellState) -> CommandOutcome {
         cmd: cmd.to_vec(),
         cwd: state.cwd().display().to_string(),
         env: job_env(state),
+        opaque_env: state.opaque_exported_env_bytes(),
         rows,
         cols,
         kind: JobKind::Job,
@@ -180,6 +184,51 @@ fn spawn(cmd: &[String], state: &mut ShellState) -> CommandOutcome {
         info.id, info.pid
     );
     finish_attach(&client, &info.id, attach_interactive(&client, &info.id))
+}
+
+/// Compatibility entry point for the legacy `agjob` builtin. Jobs use the
+/// broker so their logs are private, rotated, and survive the invoking shell.
+pub(crate) fn builtin_agjob(cmd: &[String], state: &mut ShellState) -> CommandOutcome {
+    if cmd.is_empty() {
+        return fail(2, "agjob: usage: agjob <command> [args...]");
+    }
+    if let Some(denied) = crate::confined_external_denial(state, &cmd[0]) {
+        return denied;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => return fail(1, format!("agjob: cannot find agsh binary: {error}")),
+    };
+    let client = match Client::connect_or_start(&exe) {
+        Ok(client) => client,
+        Err(error) => return fail(1, format!("agjob: {error}")),
+    };
+    let info = match client.spawn_job(SpawnSpec {
+        cmd: cmd.to_vec(),
+        cwd: state.cwd().display().to_string(),
+        env: job_env(state),
+        opaque_env: state.opaque_exported_env_bytes(),
+        rows: 24,
+        cols: 80,
+        kind: JobKind::Job,
+        title: cmd.join(" "),
+    }) {
+        Ok(info) => info,
+        Err(error) => return fail(1, format!("agjob: {error}")),
+    };
+
+    CommandOutcome::captured(
+        0,
+        format!(
+            "[{id}] {pid}  output: {log}\n\
+             agjob: status: keep status {id}   output: keep tail {id}\n",
+            id = info.id,
+            pid = info.pid,
+            log = info.log,
+        )
+        .into_bytes(),
+        Vec::new(),
+    )
 }
 
 fn attach(id: &str) -> CommandOutcome {
@@ -387,5 +436,16 @@ mod tests {
         let env = job_env(&state);
         assert!(env.iter().any(|(k, v)| k == "KEEP_ME" && v == "yes"));
         assert!(!env.iter().any(|(k, _)| k == "AGSH_SESSION"));
+    }
+
+    #[test]
+    fn spawn_respects_sticky_confinement_before_contacting_broker() {
+        let mut state = ShellState::from_current_process();
+        state.set_confine(&["true".to_string()]);
+
+        let outcome = spawn(&["/bin/echo".into(), "should-not-run".into()], &mut state);
+
+        assert_eq!(outcome.exit_code, 126);
+        assert!(String::from_utf8_lossy(&outcome.stderr).contains("echo: not permitted"));
     }
 }

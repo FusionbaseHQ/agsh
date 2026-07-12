@@ -7,8 +7,8 @@ reports seriously.
 
 **Please do not open a public issue for security vulnerabilities.**
 
-Report privately via GitHub's [Security Advisories](https://github.com/FusionbaseHQ/agsh/security/advisories/new),
-or email the maintainers. Include:
+Report privately via GitHub's [Security Advisories](https://github.com/FusionbaseHQ/agsh/security/advisories/new).
+Include:
 
 - affected version / commit,
 - platform and OS version,
@@ -16,6 +16,12 @@ or email the maintainers. Include:
 
 We aim to acknowledge within a few business days and to coordinate a fix and
 disclosure timeline with you.
+
+## Supported versions
+
+Security fixes are applied to `main` and, once public releases exist, to the
+latest GitHub release line. Older release lines and arbitrary forks are not
+maintained by this project.
 
 ## Scope
 
@@ -25,8 +31,9 @@ Of particular interest:
   (writes/network/exec/secret reads), or a case where `confine` runs a payload
   *unconfined* instead of failing closed.
 - Stream-corruption bugs where piped/redirected bytes are altered.
-- Parser/executor crashes or memory-safety issues (note: `unsafe` is forbidden in
-  first-party crates).
+- Parser/executor crashes or memory-safety issues. `unsafe` is forbidden in all
+  first-party crates except the isolated, optional `agsh-intercept` preload
+  library.
 
 ## Non-goals
 
@@ -34,3 +41,9 @@ Of particular interest:
 kernel/LSM vulnerabilities or side channels, and on platforms without a supported
 backend it **fails closed** (refuses to run) rather than pretending to confine.
 See [`docs/CONFINE.md`](docs/CONFINE.md).
+
+Deep shell interception is an experimental observation aid, not a security
+boundary. Platform loaders can omit it (including SIP/hardened, static, and
+setuid execution), and the preload hooks are not guaranteed safe in every
+post-fork, multi-threaded child. Security policy must rely on `confine` and its
+documented platform backend, never on `AGSH_INTERCEPT=...:deep` coverage.

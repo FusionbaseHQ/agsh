@@ -11,32 +11,69 @@ env:
   CARGO_TERM_COLOR: always
 
 permissions:
-  contents: write # create the release + upload assets
-  id-token: write # Sigstore signing for artifact attestations
-  attestations: write
-  artifact-metadata: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  validate:
+    name: validate release metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate pins, version, tag, and changelog
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            if [ "${{ github.event.repository.private }}" != false ]; then
+              echo "::error::release tags are refused while the repository is private; public releases require attestations"
+              exit 1
+            fi
+            case "$GITHUB_REF" in
+              refs/tags/v*) scripts/validate-release.sh "$GITHUB_REF_NAME" ;;
+              *) echo "::error::release pushes must target refs/tags/v*"; exit 1 ;;
+            esac
+          else
+            scripts/validate-release.sh
+          fi
+          tests/release/run.sh
+
   # Gate: the tagged commit must pass the workspace tests on both platforms.
   # (Full behavioral suites run in ci.yml on every push to main.)
   test:
     name: test gate (${{ matrix.os }})
+    needs: validate
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: true
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-22.04
+            installer_fixture: linux-x86_64
+          - os: macos-15
+            installer_fixture: darwin-arm64
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust (stable + rustfmt + clippy)
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: offline installer fixture (${{ matrix.installer_fixture }})
+        run: tests/install/run.sh "${{ matrix.installer_fixture }}"
+      - name: Install pinned Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
-          rustup default stable
-      - uses: Swatinem/rust-cache@v2
+          toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt,clippy
+          rustup default "$toolchain"
       - name: cargo fmt --check
         run: cargo fmt --all --check
       - name: cargo clippy -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo build
         run: cargo build --workspace --locked --verbose
       - name: cargo test
@@ -50,66 +87,366 @@ jobs:
       - name: interactive (PTY) tests
         run: python3 tests/interactive/run.py
 
+  # Compilation runs without signing or publication credentials. macOS payloads
+  # are handed to the isolated signing job as data; Linux archives are final.
   build:
     name: build (${{ matrix.target }})
     needs: test
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15
+            intercept_target: aarch64-apple-darwin
+            intercept_lib: libagsh_intercept.dylib
+            artifact: unsigned-agsh-aarch64-apple-darwin
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
+            intercept_target: x86_64-apple-darwin
+            intercept_lib: libagsh_intercept.dylib
+            artifact: unsigned-agsh-x86_64-apple-darwin
           # musl: fully static Linux binaries that run on any distro.
+          # The optional preload library uses the host's glibc ABI so it can be
+          # injected into ordinary Ubuntu executables.
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-22.04
+            intercept_target: x86_64-unknown-linux-gnu
+            intercept_lib: libagsh_intercept.so
+            artifact: release-agsh-x86_64-unknown-linux-musl
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
+            intercept_target: aarch64-unknown-linux-gnu
+            intercept_lib: libagsh_intercept.so
+            artifact: release-agsh-aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust (stable + target)
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain and targets
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
           rustup target add ${{ matrix.target }}
+          if [ "${{ matrix.intercept_target }}" != "${{ matrix.target }}" ]; then
+            rustup target add ${{ matrix.intercept_target }}
+          fi
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
           echo "CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER=musl-gcc" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-      - name: Build
-        run: cargo build --release --locked -p agsh --target ${{ matrix.target }}
-
-      # ---- macOS: Developer ID signing + notarization --------------------
-      # Required for tagged releases (a tag build FAILS without the secrets,
-      # so an unsigned release can never slip out); dry runs skip gracefully.
-      - name: Import Developer ID certificate
+      - name: Set minimum macOS deployment target
         if: runner.os == 'macOS'
+        run: echo 'MACOSX_DEPLOYMENT_TARGET=11.0' >> "$GITHUB_ENV"
+      - name: Build shell
+        run: cargo build --release --locked -p agsh --target ${{ matrix.target }}
+      - name: Build deep-interception library
+        run: cargo build --release --locked -p agsh-intercept --target ${{ matrix.intercept_target }}
+      - name: Normalize macOS interception-library install name
+        if: runner.os == 'macOS'
+        run: |
+          bin="target/${{ matrix.target }}/release/agsh"
+          lib="target/${{ matrix.intercept_target }}/release/${{ matrix.intercept_lib }}"
+          install_name_tool -id "@rpath/${{ matrix.intercept_lib }}" "$lib"
+          test "$(otool -D "$lib" | tail -n 1)" = "@rpath/${{ matrix.intercept_lib }}"
+          test "$(otool -l "$bin" | awk '/minos/{print $2; exit}')" = '11.0'
+          test "$(otool -l "$lib" | awk '/minos/{print $2; exit}')" = '11.0'
+      - name: Smoke test unsigned build
+        run: |
+          bin="target/${{ matrix.target }}/release/agsh"
+          lib="target/${{ matrix.intercept_target }}/release/${{ matrix.intercept_lib }}"
+          test -f "$bin"
+          test -f "$lib"
+          case "$(uname -s):$(uname -m):${{ matrix.target }}" in
+            Darwin:arm64:aarch64-apple-darwin | Darwin:x86_64:x86_64-apple-darwin | \
+            Linux:x86_64:x86_64-unknown-linux-musl | Linux:aarch64:aarch64-unknown-linux-musl)
+              "$bin" --version
+              test "$("$bin" -c 'echo release-smoke')" = "release-smoke"
+              smoke_src="$RUNNER_TEMP/agsh-dlopen-smoke.c"
+              smoke_bin="$RUNNER_TEMP/agsh-dlopen-smoke"
+              printf '%s\n' \
+                '#include <dlfcn.h>' \
+                '#include <stdio.h>' \
+                'int main(int argc, char **argv) {' \
+                '  void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);' \
+                '  if (handle == NULL) { puts(dlerror()); return 1; }' \
+                '  return dlclose(handle) != 0;' \
+                '}' > "$smoke_src"
+              cc "$smoke_src" -ldl -o "$smoke_bin"
+              "$smoke_bin" "$lib"
+              ;;
+            *) echo "Cross-built target; existence checked, execution skipped." ;;
+          esac
+      - name: Stage release payload
+        id: package
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            VERSION="$GITHUB_REF_NAME"
+          else
+            VERSION=dry-run
+          fi
+          NAME="agsh-$VERSION-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+          cp "target/${{ matrix.target }}/release/agsh" "dist/$NAME/"
+          cp "target/${{ matrix.intercept_target }}/release/${{ matrix.intercept_lib }}" "dist/$NAME/"
+          cp LICENSE NOTICE THIRD_PARTY_LICENSES.html README.md CHANGELOG.md "dist/$NAME/"
+          rust_copyright="$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html"
+          test -f "$rust_copyright"
+          cp "$rust_copyright" "dist/$NAME/RUST_STANDARD_LIBRARY_COPYRIGHT.html"
+          if [ "${{ runner.os }}" = Linux ]; then
+            musl_copyright=/usr/share/doc/musl/copyright
+            test -f "$musl_copyright"
+            cp "$musl_copyright" "dist/$NAME/MUSL_COPYRIGHT.txt"
+          fi
+          cp -R LICENSES "dist/$NAME/"
+          if [ "${{ runner.os }}" = Linux ]; then
+            tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+            rm -r "dist/$NAME"
+            (cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+          fi
+          printf 'name=%s\n' "$NAME" >> "$GITHUB_OUTPUT"
+      - name: Upload unsigned macOS payload
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ steps.package.outputs.name }}/
+          if-no-files-found: error
+      - name: Upload final Linux archive
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ steps.package.outputs.name }}.tar.gz
+            dist/${{ steps.package.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  # Source packaging does not compile project or dependency code. The finished
+  # artifact is uploaded before a different non-publishing job builds it with
+  # network access denied.
+  source-package:
+    name: assemble corresponding source
+    needs: test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain for cargo vendor
+        run: |
+          toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+      - name: Assemble complete corresponding source
+        id: source
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            VERSION="$GITHUB_REF_NAME"
+          else
+            VERSION=dry-run
+          fi
+          NAME="agsh-$VERSION-source"
+          SOURCE_ROOT="$RUNNER_TEMP/corresponding-source"
+          mkdir -p "$SOURCE_ROOT/$NAME/.cargo" dist
+
+          git archive --format=tar HEAD | tar -x -C "$SOURCE_ROOT/$NAME"
+          (
+            cd "$SOURCE_ROOT/$NAME"
+            cargo vendor --locked --versioned-dirs vendor > .cargo/config.toml
+          )
+
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
+          tar -C "$SOURCE_ROOT" --sort=name --mtime="@$SOURCE_DATE_EPOCH" \
+            --owner=0 --group=0 --numeric-owner \
+            -cf - "$NAME" | gzip -n > "dist/$NAME.tar.gz"
+          (cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+          printf 'name=%s\n' "$NAME" >> "$GITHUB_OUTPUT"
+      - name: Upload corresponding source
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-agsh-source
+          path: |
+            dist/${{ steps.source.outputs.name }}.tar.gz
+            dist/${{ steps.source.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  source-verify:
+    name: build corresponding source offline
+    needs: source-package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Download exact corresponding-source artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-agsh-source
+          path: incoming
+      - name: Verify and build the finished archive
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            VERSION="$GITHUB_REF_NAME"
+          else
+            VERSION=dry-run
+          fi
+          NAME="agsh-$VERSION-source"
+          test "$(find incoming -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2
+          test "$(find incoming -mindepth 1 -maxdepth 1 ! -type f | wc -l)" -eq 0
+          test -f "incoming/$NAME.tar.gz"
+          test -f "incoming/$NAME.tar.gz.sha256"
+          (cd incoming && sha256sum -c "$NAME.tar.gz.sha256")
+
+          VERIFY_ROOT="$RUNNER_TEMP/corresponding-source-verify"
+          mkdir -p "$VERIFY_ROOT"
+          tar -xzf "incoming/$NAME.tar.gz" -C "$VERIFY_ROOT"
+          test "$(find "$VERIFY_ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1
+          test "$(find "$VERIFY_ROOT" -mindepth 1 -maxdepth 1 ! -type d | wc -l)" -eq 0
+          test -d "$VERIFY_ROOT/$NAME"
+          toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' "$VERIFY_ROOT/$NAME/rust-toolchain.toml")
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          (
+            cd "$VERIFY_ROOT/$NAME"
+            cargo_bin=$(command -v cargo)
+            unshare_bin=$(command -v unshare)
+            setpriv_bin=$(command -v setpriv)
+            runner_uid=$(id -u)
+            runner_gid=$(id -g)
+            sudo --non-interactive "$unshare_bin" --net -- "$setpriv_bin" \
+              --reuid "$runner_uid" --regid "$runner_gid" --init-groups \
+              --no-new-privs -- \
+              /usr/bin/env \
+              "HOME=$HOME" \
+              "PATH=$PATH" \
+              "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+              "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+              CARGO_NET_OFFLINE=true \
+              "CARGO_TARGET_DIR=$RUNNER_TEMP/corresponding-source-target" \
+              "$cargo_bin" build --workspace --release --locked --offline
+          )
+
+  # Release notes and the installer are copied without running repository code.
+  metadata:
+    name: prepare release metadata
+    needs: validate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Prepare installer and release notes
+        run: |
+          mkdir metadata
+          cp install.sh metadata/install.sh
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            ver=${GITHUB_REF_NAME#v}
+          else
+            ver=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          fi
+          awk -v ver="$ver" '
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > metadata/notes.md
+          if ! grep -q '[^[:space:]]' metadata/notes.md; then
+            echo "See CHANGELOG.md for details." > metadata/notes.md
+          fi
+      - name: Upload exact release metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-metadata
+          path: |
+            metadata/install.sh
+            metadata/notes.md
+          if-no-files-found: error
+
+  # This job never checks out or compiles repository code and never executes the
+  # downloaded payload. Its environment must be protected as documented.
+  sign-macos:
+    name: sign (${{ matrix.target }})
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !github.event.repository.private
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    environment:
+      name: release-signing
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+            arch: arm64
+            artifact: unsigned-agsh-aarch64-apple-darwin
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            arch: x86_64
+            artifact: unsigned-agsh-x86_64-apple-darwin
+    steps:
+      - name: Download exact unsigned payload
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: unsigned
+      - name: Validate unsigned payload
+        run: |
+          test "$(find unsigned -mindepth 1 -type f | wc -l)" -eq 9
+          test "$(find unsigned -mindepth 1 -type d | wc -l)" -eq 1
+          test "$(find unsigned -mindepth 1 ! -type f ! -type d | wc -l)" -eq 0
+          set -- \
+            unsigned/agsh \
+            unsigned/libagsh_intercept.dylib \
+            unsigned/LICENSE \
+            unsigned/NOTICE \
+            unsigned/THIRD_PARTY_LICENSES.html \
+            unsigned/RUST_STANDARD_LIBRARY_COPYRIGHT.html \
+            unsigned/README.md \
+            unsigned/CHANGELOG.md \
+            unsigned/LICENSES/Apache-2.0.txt
+          for file in "$@"; do
+            test -f "$file"
+            test ! -L "$file"
+          done
+          test -d unsigned/LICENSES
+          test ! -L unsigned/LICENSES
+          test "$(lipo -archs unsigned/agsh)" = "${{ matrix.arch }}"
+          test "$(lipo -archs unsigned/libagsh_intercept.dylib)" = "${{ matrix.arch }}"
+          chmod 755 unsigned/agsh unsigned/libagsh_intercept.dylib
+      - name: Import Developer ID certificate
         env:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
-          if [ -z "$MACOS_CERT_P12" ]; then
-            case "$GITHUB_REF" in
-            refs/tags/v*)
-              echo "::error::tagged release requires signing secrets: MACOS_CERT_P12, MACOS_CERT_PASSWORD, MACOS_SIGN_IDENTITY, plus notary credentials (either APPLE_API_KEY_ID/APPLE_API_ISSUER/APPLE_API_KEY_P8 or APPLE_ID/APPLE_TEAM_ID/APPLE_APP_PASSWORD) — see docs/RELEASING.md"
-              exit 1
-              ;;
-            *)
-              echo "No signing secrets available — dry-run build stays unsigned."
-              exit 0
-              ;;
-            esac
-          fi
+          umask 077
+          test -n "$MACOS_CERT_P12"
+          test -n "$MACOS_CERT_PASSWORD"
+          test -n "$MACOS_SIGN_IDENTITY"
           KEYCHAIN="$RUNNER_TEMP/sign.keychain-db"
           KEYCHAIN_PASS=$(openssl rand -hex 24)
-          echo "$MACOS_CERT_P12" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          trap 'rm -f "$RUNNER_TEMP/cert.p12"' EXIT
+          printf '%s' "$MACOS_CERT_P12" | base64 -d > "$RUNNER_TEMP/cert.p12"
           security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
           security set-keychain-settings -lut 1800 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
@@ -118,130 +455,285 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: \
             -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          rm "$RUNNER_TEMP/cert.p12"
-          echo "SIGNING=1" >>"$GITHUB_ENV"
-
-      - name: Sign (hardened runtime) and notarize
-        if: runner.os == 'macOS' && env.SIGNING == '1'
+      - name: Sign with hardened runtime and notarize
         env:
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
-          # Notary auth, option A: App Store Connect API key.
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
-          # Notary auth, option B: Apple ID + app-specific password.
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
-          bin="target/${{ matrix.target }}/release/agsh"
+          umask 077
+          bin=unsigned/agsh
+          lib=unsigned/libagsh_intercept.dylib
+          trap 'rm -f "$RUNNER_TEMP/AuthKey.p8"' EXIT
+          codesign --force --sign "$MACOS_SIGN_IDENTITY" \
+            --options runtime --timestamp "$lib"
           codesign --force --sign "$MACOS_SIGN_IDENTITY" \
             --options runtime --timestamp "$bin"
+          codesign --verify --strict --verbose=2 "$lib"
           codesign --verify --strict --verbose=2 "$bin"
 
-          # Pick notary credentials: API key if present, else Apple ID +
-          # app-specific password.
           if [ -n "$APPLE_API_KEY_P8" ]; then
+            test -n "$APPLE_API_KEY_ID" && test -n "$APPLE_API_ISSUER" || {
+              echo "::error::API-key notarization requires APPLE_API_KEY_ID and APPLE_API_ISSUER"
+              exit 1
+            }
             printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
             auth=(--key "$RUNNER_TEMP/AuthKey.p8"
                   --key-id "$APPLE_API_KEY_ID"
                   --issuer "$APPLE_API_ISSUER")
           elif [ -n "$APPLE_APP_PASSWORD" ]; then
+            test -n "$APPLE_ID" && test -n "$APPLE_TEAM_ID" || {
+              echo "::error::Apple-ID notarization requires APPLE_ID and APPLE_TEAM_ID"
+              exit 1
+            }
             auth=(--apple-id "$APPLE_ID"
                   --team-id "$APPLE_TEAM_ID"
                   --password "$APPLE_APP_PASSWORD")
           else
-            echo "::error::no notary credentials: set APPLE_API_KEY_ID/APPLE_API_ISSUER/APPLE_API_KEY_P8 or APPLE_ID/APPLE_TEAM_ID/APPLE_APP_PASSWORD"
+            echo "::error::no notary credentials configured in release-signing"
             exit 1
           fi
 
-          # The notary service accepts zip/dmg/pkg — submit a zip of the
-          # signed binary. The ticket is keyed to the binary's cdhash, so the
-          # binary inside our .tar.gz is covered; bare Mach-O binaries can't
-          # be stapled (Gatekeeper fetches the ticket online on first run).
-          ditto -c -k "$bin" "$RUNNER_TEMP/agsh-notarize.zip"
+          notarize_dir="$RUNNER_TEMP/agsh-notarize"
+          mkdir "$notarize_dir"
+          cp "$bin" "$lib" "$notarize_dir/"
+          ditto -c -k --keepParent "$notarize_dir" "$RUNNER_TEMP/agsh-notarize.zip"
           xcrun notarytool submit "$RUNNER_TEMP/agsh-notarize.zip" \
             "${auth[@]}" \
             --wait --timeout 20m \
             --output-format json | tee "$RUNNER_TEMP/notary.json"
-          rm -f "$RUNNER_TEMP/AuthKey.p8"
           status=$(jq -r '.status' "$RUNNER_TEMP/notary.json")
-          if [ "$status" != "Accepted" ]; then
+          if [ "$status" != Accepted ]; then
             echo "::error::notarization failed: status=$status (id=$(jq -r '.id' "$RUNNER_TEMP/notary.json"))"
             exit 1
           fi
-
       - name: Clean up signing keychain
-        if: always() && runner.os == 'macOS'
+        if: always()
         run: |
           security delete-keychain "$RUNNER_TEMP/sign.keychain-db" 2>/dev/null || true
           security list-keychains -d user -s login.keychain-db 2>/dev/null || true
-      # ---------------------------------------------------------------------
-
-      - name: Smoke test the binary
-        # Native-arch targets only; the x86_64 darwin binary is cross-built on
-        # an arm64 runner (Rosetta may or may not be available — skip there).
-        if: matrix.target != 'x86_64-apple-darwin'
+      - name: Package signed payload
+        id: signed
         run: |
-          bin="target/${{ matrix.target }}/release/agsh"
-          "$bin" --version
-          test "$("$bin" -c 'echo release-smoke')" = "release-smoke"
-      - name: Package
-        run: |
-          VERSION="$GITHUB_REF_NAME"
-          case "$VERSION" in v*) ;; *) VERSION="dry-run" ;; esac
-          NAME="agsh-$VERSION-${{ matrix.target }}"
-          mkdir -p "dist/$NAME"
-          cp "target/${{ matrix.target }}/release/agsh" "dist/$NAME/"
-          cp LICENSE README.md CHANGELOG.md "dist/$NAME/"
-          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
-          rm -r "dist/$NAME"
+          NAME="agsh-$GITHUB_REF_NAME-${{ matrix.target }}"
+          mkdir -p "package/$NAME" dist
+          cp -R unsigned/. "package/$NAME/"
+          chmod 755 "package/$NAME/agsh" "package/$NAME/libagsh_intercept.dylib"
+          tar -C package -czf "dist/$NAME.tar.gz" "$NAME"
           (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
-      - uses: actions/upload-artifact@v4
+          printf 'name=%s\n' "$NAME" >> "$GITHUB_OUTPUT"
+      - name: Upload final signed archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: agsh-${{ matrix.target }}
-          path: dist/*
+          name: release-agsh-${{ matrix.target }}
+          path: |
+            dist/${{ steps.signed.outputs.name }}.tar.gz
+            dist/${{ steps.signed.outputs.name }}.tar.gz.sha256
           if-no-files-found: error
 
+  # The publisher has no checkout and runs no Cargo/project code. It receives
+  # only exact final artifacts after all non-publishing verification has passed.
   release:
     name: publish GitHub release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    needs: [build, source-package, source-verify, metadata, sign-macos]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !github.event.repository.private
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment:
+      name: release-publication
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - name: Download final macOS arm64 archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: dist
-          merge-multiple: true
-      - name: Assemble checksums.txt
+          name: release-agsh-aarch64-apple-darwin
+          path: incoming/aarch64-apple-darwin
+      - name: Download final macOS x86_64 archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-agsh-x86_64-apple-darwin
+          path: incoming/x86_64-apple-darwin
+      - name: Download final Linux arm64 archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-agsh-aarch64-unknown-linux-musl
+          path: incoming/aarch64-unknown-linux-musl
+      - name: Download final Linux x86_64 archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-agsh-x86_64-unknown-linux-musl
+          path: incoming/x86_64-unknown-linux-musl
+      - name: Download exact corresponding-source archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-agsh-source
+          path: incoming/source
+      - name: Download exact release metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-metadata
+          path: incoming/metadata
+      - name: Assemble and verify exact release asset set
         run: |
+          set -euo pipefail
+          mkdir dist
+          targets=(
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+            aarch64-unknown-linux-musl
+            x86_64-unknown-linux-musl
+          )
+          archives=()
+          for target in "${targets[@]}"; do
+            input="incoming/$target"
+            archive="agsh-$GITHUB_REF_NAME-$target.tar.gz"
+            test "$(find "$input" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2
+            test "$(find "$input" -mindepth 1 -maxdepth 1 ! -type f | wc -l)" -eq 0
+            test -f "$input/$archive"
+            test -f "$input/$archive.sha256"
+            cp "$input/$archive" "$input/$archive.sha256" dist/
+            archives+=("$archive")
+          done
+
+          source_archive="agsh-$GITHUB_REF_NAME-source.tar.gz"
+          test "$(find incoming/source -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2
+          test "$(find incoming/source -mindepth 1 -maxdepth 1 ! -type f | wc -l)" -eq 0
+          test -f "incoming/source/$source_archive"
+          test -f "incoming/source/$source_archive.sha256"
+          cp "incoming/source/$source_archive" "incoming/source/$source_archive.sha256" dist/
+          archives+=("$source_archive")
+
+          test "$(find incoming/metadata -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2
+          test "$(find incoming/metadata -mindepth 1 -maxdepth 1 ! -type f | wc -l)" -eq 0
+          test -f incoming/metadata/install.sh
+          test -f incoming/metadata/notes.md
+          test -s incoming/metadata/notes.md
+          cp incoming/metadata/install.sh dist/install.sh
+
           cd dist
-          cat ./*.sha256 > checksums.txt
-          rm ./*.sha256
-          ls -la
-      - name: Attest release assets
-        if: ${{ !github.event.repository.private }}
-        uses: actions/attest@v4
-        with:
-          subject-path: |
-            dist/*.tar.gz
-            dist/checksums.txt
-      - name: Extract this version's notes from CHANGELOG.md
+          : > checksums.unsorted
+          for archive in "${archives[@]}"; do
+            sidecar="$archive.sha256"
+            expected=$(awk -v file="$archive" '
+              NR == 1 && NF == 2 && $2 == file && length($1) == 64 && $1 ~ /^[0-9a-f]+$/ { print $1 }
+            ' "$sidecar")
+            test "$(wc -l < "$sidecar" | tr -d ' ')" = 1
+            test -n "$expected"
+            actual=$(sha256sum "$archive" | awk '{print $1}')
+            test "$actual" = "$expected"
+            sha256sum "$archive" >> checksums.unsorted
+          done
+          sha256sum install.sh >> checksums.unsorted
+          LC_ALL=C sort -k 2 checksums.unsorted > checksums.txt
+          sha256sum -c checksums.txt
+          for archive in "${archives[@]}"; do
+            rm "$archive.sha256"
+          done
+          rm checksums.unsorted
+
+          expected_assets=(
+            "agsh-$GITHUB_REF_NAME-aarch64-apple-darwin.tar.gz"
+            "agsh-$GITHUB_REF_NAME-x86_64-apple-darwin.tar.gz"
+            "agsh-$GITHUB_REF_NAME-aarch64-unknown-linux-musl.tar.gz"
+            "agsh-$GITHUB_REF_NAME-x86_64-unknown-linux-musl.tar.gz"
+            "agsh-$GITHUB_REF_NAME-source.tar.gz"
+            install.sh
+            checksums.txt
+          )
+          test "$(find . -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq "${#expected_assets[@]}"
+          test "$(find . -mindepth 1 -maxdepth 1 ! -type f | wc -l)" -eq 0
+          for asset in "${expected_assets[@]}"; do
+            test -f "$asset"
+          done
+      - name: Prepare no-checkout release-tag guard
         run: |
-          awk -v ver="${GITHUB_REF_NAME#v}" '
-            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
-            found && /^## \[/ { exit }
-            found { print }
-          ' CHANGELOG.md > notes.md
-          if ! grep -q '[^[:space:]]' notes.md; then
-            echo "See CHANGELOG.md for details." > notes.md
-          fi
-      - name: Create release
+          umask 077
+          cat > "$RUNNER_TEMP/verify-release-tag-binding.sh" <<'BASH'
+          verify_release_tag_binding() {
+            local ref_type tag_object_sha target_type target_sha
+            local confirmed_ref_type confirmed_tag_object_sha
+            IFS=$'\t' read -r ref_type tag_object_sha < <(
+              gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+                --jq '[.object.type, .object.sha] | @tsv'
+            )
+            if [ "$ref_type" != tag ]; then
+              echo "::error::$GITHUB_REF_NAME is no longer an annotated tag"
+              return 1
+            fi
+
+            IFS=$'\t' read -r target_type target_sha < <(
+              gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha" \
+                --jq '[.object.type, .object.sha] | @tsv'
+            )
+            if [ "$target_type" != commit ]; then
+              echo "::error::$GITHUB_REF_NAME must directly annotate a commit"
+              return 1
+            fi
+
+            IFS=$'\t' read -r confirmed_ref_type confirmed_tag_object_sha < <(
+              gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+                --jq '[.object.type, .object.sha] | @tsv'
+            )
+            if [ "$confirmed_ref_type" != tag ] || \
+              [ "$confirmed_tag_object_sha" != "$tag_object_sha" ]
+            then
+              echo "::error::$GITHUB_REF_NAME changed while its target was being checked"
+              return 1
+            fi
+            if ! test "$target_sha" = "$GITHUB_SHA"; then
+              echo "::error::$GITHUB_REF_NAME moved from workflow commit $GITHUB_SHA to $target_sha"
+              return 1
+            fi
+          }
+          BASH
+      - name: Revalidate annotated tag before attestation
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          set -euo pipefail
+          . "$RUNNER_TEMP/verify-release-tag-binding.sh"
+          verify_release_tag_binding
+      - name: Attest release assets
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            dist/agsh-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+            dist/agsh-${{ github.ref_name }}-x86_64-apple-darwin.tar.gz
+            dist/agsh-${{ github.ref_name }}-aarch64-unknown-linux-musl.tar.gz
+            dist/agsh-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz
+            dist/agsh-${{ github.ref_name }}-source.tar.gz
+            dist/install.sh
+            dist/checksums.txt
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/verify-release-tag-binding.sh"
+          verify_release_tag_binding
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/agsh-$GITHUB_REF_NAME-aarch64-apple-darwin.tar.gz" \
+            "dist/agsh-$GITHUB_REF_NAME-x86_64-apple-darwin.tar.gz" \
+            "dist/agsh-$GITHUB_REF_NAME-aarch64-unknown-linux-musl.tar.gz" \
+            "dist/agsh-$GITHUB_REF_NAME-x86_64-unknown-linux-musl.tar.gz" \
+            "dist/agsh-$GITHUB_REF_NAME-source.tar.gz" \
+            dist/install.sh \
+            dist/checksums.txt \
             --title "agsh $GITHUB_REF_NAME" \
-            --notes-file notes.md \
+            --notes-file incoming/metadata/notes.md \
             --verify-tag
+          immutable=$(gh release view "$GITHUB_REF_NAME" --json isImmutable --jq .isImmutable)
+          if [ "$immutable" != true ]; then
+            echo "::error::published release is mutable; enable repository release immutability"
+            exit 1
+          fi

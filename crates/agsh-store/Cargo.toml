@@ -3,10 +3,17 @@ name = "agsh-store"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+authors.workspace = true
+description = "Trace, history, and session-journal storage types for agsh."
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish.workspace = true
 
 [dependencies]
 agsh-core = { path = "../agsh-core" }
 agsh-output = { path = "../agsh-output" }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 

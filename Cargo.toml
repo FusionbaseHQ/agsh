@@ -21,11 +21,13 @@ members = [
 edition = "2021"
 rust-version = "1.96"
 license = "AGPL-3.0-only"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Fusionbase and the agsh contributors"]
 description = "A modern, from-scratch POSIX-style shell in Rust — for humans and AI coding agents."
 repository = "https://github.com/FusionbaseHQ/agsh"
 homepage = "https://github.com/FusionbaseHQ/agsh"
+readme = "README.md"
+publish = false
 keywords = ["shell", "posix", "terminal", "agent", "sandbox"]
 categories = ["command-line-utilities", "development-tools"]
 

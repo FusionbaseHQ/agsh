@@ -14,6 +14,8 @@ ci_default = "raw"
 [storage]
 store_raw = true
 raw_retention = "14d"
+# Combined persisted stdout + stderr per command. b/kb/mb/gb use binary units;
+# values above the hard 1 GiB ceiling are clamped.
 max_raw_per_command = "100mb"
 
 [budget]

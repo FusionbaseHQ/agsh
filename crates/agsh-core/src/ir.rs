@@ -1,6 +1,10 @@
 use crate::lexer::{QuoteKind, WordSegment};
 use crate::{CommandId, SourceSpan};
 
+/// Parser-only transport for a here-document embedded inside a compound command
+/// that will be reconstructed and parsed again by the executor.
+pub const INLINE_HEREDOC_PREFIX: &str = "\u{1f}agsh-heredoc:v1:";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandGraph {
     pub id: CommandId,

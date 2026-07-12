@@ -2,8 +2,7 @@
 //! introspection and editing for an AI agent driving the shell.
 //!
 //! - `context`  — one-shot structured shell state (cwd/git/last/jobs/env/recent).
-//! - `trace`    — slice captured output (head/tail/range/grep/lines) — see
-//!   `builtins::builtin_trace`, which uses [`apply_slice`] here.
+//! - `trace`    — stream bounded captured-output head/tail/range/grep slices.
 //! - `peek`     — read file slices with line numbers (file.read_range).
 //! - `patch`    — apply a unified diff from stdin to a file (file.patch).
 //!
@@ -12,12 +11,58 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::{CommandOutcome, ShellState};
 
 /// Largest number of lines any of these builtins will emit (runaway guard).
 const MAX_LINES: usize = 5000;
+const MAX_AGENT_FILE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PATCH_DIFF_BYTES: usize = 16 * 1024 * 1024;
+const MAX_GIT_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
+const GIT_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_CAPTURE_POST_EXIT_BYTES: usize = 1024 * 1024;
+const GIT_CAPTURE_POST_EXIT_TIME: Duration = Duration::from_millis(100);
+
+fn read_bounded_regular_file(
+    path: &Path,
+    limit: usize,
+) -> std::io::Result<(Vec<u8>, std::fs::Permissions)> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let file = std::fs::File::from(descriptor);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    if metadata.len() > limit as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {limit} bytes"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((limit + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {limit} bytes"),
+        ));
+    }
+    Ok((bytes, metadata.permissions()))
+}
 
 /// Line-selection options shared by `trace` and `peek`.
 #[derive(Debug, Default, Clone)]
@@ -227,8 +272,8 @@ pub fn peek(args: &[String], state: &ShellState) -> CommandOutcome {
         return CommandOutcome::captured(2, Vec::new(), b"peek: usage: peek <file> [--range A:B] [--head N] [--tail N] [--grep STR] [--lines]\n".to_vec());
     };
     let path = resolve_path(state, file);
-    match std::fs::read(&path) {
-        Ok(bytes) => {
+    match read_bounded_regular_file(&path, MAX_AGENT_FILE_BYTES) {
+        Ok((bytes, _)) => {
             if bytes.iter().take(8192).any(|&b| b == 0) {
                 return CommandOutcome::captured(
                     1,
@@ -262,6 +307,13 @@ pub fn patch(args: &[String], state: &ShellState, stdin: Option<&[u8]>) -> Comma
             b"patch: no diff on stdin (pipe a unified diff or use a heredoc)\n".to_vec(),
         );
     };
+    if diff_bytes.len() > MAX_PATCH_DIFF_BYTES {
+        return CommandOutcome::captured(
+            1,
+            Vec::new(),
+            format!("patch: diff exceeds {MAX_PATCH_DIFF_BYTES} bytes\n").into_bytes(),
+        );
+    }
     let diff = match std::str::from_utf8(diff_bytes) {
         Ok(diff) => diff,
         Err(e) => {
@@ -283,41 +335,17 @@ pub fn patch(args: &[String], state: &ShellState, stdin: Option<&[u8]>) -> Comma
             )
         }
     };
-    let mut source = match std::fs::File::open(&target) {
-        Ok(source) => source,
-        Err(e) => {
-            return CommandOutcome::captured(
-                1,
-                Vec::new(),
-                format!("patch: {file}: {e}\n").into_bytes(),
-            )
-        }
-    };
-    let permissions = match source.metadata() {
-        Ok(metadata) if metadata.is_file() => metadata.permissions(),
-        Ok(_) => {
-            return CommandOutcome::captured(
-                1,
-                Vec::new(),
-                format!("patch: {file}: not a regular file\n").into_bytes(),
-            )
-        }
-        Err(e) => {
-            return CommandOutcome::captured(
-                1,
-                Vec::new(),
-                format!("patch: {file}: {e}\n").into_bytes(),
-            )
-        }
-    };
-    let mut original_bytes = Vec::new();
-    if let Err(e) = source.read_to_end(&mut original_bytes) {
-        return CommandOutcome::captured(
-            1,
-            Vec::new(),
-            format!("patch: {file}: {e}\n").into_bytes(),
-        );
-    }
+    let (original_bytes, permissions) =
+        match read_bounded_regular_file(&target, MAX_AGENT_FILE_BYTES) {
+            Ok(result) => result,
+            Err(e) => {
+                return CommandOutcome::captured(
+                    1,
+                    Vec::new(),
+                    format!("patch: {file}: {e}\n").into_bytes(),
+                )
+            }
+        };
     let original = match std::str::from_utf8(&original_bytes) {
         Ok(original) => original,
         Err(e) => {
@@ -372,11 +400,16 @@ fn atomic_replace(
     for _ in 0..128 {
         let id = PATCH_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let temp_path = parent.join(format!(".agsh-patch-{}-{id}.tmp", std::process::id()));
-        let mut temp = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            // New contents may be more sensitive than the source file. Keep the
+            // temporary private until the original permissions are restored.
+            options.mode(0o600);
+        }
+        let mut temp = match options.open(&temp_path) {
             Ok(temp) => temp,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 last_collision = Some(e);
@@ -473,16 +506,27 @@ fn risk_role(level: agsh_policy::RiskLevel) -> agsh_style::Role {
 /// `snapshot [msg] | list | restore [ref]`: lightweight git checkpoints of the
 /// working tree (git.snapshot / git.rollback) so an agent can checkpoint before
 /// risky edits. Uses `git stash create`+`store` (does NOT disturb the tree).
+/// Git stdout/stderr and runtime are bounded, and checkpoint-store failures are
+/// reported instead of claiming that an unavailable snapshot was saved.
 pub fn snapshot(args: &[String], state: &ShellState) -> CommandOutcome {
-    let cwd = state.cwd();
+    if let Some(denied) = crate::confined_external_denial(state, "git") {
+        return denied;
+    }
+    let Some(git) = crate::resolve_shell_external(state, "git") else {
+        return CommandOutcome::captured(
+            127,
+            Vec::new(),
+            b"snapshot: git: command not found\n".to_vec(),
+        );
+    };
     match args.first().map(String::as_str) {
-        Some("list") => git_run(&["stash", "list"], cwd, "snapshot"),
+        Some("list") => git_run(&git, &["stash", "list"], state, "snapshot"),
         Some("restore") => {
             // Overwrite tracked files in cwd with the snapshot's working-tree
             // state (the stash commit's tree). Unlike `stash apply`, this is an
             // exact restore, not a 3-way merge against divergent content.
             let target = args.get(1).map(String::as_str).unwrap_or("stash@{0}");
-            let outcome = git_run(&["checkout", target, "--", "."], cwd, "snapshot");
+            let outcome = git_run(&git, &["checkout", target, "--", "."], state, "snapshot");
             if outcome.exit_code == 0 {
                 CommandOutcome::captured(
                     0,
@@ -499,14 +543,30 @@ pub fn snapshot(args: &[String], state: &ShellState) -> CommandOutcome {
             } else {
                 args.join(" ")
             };
-            match git_capture(&["stash", "create"], cwd) {
+            match git_capture(&git, &["stash", "create"], state) {
                 Ok(sha) if !sha.trim().is_empty() => {
-                    let sha = sha.trim().to_string();
-                    let _ = git_capture(
-                        &["stash", "store", "-m", &format!("agsh: {msg}"), &sha],
-                        cwd,
-                    );
-                    let short = &sha[..sha.len().min(12)];
+                    let sha = sha.trim();
+                    if !matches!(sha.len(), 40 | 64)
+                        || !sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    {
+                        return CommandOutcome::captured(
+                            1,
+                            Vec::new(),
+                            b"snapshot: git returned an invalid snapshot object id\n".to_vec(),
+                        );
+                    }
+                    if let Err(error) = git_capture(
+                        &git,
+                        &["stash", "store", "-m", &format!("agsh: {msg}"), sha],
+                        state,
+                    ) {
+                        return CommandOutcome::captured(
+                            1,
+                            Vec::new(),
+                            format!("snapshot: {error}\n").into_bytes(),
+                        );
+                    }
+                    let short = &sha[..12];
                     CommandOutcome::captured(
                         0,
                         format!("snapshot saved: {short} (agsh: {msg})\n").into_bytes(),
@@ -528,31 +588,306 @@ pub fn snapshot(args: &[String], state: &ShellState) -> CommandOutcome {
 
 /// Run `git <args>` in `cwd`, passing its stdout/stderr/exit through as the
 /// command outcome.
-fn git_run(args: &[&str], cwd: &Path, who: &str) -> CommandOutcome {
-    match std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-    {
-        Ok(o) => CommandOutcome::captured(o.status.code().unwrap_or(1), o.stdout, o.stderr),
+fn git_run(git: &Path, args: &[&str], state: &ShellState, who: &str) -> CommandOutcome {
+    let mut command = std::process::Command::new(git);
+    command.args(args).current_dir(state.cwd());
+    state.configure_child_env(&mut command);
+    match capture_command_with_limits(&mut command, MAX_GIT_CAPTURE_BYTES, GIT_CAPTURE_TIMEOUT) {
+        Ok(output) => git_run_output(output, who),
         Err(e) => {
             CommandOutcome::captured(1, Vec::new(), format!("{who}: git: {e}\n").into_bytes())
         }
     }
 }
 
-/// Run `git <args>` in `cwd`, returning trimmed stdout or an error string.
-fn git_capture(args: &[&str], cwd: &Path) -> Result<String, String> {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+fn git_run_output(output: BoundedCommandOutput, who: &str) -> CommandOutcome {
+    let incomplete_streams = output.incomplete_streams();
+    let child_exit = command_exit_code(output.status);
+    let stdout = output.stdout.bytes;
+    let mut stderr = output.stderr.bytes;
+    if let Some(streams) = incomplete_streams {
+        if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+            stderr.push(b'\n');
+        }
+        stderr.extend_from_slice(
+            format!("{who}: git: {}\n", incomplete_git_capture_message(streams)).as_bytes(),
+        );
+        return CommandOutcome::captured(child_exit.max(1), stdout, stderr);
     }
+    CommandOutcome::captured(child_exit, stdout, stderr)
+}
+
+fn command_exit_code(status: ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1)
+}
+
+/// Run `git <args>` in `cwd`, returning trimmed stdout or an error string.
+fn git_capture(git: &Path, args: &[&str], state: &ShellState) -> Result<String, String> {
+    let mut command = std::process::Command::new(git);
+    command.args(args).current_dir(state.cwd());
+    state.configure_child_env(&mut command);
+    let out = capture_command_with_limits(&mut command, MAX_GIT_CAPTURE_BYTES, GIT_CAPTURE_TIMEOUT)
+        .map_err(|e| format!("git: {e}"))?;
+    git_capture_output(out)
+}
+
+fn git_capture_output(out: BoundedCommandOutput) -> Result<String, String> {
+    if let Some(streams) = out.incomplete_streams() {
+        return Err(incomplete_git_capture_message(streams));
+    }
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout.bytes).into_owned())
+    } else {
+        let message = String::from_utf8_lossy(&out.stderr.bytes)
+            .trim()
+            .to_string();
+        if message.is_empty() {
+            Err(format!("git exited with status {}", out.status))
+        } else {
+            Err(message)
+        }
+    }
+}
+
+fn incomplete_git_capture_message(streams: &str) -> String {
+    format!(
+        "output capture incomplete after the direct child exited; retained {streams} descriptor(s) did not reach EOF"
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureCompleteness {
+    Complete,
+    Incomplete,
+}
+
+#[derive(Debug)]
+struct PipeCapture {
+    bytes: Vec<u8>,
+    completeness: CaptureCompleteness,
+}
+
+impl PipeCapture {
+    fn complete(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            completeness: CaptureCompleteness::Complete,
+        }
+    }
+
+    fn incomplete(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            completeness: CaptureCompleteness::Incomplete,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BoundedCommandOutput {
+    status: ExitStatus,
+    stdout: PipeCapture,
+    stderr: PipeCapture,
+}
+
+impl BoundedCommandOutput {
+    fn incomplete_streams(&self) -> Option<&'static str> {
+        match (self.stdout.completeness, self.stderr.completeness) {
+            (CaptureCompleteness::Complete, CaptureCompleteness::Complete) => None,
+            (CaptureCompleteness::Incomplete, CaptureCompleteness::Complete) => Some("stdout"),
+            (CaptureCompleteness::Complete, CaptureCompleteness::Incomplete) => Some("stderr"),
+            (CaptureCompleteness::Incomplete, CaptureCompleteness::Incomplete) => {
+                Some("stdout/stderr")
+            }
+        }
+    }
+}
+
+fn capture_pipe<R: Read + std::os::fd::AsFd + Send + 'static>(
+    mut pipe: R,
+    limit: usize,
+    abort: Arc<AtomicBool>,
+    direct_child_exited: Arc<AtomicBool>,
+) -> std::io::Result<std::thread::JoinHandle<std::io::Result<PipeCapture>>> {
+    let flags = rustix::fs::fcntl_getfl(&pipe)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+    rustix::fs::fcntl_setfl(&pipe, flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+    std::thread::Builder::new().spawn(move || {
+        let mut output = Vec::with_capacity(limit.min(64 * 1024));
+        let mut chunk = [0u8; 16 * 1024];
+        let mut post_exit_started = None;
+        let mut post_exit_bytes = 0usize;
+        loop {
+            if abort.load(Ordering::Acquire) {
+                return Ok(PipeCapture::incomplete(output));
+            }
+            let exited = direct_child_exited.load(Ordering::Acquire);
+            if exited {
+                let started = *post_exit_started.get_or_insert_with(Instant::now);
+                if post_exit_bytes >= GIT_CAPTURE_POST_EXIT_BYTES
+                    || started.elapsed() >= GIT_CAPTURE_POST_EXIT_TIME
+                {
+                    return Ok(PipeCapture::incomplete(output));
+                }
+            }
+            match pipe.read(&mut chunk) {
+                Ok(0) => return Ok(PipeCapture::complete(output)),
+                Ok(read) if read <= limit.saturating_sub(output.len()) => {
+                    output.extend_from_slice(&chunk[..read]);
+                    if exited {
+                        post_exit_bytes = post_exit_bytes.saturating_add(read);
+                    }
+                }
+                Ok(_) => {
+                    abort.store(true, Ordering::Release);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("command output limit of {limit} bytes exceeded"),
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if exited {
+                        return Ok(PipeCapture::incomplete(output));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    abort.store(true, Ordering::Release);
+                    return Err(error);
+                }
+            }
+        }
+    })
+}
+
+fn kill_capture_group(child: &mut std::process::Child) -> std::io::Result<ExitStatus> {
+    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    let _ = child.kill();
+    child.wait()
+}
+
+fn join_capture(
+    handle: std::thread::JoinHandle<std::io::Result<PipeCapture>>,
+) -> std::io::Result<PipeCapture> {
+    handle
+        .join()
+        .map_err(|_| std::io::Error::other("command output reader panicked"))?
+}
+
+fn capture_command_with_limits(
+    command: &mut std::process::Command,
+    stream_limit: usize,
+    timeout: Duration,
+) -> std::io::Result<BoundedCommandOutput> {
+    use std::os::unix::process::CommandExt;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn()?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = kill_capture_group(&mut child);
+            return Err(std::io::Error::other("command stdout pipe is unavailable"));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            drop(stdout);
+            let _ = kill_capture_group(&mut child);
+            return Err(std::io::Error::other("command stderr pipe is unavailable"));
+        }
+    };
+    let abort = Arc::new(AtomicBool::new(false));
+    let direct_child_exited = Arc::new(AtomicBool::new(false));
+    let stdout_handle = match capture_pipe(
+        stdout,
+        stream_limit,
+        Arc::clone(&abort),
+        Arc::clone(&direct_child_exited),
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            drop(stderr);
+            let _ = kill_capture_group(&mut child);
+            return Err(error);
+        }
+    };
+    let stderr_handle = match capture_pipe(
+        stderr,
+        stream_limit,
+        Arc::clone(&abort),
+        Arc::clone(&direct_child_exited),
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            abort.store(true, Ordering::Release);
+            let _ = kill_capture_group(&mut child);
+            let _ = join_capture(stdout_handle);
+            return Err(error);
+        }
+    };
+    let started = Instant::now();
+
+    let status = loop {
+        if abort.load(Ordering::Acquire) {
+            let _ = kill_capture_group(&mut child);
+            let stdout = join_capture(stdout_handle);
+            let stderr = join_capture(stderr_handle);
+            return Err(stdout
+                .err()
+                .or_else(|| stderr.err())
+                .unwrap_or_else(|| std::io::Error::other("command output capture aborted")));
+        }
+        if started.elapsed() >= timeout {
+            abort.store(true, Ordering::Release);
+            let _ = kill_capture_group(&mut child);
+            let _ = join_capture(stdout_handle);
+            let _ = join_capture(stderr_handle);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("command exceeded {} second timeout", timeout.as_secs_f64()),
+            ));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+            Err(error) => {
+                abort.store(true, Ordering::Release);
+                let _ = kill_capture_group(&mut child);
+                let _ = join_capture(stdout_handle);
+                let _ = join_capture(stderr_handle);
+                return Err(error);
+            }
+        }
+    };
+
+    // A child that daemonized a descendant must not leave our reader threads
+    // blocked forever on inherited pipe descriptors.
+    direct_child_exited.store(true, Ordering::Release);
+    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    let stdout = join_capture(stdout_handle)?;
+    let stderr = join_capture(stderr_handle)?;
+    Ok(BoundedCommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn diff_stats(diff: &str) -> (usize, usize) {
@@ -811,6 +1146,32 @@ mod tests {
     }
 
     #[test]
+    fn peek_and_patch_reject_oversized_files_without_reading_them() {
+        let (dir, state) = patch_fixture("agent-oversized-file");
+        let path = dir.join("huge.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_AGENT_FILE_BYTES + 1) as u64).unwrap();
+        drop(file);
+
+        let peeked = peek(&["huge.txt".to_string()], &state);
+        assert_eq!(peeked.exit_code, 1);
+        assert!(String::from_utf8_lossy(&peeked.stderr).contains("exceeds"));
+
+        let patched = patch(
+            &["huge.txt".to_string()],
+            &state,
+            Some(b"@@ -0,0 +1 @@\n+replacement\n"),
+        );
+        assert_eq!(patched.exit_code, 1);
+        assert!(String::from_utf8_lossy(&patched.stderr).contains("exceeds"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (MAX_AGENT_FILE_BYTES + 1) as u64
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn patch_non_utf8_diff_fails_without_modifying_file() {
         let (dir, state) = patch_fixture("patch-non-utf8-diff");
         let path = dir.join("source.txt");
@@ -897,5 +1258,173 @@ mod tests {
         }
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_respects_sticky_confinement_before_spawning_git() {
+        let (dir, mut state) = patch_fixture("snapshot-confined");
+        state.set_confine(&["true".to_string()]);
+
+        let outcome = snapshot(&["list".to_string()], &state);
+
+        assert_eq!(outcome.exit_code, 126);
+        assert!(String::from_utf8_lossy(&outcome.stderr).contains("git: not permitted"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_resolves_git_from_the_shell_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut state) = patch_fixture("snapshot-path");
+        let bin = dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let git = bin.join("git");
+        std::fs::write(&git, "#!/bin/sh\nprintf '%s' \"$SNAPSHOT_TEST\"").unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o700)).unwrap();
+        state.set_var("PATH", bin.display().to_string());
+        state.export_var("SNAPSHOT_TEST", "shell-env-git");
+
+        let outcome = snapshot(&["list".to_string()], &state);
+
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.stdout, b"shell-env-git");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_propagates_stash_store_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut state) = patch_fixture("snapshot-store-failure");
+        let bin = dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let git = bin.join("git");
+        std::fs::write(
+            &git,
+            "#!/bin/sh\ncase \"$1 $2\" in\n  'stash create') printf '%040d' 0 ;;\n  'stash store') echo 'store rejected' >&2; exit 9 ;;\n  *) exit 8 ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o700)).unwrap();
+        state.set_var("PATH", bin.display().to_string());
+
+        let outcome = snapshot(&["before-risk".to_string()], &state);
+
+        assert_eq!(outcome.exit_code, 1);
+        assert!(outcome.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&outcome.stderr).contains("store rejected"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_capture_kills_and_reaps_on_output_limit() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "while :; do printf '0123456789abcdef0123456789abcdef'; done",
+        ]);
+        let started = std::time::Instant::now();
+
+        let error =
+            capture_command_with_limits(&mut command, 32 * 1024, std::time::Duration::from_secs(2))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("output limit"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_capture_kills_and_reaps_on_timeout() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "while :; do :; done"]);
+        let started = std::time::Instant::now();
+
+        let error =
+            capture_command_with_limits(&mut command, 1024, std::time::Duration::from_millis(50))
+                .unwrap_err();
+
+        assert!(error.kind() == std::io::ErrorKind::TimedOut, "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_pipe_stops_when_a_descendant_keeps_the_descriptor_open() {
+        use std::os::unix::net::UnixStream;
+
+        let (reader, mut retained_writer) = UnixStream::pair().unwrap();
+        let abort = Arc::new(AtomicBool::new(false));
+        let direct_child_exited = Arc::new(AtomicBool::new(false));
+        let handle = capture_pipe(
+            reader,
+            1024,
+            Arc::clone(&abort),
+            Arc::clone(&direct_child_exited),
+        )
+        .unwrap();
+        retained_writer.write_all(b"captured").unwrap();
+        direct_child_exited.store(true, Ordering::Release);
+
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || send.send(join_capture(handle)).unwrap());
+        let output = receive
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader must not wait for the retained writer")
+            .unwrap();
+        assert_eq!(output.bytes, b"captured");
+        assert_eq!(output.completeness, CaptureCompleteness::Incomplete);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_rejects_valid_looking_sha_from_incomplete_git_capture() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let stash_output = BoundedCommandOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: PipeCapture {
+                bytes: vec![b'0'; 40],
+                completeness: CaptureCompleteness::Incomplete,
+            },
+            stderr: PipeCapture {
+                bytes: Vec::new(),
+                completeness: CaptureCompleteness::Complete,
+            },
+        };
+
+        let error = git_capture_output(stash_output).unwrap_err();
+        assert!(error.contains("incomplete"), "{error}");
+        assert!(error.contains("stdout"), "{error}");
+
+        let list_output = BoundedCommandOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: PipeCapture {
+                bytes: b"partial list".to_vec(),
+                completeness: CaptureCompleteness::Incomplete,
+            },
+            stderr: PipeCapture {
+                bytes: Vec::new(),
+                completeness: CaptureCompleteness::Complete,
+            },
+        };
+        let outcome = git_run_output(list_output, "snapshot");
+        assert_eq!(outcome.exit_code, 1);
+        assert_eq!(outcome.stdout, b"partial list");
+        let diagnostic = String::from_utf8_lossy(&outcome.stderr);
+        assert!(diagnostic.contains("incomplete"), "{diagnostic}");
+        assert!(diagnostic.contains("stdout"), "{diagnostic}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_command_exit_mapping_preserves_signal_status() {
+        use std::os::unix::process::ExitStatusExt;
+
+        assert_eq!(command_exit_code(ExitStatus::from_raw(7 << 8)), 7);
+        assert_eq!(command_exit_code(ExitStatus::from_raw(9)), 137);
     }
 }

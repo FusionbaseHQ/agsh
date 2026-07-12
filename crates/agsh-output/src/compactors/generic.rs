@@ -19,6 +19,7 @@ const FAIL_NEEDLES: &[&str] = &[
 ];
 const WARN_NEEDLES: &[&str] = &["warning", "warn:", " warn "];
 const MAX_LINE: usize = 200;
+const MAX_DETAILS: usize = 50;
 
 pub fn summarize(cx: &CommandContext) -> SemanticSummary {
     let mut summary = SemanticSummary::new(cx, "generic");
@@ -30,10 +31,13 @@ pub fn summarize(cx: &CommandContext) -> SemanticSummary {
 
     // Failure/warning digest (a quick "what broke" scan over both streams).
     for line in cx.all_lines() {
-        let lower = line.to_ascii_lowercase();
-        if FAIL_NEEDLES.iter().any(|n| lower.contains(n)) {
-            summary.add_failure(clip(line, MAX_LINE));
-        } else if WARN_NEEDLES.iter().any(|n| lower.contains(n)) {
+        if contains_any_ascii_case_insensitive(line, FAIL_NEEDLES) {
+            if summary.failures.len() < MAX_DETAILS {
+                summary.add_failure(clip(line, MAX_LINE));
+            }
+        } else if contains_any_ascii_case_insensitive(line, WARN_NEEDLES)
+            && summary.warnings.len() < MAX_DETAILS
+        {
             summary.add_warning(clip(line, MAX_LINE));
         }
     }
@@ -63,6 +67,15 @@ pub fn summarize(cx: &CommandContext) -> SemanticSummary {
     };
     summary.set_headline(headline);
     summary
+}
+
+fn contains_any_ascii_case_insensitive(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| {
+        haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+    })
 }
 
 #[cfg(test)]

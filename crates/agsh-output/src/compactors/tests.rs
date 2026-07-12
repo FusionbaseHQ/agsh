@@ -5,12 +5,34 @@
 
 use crate::summary::{CommandContext, SemanticSummary};
 use crate::util::{clip, command_basename};
-use regex::Regex;
 
 /// Truncate any single collected line to this many characters.
 const MAX_LINE: usize = 200;
 /// Stop collecting failure detail lines past this many entries.
 const MAX_FAILURES: usize = 50;
+
+static_regex!(PYTEST_COUNT_RE, r"(\d+)\s+(passed|failed|skipped|errors?)");
+static_regex!(
+    CARGO_RESULT_RE,
+    r"test result:\s+(?:ok|FAILED)\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;\s+(\d+)\s+ignored"
+);
+static_regex!(CARGO_FAILURE_RE, r"^test\s+(\S+)\s+\.\.\.\s+FAILED");
+static_regex!(
+    NEXTEST_RESULT_RE,
+    r"(\d+)\s+tests run:\s+(\d+)\s+passed.*?(\d+)\s+failed"
+);
+static_regex!(NEXTEST_FAILURE_RE, r"^FAIL\s+\[[^\]]*\]\s+(.+)$");
+static_regex!(GO_FAILURE_RE, r"^---\s+FAIL:\s+(\S+)");
+static_regex!(GO_PASS_RE, r"^---\s+PASS:\s+(\S+)");
+static_regex!(
+    GO_PACKAGE_RE,
+    r"^(ok|FAIL)\s+(\S+)\s+(?:[\d.]+s|\(cached\))"
+);
+static_regex!(
+    JEST_COUNT_RE,
+    r"(\d+)\s+(failed|passed|skipped|todo|pending|total)"
+);
+static_regex!(JEST_TIMING_RE, r"\s*\(\d+(?:\.\d+)?\s*m?s\)\s*$");
 
 /// Which test runner produced the output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -83,8 +105,6 @@ pub fn summarize(cx: &CommandContext) -> SemanticSummary {
 /// pytest: the bordered summary line `=== N passed, M failed, K skipped ... ===`
 /// plus `FAILED path::test - reason` / `ERROR path - reason` detail lines.
 fn parse_pytest(cx: &CommandContext, summary: &mut SemanticSummary) {
-    let count_re = Regex::new(r"(\d+)\s+(passed|failed|skipped|errors?)").unwrap();
-
     let mut passed = 0i64;
     let mut failed = 0i64;
     let mut skipped = 0i64;
@@ -122,7 +142,7 @@ fn parse_pytest(cx: &CommandContext, summary: &mut SemanticSummary) {
                 || trimmed.contains("skipped"));
         if is_summary {
             found_summary = true;
-            for cap in count_re.captures_iter(trimmed) {
+            for cap in PYTEST_COUNT_RE.captures_iter(trimmed) {
                 let n: i64 = cap[1].parse().unwrap_or(0);
                 match &cap[2] {
                     "passed" => passed += n,
@@ -151,14 +171,6 @@ fn parse_pytest(cx: &CommandContext, summary: &mut SemanticSummary) {
 /// and `test mod::name ... FAILED`, plus cargo-nextest summary/`FAIL [..]` lines.
 /// Counts are summed across every result line (lib, bins, doctests).
 fn parse_cargo(cx: &CommandContext, summary: &mut SemanticSummary) {
-    let result_re = Regex::new(
-        r"test result:\s+(?:ok|FAILED)\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;\s+(\d+)\s+ignored",
-    )
-    .unwrap();
-    let fail_re = Regex::new(r"^test\s+(\S+)\s+\.\.\.\s+FAILED").unwrap();
-    let nextest_re = Regex::new(r"(\d+)\s+tests run:\s+(\d+)\s+passed.*?(\d+)\s+failed").unwrap();
-    let nextest_fail_re = Regex::new(r"^FAIL\s+\[[^\]]*\]\s+(.+)$").unwrap();
-
     let mut passed = 0i64;
     let mut failed = 0i64;
     let mut ignored = 0i64;
@@ -167,26 +179,26 @@ fn parse_cargo(cx: &CommandContext, summary: &mut SemanticSummary) {
     for line in cx.all_lines() {
         let trimmed = line.trim();
 
-        if let Some(cap) = result_re.captures(trimmed) {
+        if let Some(cap) = CARGO_RESULT_RE.captures(trimmed) {
             saw_result = true;
             passed += cap[1].parse::<i64>().unwrap_or(0);
             failed += cap[2].parse::<i64>().unwrap_or(0);
             ignored += cap[3].parse::<i64>().unwrap_or(0);
             continue;
         }
-        if let Some(cap) = nextest_re.captures(trimmed) {
+        if let Some(cap) = NEXTEST_RESULT_RE.captures(trimmed) {
             saw_result = true;
             passed += cap[2].parse::<i64>().unwrap_or(0);
             failed += cap[3].parse::<i64>().unwrap_or(0);
             continue;
         }
-        if let Some(cap) = nextest_fail_re.captures(trimmed) {
+        if let Some(cap) = NEXTEST_FAILURE_RE.captures(trimmed) {
             if summary.failures.len() < MAX_FAILURES {
                 summary.add_failure(clip(cap[1].trim(), MAX_LINE));
             }
             continue;
         }
-        if let Some(cap) = fail_re.captures(trimmed) {
+        if let Some(cap) = CARGO_FAILURE_RE.captures(trimmed) {
             if summary.failures.len() < MAX_FAILURES {
                 summary.add_failure(clip(&cap[1], MAX_LINE));
             }
@@ -207,10 +219,6 @@ fn parse_cargo(cx: &CommandContext, summary: &mut SemanticSummary) {
 /// go test: `--- FAIL: Name` / `--- PASS: Name` per test and `ok|FAIL  pkg dur`
 /// package result lines.
 fn parse_go(cx: &CommandContext, summary: &mut SemanticSummary) {
-    let fail_re = Regex::new(r"^---\s+FAIL:\s+(\S+)").unwrap();
-    let pass_re = Regex::new(r"^---\s+PASS:\s+(\S+)").unwrap();
-    let pkg_re = Regex::new(r"^(ok|FAIL)\s+(\S+)\s+(?:[\d.]+s|\(cached\))").unwrap();
-
     let mut passed = 0i64;
     let mut failed = 0i64;
     let mut pkg_failed = 0i64;
@@ -218,19 +226,21 @@ fn parse_go(cx: &CommandContext, summary: &mut SemanticSummary) {
     for line in cx.all_lines() {
         let trimmed = line.trim_start();
 
-        if let Some(cap) = fail_re.captures(trimmed) {
+        if let Some(cap) = GO_FAILURE_RE.captures(trimmed) {
             failed += 1;
             if summary.failures.len() < MAX_FAILURES {
                 summary.add_failure(clip(&cap[1], MAX_LINE));
             }
             continue;
         }
-        if pass_re.is_match(trimmed) {
+        if GO_PASS_RE.is_match(trimmed) {
             passed += 1;
             continue;
         }
-        if let Some(cap) = pkg_re.captures(trimmed) {
-            summary.add_path(clip(&cap[2], MAX_LINE));
+        if let Some(cap) = GO_PACKAGE_RE.captures(trimmed) {
+            if summary.paths.len() < MAX_FAILURES {
+                summary.add_path(clip(&cap[2], MAX_LINE));
+            }
             if &cap[1] == "FAIL" {
                 pkg_failed += 1;
             }
@@ -247,9 +257,6 @@ fn parse_go(cx: &CommandContext, summary: &mut SemanticSummary) {
 /// jest/vitest: the `Tests: X failed, Y passed, Z total` summary (jest) or
 /// `Tests  X failed | Y passed (Z)` (vitest), plus `✕`/`×`/`●` failure markers.
 fn parse_jest(cx: &CommandContext, summary: &mut SemanticSummary) {
-    let count_re = Regex::new(r"(\d+)\s+(failed|passed|skipped|todo|pending|total)").unwrap();
-    let timing_re = Regex::new(r"\s*\(\d+(?:\.\d+)?\s*m?s\)\s*$").unwrap();
-
     let mut passed = 0i64;
     let mut failed = 0i64;
     let mut skipped = 0i64;
@@ -265,7 +272,7 @@ fn parse_jest(cx: &CommandContext, summary: &mut SemanticSummary) {
             .next()
             .filter(|&c| matches!(c, '✕' | '×' | '✗' | '●'))
         {
-            let stripped = timing_re.replace(trimmed[m.len_utf8()..].trim(), "");
+            let stripped = JEST_TIMING_RE.replace(trimmed[m.len_utf8()..].trim(), "");
             let name = stripped.trim();
             if !name.is_empty() && summary.failures.len() < MAX_FAILURES {
                 summary.add_failure(clip(name, MAX_LINE));
@@ -276,7 +283,7 @@ fn parse_jest(cx: &CommandContext, summary: &mut SemanticSummary) {
         // The aggregate test line (not the "Test Files" line).
         if trimmed.starts_with("Tests:") || trimmed.starts_with("Tests ") {
             found_summary = true;
-            for cap in count_re.captures_iter(trimmed) {
+            for cap in JEST_COUNT_RE.captures_iter(trimmed) {
                 let n: i64 = cap[1].parse().unwrap_or(0);
                 match &cap[2] {
                     "passed" => passed += n,

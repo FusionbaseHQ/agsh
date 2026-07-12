@@ -57,17 +57,19 @@ Every command can be rendered in a mode. Priority, highest first:
 default = "compact"   # applies to interactive sessions only
 ```
 
-The config / `mode` default applies to **interactive** sessions only —
-non-interactive `agsh -c` and scripts stay `raw`, so piped output is never
-silently transformed.
+The config / `mode` default applies to **interactive** sessions only.
+Non-interactive `agsh -c` and scripts stay `raw` unless `--output` or
+`AGSH_OUTPUT_MODE` explicitly selects an observation mode, so automation is not
+silently transformed by interactive configuration.
 
 | Mode           | Use                                                     |
 | -------------- | ------------------------------------------------------- |
 | `raw`          | default; exact bytes, streamed                          |
+| `clean`        | normalized observation without ANSI/progress noise      |
 | `compact`      | trimmed, deduplicated output                            |
 | `semantic`     | structured observation of recognized commands           |
-| `lossless-ref` | compact view + a `trace://` reference to the raw stream |
-| `silent`       | suppress display, keep exit status + trace              |
+| `lossless-ref` | compact view + status-aware ref; exact only when persistence is `complete` |
+| `silent`       | suppress display; keep status and a trace when persistence succeeds |
 | `rich`         | human rich rendering (see `agview`)                     |
 
 ### The `mode` builtin
@@ -113,30 +115,62 @@ Flavors and layers (combine with `:`):
   Exact semantics; recommended.
 - `AGSH_INTERCEPT=compact:native` — **interpret**: agsh runs the command in its own
   interpreter (full agsh features, but bounded by agsh's `bash` compatibility).
-- `AGSH_INTERCEPT=compact:deep` — also catch **absolute-path** shell calls
+- `AGSH_INTERCEPT=compact:deep` — experimentally catch some **absolute-path** shell calls
   (`/bin/bash -c …`) and `posix_spawn` (what node/libuv use), via an injected
   interposition library (`DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`).
 
 **Recovering raw output.** Compacted results only carry a `raw:` reference when they
 actually elide output. Under interception those references are **catable file paths**
 (agsh persists each observed command's raw stdout/stderr to `$AGSH_TRACE_DIR`), so an
-agent can pull back exactly what it needs from plain bash:
+agent can pull back exactly what it needs from plain bash while the trace status
+is `complete`:
 
 ```sh
 # a compacted result ends with, e.g.:
 #   raw: /…/agsh-traces/1234_cmd_….out /…/agsh-traces/1234_cmd_….err
-grep -n "error" /…/agsh-traces/1234_cmd_….out     # query the full raw output
+grep -n "error" /…/agsh-traces/1234_cmd_….out     # query retained raw output
 ```
 
-The trace directory is **bounded** — on every write the oldest files are reaped so
-it never grows without limit (default 512 files ≈ 256 commands; override with
-`AGSH_TRACE_DIR_CAP`).
+Raw persistence is configured in `~/.config/agsh/token.toml`:
 
-> **Coverage.** Without `:deep`, interception catches shells resolved by name or via
-> `$SHELL` (a program calling `/bin/bash` by absolute path bypasses it). `:deep`
-> closes that gap, but is best-effort: macOS **SIP / hardened-runtime** binaries
-> strip `DYLD_INSERT_LIBRARIES`, and `LD_PRELOAD` is ignored by **static** binaries
-> and across setuid execs — those fall back to the (still active) PATH shims.
+```toml
+[storage]
+store_raw = true
+max_raw_per_command = "100mb" # combined stdout+stderr; b/kb/mb/gb are binary
+raw_retention = "14d"         # reserved; duration pruning is not implemented
+```
+
+The per-command value is clamped to a hard 1 GiB ceiling. Capture continues
+draining after the shared stdout/stderr budget is exhausted, but the reference
+is labeled as an incomplete capture and exact trace reads refuse it. Setting
+`store_raw = false` stores no raw bytes. The directory is independently bounded
+to 2 GiB and, by default, 512 files (roughly 256 commands); oldest files are
+reaped after each write when either bound is exceeded. `AGSH_TRACE_DIR_CAP`
+overrides the count but is clamped to 4,096 and cannot bypass the byte ceiling.
+Old references can expire.
+
+Relative `AGSH_TRACE_DIR` values are anchored to the shell's startup directory;
+persisted references are absolute and do not move after `cd`. Trace persistence
+is best effort in ordinary observation modes. Enabled `lossless-ref` storage is
+validated before the payload starts, while a later directory, write, or sync
+failure marks the reference unavailable without replacing the child's status.
+A capture stopped because a descendant retained a pipe descriptor is marked
+incomplete rather than exact. `agtrace` returns at most 16 MiB and 5,000 selected
+lines per invocation (1 MiB per input line), and grep scans at most the hard
+1 GiB trace ceiling. Use ordinary streaming tools directly on a known
+`complete` raw file when a larger view is required.
+
+> **Experimental coverage, not confinement.** Without `:deep`, interception catches
+> shells resolved by name or via `$SHELL` (a program calling `/bin/bash` by absolute
+> path bypasses it). `:deep` is a best-effort observation aid, not comprehensive exec
+> mediation or a security boundary. It hooks a limited exec/posix_spawn surface;
+> macOS **SIP / hardened-runtime** binaries strip `DYLD_INSERT_LIBRARIES`, and
+> `LD_PRELOAD` is ignored by **static** binaries and across setuid execs. Preload
+> hooks also cannot guarantee async-signal-safety in every post-fork, multi-threaded
+> child. Unsupported calls may still fall back to the active PATH shims, but policy
+> enforcement must use `confine`, never interception coverage. Prebuilt Linux
+> archives ship a glibc interposer beside the otherwise static-musl `agsh` binary;
+> musl-only systems retain PATH-shim interception but cannot load that `.so`.
 
 Set it in your `agshrc` so it applies to every session, or per-agent:
 `AGSH_INTERCEPT=compact agsh -c 'my-agent …'`.
@@ -150,14 +184,61 @@ mode:intercept                # show on/off
 mode:intercept off            # turn off
 ```
 
+## Resource limits
+
+agsh rejects oversized control/input files before parsing them. These limits
+bound memory use and prevent device/FIFO-backed configuration from blocking
+startup:
+
+| Input | Limit |
+| --- | ---: |
+| shell script, piped script, or `source` file | 64 MiB |
+| interactive rc file | 1 MiB |
+| `token.toml` | 1 MiB |
+| `theme.toml` | 256 KiB |
+| trusted project `.env` | 1 MiB |
+| agent `peek`/`patch` target | 64 MiB |
+| agent `patch` diff | 16 MiB |
+| persisted history JSONL record | 1 MiB |
+| command retained in history | 256 KiB |
+| persistent history file | 64 MiB |
+| aggregate in-memory history | 32 MiB |
+| in-memory exact capture (command substitution, rich/internal evaluation) | 64 MiB per stream |
+| process-substitution staging | shared `max_raw_per_command`; 64 MiB per stream when raw storage is disabled |
+| nested compound capture / ordering metadata | 64 MiB / 1,048,576 spans / 65,536 exact segments |
+| one `agtrace` result / selected lines / input line | 16 MiB / 5,000 / 1 MiB |
+| Git subprocess used by `snapshot` | 4 MiB per stream / 30 seconds |
+| one `read` logical input line | 1 MiB |
+| one builtin `printf` outcome | 16 MiB |
+| one `pty` captured stream | 64 MiB |
+| asynchronous-subshell state handoff | 8 MiB / 16,384 entries per collection / 65,536 total entries |
+| one session-journal record / file / decoded event count | 1 MiB / 64 MiB / 16,384 |
+| broker JSON control line / active connections / control I/O | 4 MiB / 64 / 5 seconds |
+| broker tail response / per-job log generations | 16 MiB / two approximately 8 MiB files |
+
+External commands, pipes, and redirections still stream raw bytes without
+passing through these buffers. The in-memory capture limit applies only where
+shell semantics require the complete output as a value; exceeding it is an
+explicit execution error instead of an unbounded allocation.
+
+Broker limits are per request or per job. There is currently no global cap on
+running jobs, accumulated old job logs, or the daemon log; see
+[`SESSIONS.md`](SESSIONS.md) for the same-UID trust and cleanup boundary.
+
 ## Environment variables
 
 | Variable            | Effect                                                    |
 | ------------------- | -------------------------------------------------------- |
 | `AGSH_OUTPUT_MODE`  | default output mode for the session                       |
 | `AGSH_INTERCEPT`    | route the agent's `bash`/`sh`/… through agsh (mode name; off by default) |
+| `AGSH_TRUST_FILE`   | override the private project-`.env` trust database path   |
 | `AGSH_ICONS=1`      | enable Nerd Font glyphs in the UI                         |
 | `NO_COLOR`          | disable color (honored)                                   |
+
+`agtrust` persists a versioned SHA-256 digest before activating a project
+`.env`. Legacy unversioned trust records are intentionally ignored and must be
+re-trusted. Leaving the project restores each affected shell binding's original
+value, export state, and variable attributes.
 
 ## Themes
 

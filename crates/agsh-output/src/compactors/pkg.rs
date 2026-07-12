@@ -17,6 +17,15 @@ const MAX_LINE: usize = 200;
 /// Maximum entries kept in any one detail list.
 const MAX_DETAIL: usize = 50;
 
+static_regex!(NODE_ADDED_RE, r"added (\d+)");
+static_regex!(NODE_REMOVED_RE, r"removed (\d+)");
+static_regex!(NODE_CHANGED_RE, r"changed (\d+)");
+static_regex!(NODE_AUDITED_RE, r"audited (\d+)");
+static_regex!(NODE_VULNERABILITY_RE, r"(\d+) vulnerabilit");
+static_regex!(NINJA_PROGRESS_RE, r"^\[\d+/\d+\]");
+static_regex!(CMAKE_PROGRESS_RE, r"^\[\s*\d+%\]");
+static_regex!(MAKE_ERROR_RE, r"\bError\s+\d+\b");
+
 /// Summarize a package-manager / build-tool invocation by dispatching on the
 /// program name to a tool-group parser.
 pub fn summarize(cx: &CommandContext) -> SemanticSummary {
@@ -43,12 +52,6 @@ fn summarize_node(cx: &CommandContext) -> SemanticSummary {
         _ => "npm",
     };
     let mut s = SemanticSummary::new(cx, label);
-
-    let re_added = Regex::new(r"added (\d+)").unwrap();
-    let re_removed = Regex::new(r"removed (\d+)").unwrap();
-    let re_changed = Regex::new(r"changed (\d+)").unwrap();
-    let re_audited = Regex::new(r"audited (\d+)").unwrap();
-    let re_vuln = Regex::new(r"(\d+) vulnerabilit").unwrap();
 
     let mut errors = 0i64;
     for line in cx.all_lines() {
@@ -78,19 +81,19 @@ fn summarize_node(cx: &CommandContext) -> SemanticSummary {
         }
 
         // Counts may all appear on a single npm summary line.
-        if let Some(n) = cap1(&re_added, line) {
+        if let Some(n) = cap1(&NODE_ADDED_RE, line) {
             s.set_count("added", n);
         }
-        if let Some(n) = cap1(&re_removed, line) {
+        if let Some(n) = cap1(&NODE_REMOVED_RE, line) {
             s.set_count("removed", n);
         }
-        if let Some(n) = cap1(&re_changed, line) {
+        if let Some(n) = cap1(&NODE_CHANGED_RE, line) {
             s.set_count("changed", n);
         }
-        if let Some(n) = cap1(&re_audited, line) {
+        if let Some(n) = cap1(&NODE_AUDITED_RE, line) {
             s.set_count("audited", n);
         }
-        if let Some(n) = cap1(&re_vuln, line) {
+        if let Some(n) = cap1(&NODE_VULNERABILITY_RE, line) {
             s.set_count("vulnerabilities", n);
             if n > 0 && s.warnings.len() < MAX_DETAIL {
                 s.add_warning(clip(trimmed, MAX_LINE));
@@ -209,10 +212,6 @@ fn summarize_build(cx: &CommandContext) -> SemanticSummary {
     };
     let mut s = SemanticSummary::new(cx, label);
 
-    let re_ninja = Regex::new(r"^\[\d+/\d+\]").unwrap();
-    let re_cmake_pct = Regex::new(r"^\[\s*\d+%\]").unwrap();
-    let re_make_err = Regex::new(r"\bError\s+\d+\b").unwrap();
-
     let mut progress = 0i64;
     let mut errors = 0i64;
     let mut nothing = false;
@@ -243,7 +242,7 @@ fn summarize_build(cx: &CommandContext) -> SemanticSummary {
             || lower.contains("build failed")
             || lower.contains("build failure")
             || lead.starts_with("ninja: build stopped")
-            || re_make_err.is_match(line);
+            || MAKE_ERROR_RE.is_match(line);
         if is_failure {
             errors += 1;
             if s.failures.len() < MAX_DETAIL {
@@ -262,7 +261,7 @@ fn summarize_build(cx: &CommandContext) -> SemanticSummary {
             continue;
         }
 
-        if is_progress(lead, &re_ninja, &re_cmake_pct) {
+        if is_progress(lead, &NINJA_PROGRESS_RE, &CMAKE_PROGRESS_RE) {
             progress += 1;
             continue;
         }

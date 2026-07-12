@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 pub mod agent;
 pub mod builtins;
 pub mod confine;
@@ -15,10 +17,45 @@ pub use confine::{
 };
 pub use executor::{
     install_confine_shims, install_deep_intercept, install_intercept_shims, intercept_active,
-    parse_intercept_spec, print_captured_if_needed, uninstall_intercept, CommandOutcome,
-    ExecutionOptions, Executor,
+    parse_intercept_spec, print_captured_if_needed, set_capture_drain_helper, uninstall_intercept,
+    CommandOutcome, ExecutionOptions, Executor, CAPTURE_DRAIN_READY,
 };
-pub use state::{ShellFunction, ShellState};
+pub use state::{
+    restore_background_snapshot_stdin, ResolvedTrace, ShellFunction, ShellState, TraceReader,
+};
+
+/// Enforce the sticky session allowlist for builtins that intentionally launch
+/// an external process without re-entering the main executor.
+pub(crate) fn confined_external_denial(
+    state: &ShellState,
+    command: &str,
+) -> Option<CommandOutcome> {
+    let policy = state.confine_policy()?;
+    if policy.allows(command) {
+        return None;
+    }
+    let base = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    Some(CommandOutcome::captured(
+        126,
+        Vec::new(),
+        format!(
+            "agsh: {base}: not permitted in this confined session (allowed: {})\n",
+            policy.display_list()
+        )
+        .into_bytes(),
+    ))
+}
+
+/// Resolve a direct builtin-launched executable against the shell's effective
+/// PATH rather than the host process's stale environment.
+pub(crate) fn resolve_shell_external(state: &ShellState, command: &str) -> Option<PathBuf> {
+    use agsh_compat::{CommandResolution, Resolver};
+
+    match Resolver::default().resolve_external_only(command, state.lookup("PATH")) {
+        Some(CommandResolution::External(path)) => Some(path),
+        _ => None,
+    }
+}
 
 /// History syntax highlighting is intentionally bounded so large histories stay
 /// cheap to print and scroll. Row indexes are 1-based, matching displayed

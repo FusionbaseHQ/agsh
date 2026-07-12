@@ -163,6 +163,10 @@ pub enum ConfinePlan {
         command: String,
         cleanup: Vec<std::path::PathBuf>,
         explain: Option<String>,
+        /// Exported variables the caller must remove before starting the trusted
+        /// sandbox launcher. Removing them inside the payload is too late for
+        /// dynamic-loader injection variables.
+        env_remove: Vec<String>,
     },
     /// No OS backend, but `best_effort` was set: install shims and run the
     /// original payload (caller does this — see `install_confine_shims`).
@@ -189,6 +193,31 @@ struct Caps {
     scrub_env: bool,
     /// Provision a private writable scratch dir (and point TMPDIR at it).
     scratch: bool,
+}
+
+/// Variables that must be absent before the trusted sandbox launcher starts.
+/// Removing them inside the payload shell is too late for loader variables such
+/// as `DYLD_INSERT_LIBRARIES`: they can execute code while starting
+/// `sandbox-exec` itself, before Seatbelt has applied the requested profile.
+fn prelaunch_env_remove(state: &ShellState, caps: &Caps) -> Vec<String> {
+    if !caps.scrub_env {
+        return Vec::new();
+    }
+    let mut names = std::collections::BTreeSet::new();
+    names.extend(INJECTION_ENV_VARS.iter().map(|name| (*name).to_string()));
+    names.extend(CREDENTIAL_ENV_VARS.iter().map(|name| (*name).to_string()));
+    names.extend(
+        state
+            .exported_env_names()
+            .into_iter()
+            .filter(|name| {
+                agsh_output::is_sensitive_env_name(name)
+                    || name.starts_with("DYLD_")
+                    || name.starts_with("LD_")
+            })
+            .map(str::to_string),
+    );
+    names.into_iter().collect()
 }
 
 impl Caps {
@@ -374,6 +403,27 @@ fn preset_from_name(name: &str) -> Result<Preset, String> {
     }
 }
 
+fn select_preset(
+    opts: &mut ConfineOpts,
+    selected: &mut Option<Preset>,
+    preset: Preset,
+) -> Result<(), String> {
+    if selected.is_some_and(|existing| existing != preset) {
+        return Err("confine: conflicting presets".to_string());
+    }
+    *selected = Some(preset);
+    opts.preset = preset;
+    Ok(())
+}
+
+fn select_network(opts: &mut ConfineOpts, allow: bool) -> Result<(), String> {
+    if opts.net.is_some_and(|existing| existing != allow) {
+        return Err("confine: conflicting network options".to_string());
+    }
+    opts.net = Some(allow);
+    Ok(())
+}
+
 /// Parse confine spec tokens (everything before `--`) into an exec-allowlist and
 /// `ConfineOpts`. Tokens are classified by **shape**: `--flag` flags, known preset
 /// keywords, else exec-allowlist entries — so order is free and the bare
@@ -381,14 +431,15 @@ fn preset_from_name(name: &str) -> Result<Preset, String> {
 pub fn parse_spec(tokens: &[String]) -> Result<(Vec<String>, ConfineOpts), String> {
     let mut allow: Vec<String> = Vec::new();
     let mut opts = ConfineOpts::default();
+    let mut selected_preset = None;
     let mut i = 0;
     while i < tokens.len() {
         let t = tokens[i].as_str();
         match t {
             "--force" => opts.force = true,
             "--best-effort" => opts.best_effort = true,
-            "--net" => opts.net = Some(true),
-            "--no-net" => opts.net = Some(false),
+            "--net" => select_network(&mut opts, true)?,
+            "--no-net" => select_network(&mut opts, false)?,
             "--allow-secrets" => opts.allow_secrets = true,
             "--explain" => opts.explain = true,
             "--dry-run" => opts.dry_run = true,
@@ -406,11 +457,16 @@ pub fn parse_spec(tokens: &[String]) -> Result<(Vec<String>, ConfineOpts), Strin
             "--preset" => {
                 i += 1;
                 let name = tokens.get(i).ok_or("confine: --preset needs a NAME")?;
-                opts.preset = preset_from_name(name)?;
+                let preset = preset_from_name(name)?;
+                select_preset(&mut opts, &mut selected_preset, preset)?;
             }
-            "read-only" | "readonly" => opts.preset = Preset::ReadOnly,
-            "workspace" => opts.preset = Preset::Workspace,
-            "offline" | "no-net" => opts.net = Some(false),
+            "read-only" | "readonly" => {
+                select_preset(&mut opts, &mut selected_preset, Preset::ReadOnly)?;
+            }
+            "workspace" => {
+                select_preset(&mut opts, &mut selected_preset, Preset::Workspace)?;
+            }
+            "offline" | "no-net" => select_network(&mut opts, false)?,
             _ if t.starts_with('-') => return Err(format!("confine: unknown option '{t}'")),
             _ => allow.extend(split_list(t)),
         }
@@ -463,25 +519,75 @@ pub fn plan(
 
 /// Resolve a command name (or path) to an absolute executable path.
 fn resolve(name: &str, path_value: &str) -> Option<String> {
-    if name.contains('/') {
-        return std::path::Path::new(name)
-            .exists()
-            .then(|| name.to_string());
-    }
     match Resolver::default().resolve_external_only(name, Some(path_value)) {
         Some(CommandResolution::External(p)) => Some(p.display().to_string()),
         _ => None,
     }
 }
 
-/// If `path` is a script with a `#!interp …` shebang, return the interpreter.
-fn shebang_interpreter(path: &str) -> Option<String> {
-    let data = std::fs::read(path).ok()?;
-    let first = data.split(|&b| b == b'\n').next()?;
-    let line = std::str::from_utf8(first).ok()?.trim();
-    let rest = line.strip_prefix("#!")?;
-    // `#!/usr/bin/env python` -> env (and python is data); `#!/bin/bash` -> bash.
-    rest.split_whitespace().next().map(str::to_string)
+/// If `path` is a script with a `#!interp …` shebang, return executable names
+/// needed by that shebang. The kernel only accepts a short shebang line; cap the
+/// read so confining a multi-gigabyte payload cannot allocate its full size.
+/// For `/usr/bin/env python`, include both `env` and `python`.
+fn shebang_commands(path: &str) -> Vec<String> {
+    use std::io::Read as _;
+
+    const MAX_SHEBANG_BYTES: u64 = 4096;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut data = Vec::with_capacity(MAX_SHEBANG_BYTES as usize);
+    if file.take(MAX_SHEBANG_BYTES).read_to_end(&mut data).is_err() {
+        return Vec::new();
+    }
+    let Some(first) = data.split(|&b| b == b'\n').next() else {
+        return Vec::new();
+    };
+    let Ok(line) = std::str::from_utf8(first) else {
+        return Vec::new();
+    };
+    let Some(rest) = line.trim().strip_prefix("#!") else {
+        return Vec::new();
+    };
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    let Some(interpreter) = parts.first() else {
+        return Vec::new();
+    };
+    let mut commands = vec![(*interpreter).to_string()];
+    if basename(interpreter).eq_ignore_ascii_case("env") {
+        if let Some(command) = env_shebang_command(&parts[1..]) {
+            commands.push(command.to_string());
+        }
+    }
+    commands
+}
+
+fn env_shebang_command<'a>(parts: &'a [&str]) -> Option<&'a str> {
+    let mut index = 0usize;
+    while let Some(part) = parts.get(index).copied() {
+        match part {
+            "--" | "-S" | "--split-string" => index += 1,
+            "-u" | "--unset" | "-C" | "--chdir" => index += 2,
+            "-i" | "--ignore-environment" | "-0" | "--null" | "-v" | "--debug" => index += 1,
+            _ if part.starts_with("--unset=") || part.starts_with("--chdir=") => index += 1,
+            // Unknown options may consume the next token. Never guess that an
+            // option value is the executable and accidentally widen the profile.
+            _ if part.starts_with('-') => return None,
+            _ if is_env_assignment(part) => index += 1,
+            _ => return Some(part),
+        }
+    }
+    None
+}
+
+fn is_env_assignment(value: &str) -> bool {
+    value.split_once('=').is_some_and(|(name, _)| {
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+            && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+    })
 }
 
 /// Canonicalize `p` then insert both the canonical and original path so a
@@ -515,25 +621,24 @@ pub fn sandbox_exec_wrap(
             insert_exec(&mut execs, p);
         }
     }
-    for sh in ["/bin/sh", "/bin/bash"] {
-        if std::path::Path::new(sh).exists() {
-            insert_exec(&mut execs, sh.to_string());
-        }
+    // `/bin/sh` is the launcher used below. Do not grant other shells unless a
+    // payload/shebang or the explicit allowlist actually needs them.
+    if std::path::Path::new("/bin/sh").exists() {
+        insert_exec(&mut execs, "/bin/sh".to_string());
+    }
+    // On macOS `/bin/sh` selects `/bin/bash` as its executable variant at
+    // startup. Seatbelt reports "Failed to exec /bin/bash as variant" unless
+    // both are present, even though `/bin/sh` is a distinct regular file.
+    if cfg!(target_os = "macos") && std::path::Path::new("/bin/bash").exists() {
+        insert_exec(&mut execs, "/bin/bash".to_string());
     }
     if let Some(p) = resolve(payload0, &path_value) {
-        if let Some(interp) = shebang_interpreter(&p) {
+        for interp in shebang_commands(&p) {
             if let Some(ip) = resolve(&interp, &path_value) {
                 insert_exec(&mut execs, ip);
             }
         }
         insert_exec(&mut execs, p);
-    }
-    if let Some(extra) = state.lookup("AGSH_CONFINE_RUNTIME") {
-        for name in extra.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
-            if let Some(p) = resolve(name, &path_value) {
-                insert_exec(&mut execs, p);
-            }
-        }
     }
 
     // --- scratch dir (writable temp), if the preset wants one ---
@@ -612,17 +717,18 @@ pub fn sandbox_exec_wrap(
         profile.push_str("(deny mach-priv-task-port)\n");
     }
 
-    let profile_path = secure_temp_profile(&profile)?;
+    let Some(profile_path) = secure_temp_profile(&profile) else {
+        if let Some(path) = &scratch {
+            let _ = std::fs::remove_dir(path);
+        }
+        return None;
+    };
 
-    // --- payload prefix: scrub injection env, point TMPDIR at scratch ---
+    // --- payload prefix: point TMPDIR at scratch ---
+    // Injection and credential variables are removed by the caller before
+    // sandbox-exec starts; doing that inside this shell prefix is too late.
+    let env_remove = prelaunch_env_remove(state, &caps);
     let mut prefix = String::new();
-    if caps.scrub_env {
-        prefix.push_str("unset ");
-        prefix.push_str(&INJECTION_ENV_VARS.join(" "));
-        prefix.push(' ');
-        prefix.push_str(&CREDENTIAL_ENV_VARS.join(" "));
-        prefix.push_str(" 2>/dev/null; ");
-    }
     if let Some(s) = &scratch {
         let q = shell_quote(&s.display().to_string());
         prefix.push_str(&format!("export TMPDIR={q} TMP={q} TEMP={q}; "));
@@ -645,6 +751,7 @@ pub fn sandbox_exec_wrap(
         command,
         cleanup,
         explain,
+        env_remove,
     })
 }
 
@@ -700,7 +807,8 @@ fn secure_temp_profile(content: &str) -> Option<std::path::PathBuf> {
 
 /// Create a fresh private 0700 scratch dir under the temp base, canonicalized.
 fn make_scratch() -> Option<std::path::PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::DirBuilderExt;
+
     let base = std::env::temp_dir();
     for _ in 0..16 {
         let path = base.join(format!(
@@ -708,11 +816,16 @@ fn make_scratch() -> Option<std::path::PathBuf> {
             std::process::id(),
             unique_suffix()
         ));
-        match std::fs::create_dir(&path) {
-            Ok(()) => {
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
-                return std::fs::canonicalize(&path).ok();
-            }
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&path) {
+            Ok(()) => match std::fs::canonicalize(&path) {
+                Ok(canonical) => return Some(canonical),
+                Err(_) => {
+                    let _ = std::fs::remove_dir(&path);
+                    return None;
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => return None,
         }
@@ -834,7 +947,16 @@ mod tests {
                     "still refused as agent"
                 );
             }
-            ConfinePlan::Sandboxed { .. } | ConfinePlan::BestEffort => {}
+            ConfinePlan::Sandboxed { cleanup, .. } => {
+                for path in cleanup {
+                    let _ = if path.is_dir() {
+                        std::fs::remove_dir_all(path)
+                    } else {
+                        std::fs::remove_file(path)
+                    };
+                }
+            }
+            ConfinePlan::BestEffort => {}
         }
     }
 
@@ -851,6 +973,33 @@ mod tests {
         let q = shell_quote("/tmp/a$(touch /tmp/pwn)b");
         assert_eq!(q, "'/tmp/a$(touch /tmp/pwn)b'");
         assert!(!q.contains('"')); // never double-quoted (would re-expand)
+    }
+
+    #[test]
+    fn parse_spec_rejects_conflicting_security_options() {
+        assert!(parse_spec(&toks(&["read-only", "workspace"])).is_err());
+        assert!(parse_spec(&toks(&["--preset", "exec", "read-only"])).is_err());
+        assert!(parse_spec(&toks(&["--net", "--no-net"])).is_err());
+        assert!(parse_spec(&toks(&["offline", "--net"])).is_err());
+
+        assert!(parse_spec(&toks(&["read-only", "readonly", "--no-net"])).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_resolution_rejects_directories_and_non_executable_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "agsh-confine-resolve-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("plain");
+        std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+        assert!(resolve(dir.to_str().unwrap(), "").is_none());
+        assert!(resolve(file.to_str().unwrap(), "").is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -900,14 +1049,155 @@ mod tests {
     }
 
     #[test]
-    fn shebang_detection() {
+    fn shebang_detection_is_bounded_and_finds_env_target() {
         let dir = std::env::temp_dir().join(format!("agsh-confine-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("s.sh");
         std::fs::write(&script, "#!/bin/bash\necho hi\n").unwrap();
         assert_eq!(
-            shebang_interpreter(script.to_str().unwrap()).as_deref(),
-            Some("/bin/bash")
+            shebang_commands(script.to_str().unwrap()),
+            vec!["/bin/bash"]
         );
+        std::fs::write(&script, "#!/usr/bin/env -S python3 -O\nprint('ok')\n").unwrap();
+        assert_eq!(
+            shebang_commands(script.to_str().unwrap()),
+            vec!["/usr/bin/env", "python3"]
+        );
+        std::fs::write(&script, "#!/usr/bin/env --unknown /bin/rm python3\n").unwrap();
+        assert_eq!(
+            shebang_commands(script.to_str().unwrap()),
+            vec!["/usr/bin/env"]
+        );
+
+        let mut oversized = b"#!/bin/sh ".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', 1024 * 1024));
+        std::fs::write(&script, oversized).unwrap();
+        assert_eq!(shebang_commands(script.to_str().unwrap()), vec!["/bin/sh"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sandbox_profile_grants_only_platform_shell_runtime_not_env_backdoor() {
+        let mut s = state();
+        s.export_var("AGSH_CONFINE_RUNTIME", "/bin/cat");
+        let plan = sandbox_exec_wrap(
+            &s,
+            &[],
+            "/bin/echo",
+            "/bin/echo ok",
+            &ConfineOpts::default(),
+        )
+        .expect("build sandbox plan");
+        let ConfinePlan::Sandboxed { cleanup, .. } = plan else {
+            panic!("expected sandboxed plan");
+        };
+        let profile_path = cleanup.first().expect("profile path");
+        let profile = std::fs::read_to_string(profile_path).unwrap();
+        assert!(profile.contains("/bin/sh"));
+        assert_eq!(profile.contains("/bin/bash"), cfg!(target_os = "macos"));
+        assert!(!profile.contains("/bin/cat"));
+        for path in cleanup {
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+        }
+    }
+
+    #[test]
+    fn named_presets_remove_injection_and_generic_secret_env_before_launch() {
+        let mut s = state();
+        s.export_var("DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib");
+        s.export_var("DYLD_PRINT_TO_FILE", "/tmp/loader-output");
+        s.export_var("SERVICE_PASSWORD", "secret");
+        s.export_var("MY_PRIVATE_TOKEN", "secret");
+        s.export_var("TOKENIZERS_PARALLELISM", "true");
+        let caps = Caps::resolve(
+            &ConfineOpts {
+                preset: Preset::ReadOnly,
+                ..Default::default()
+            },
+            s.cwd(),
+        );
+        let removed = prelaunch_env_remove(&s, &caps);
+        assert!(removed.iter().any(|name| name == "DYLD_INSERT_LIBRARIES"));
+        assert!(removed.iter().any(|name| name == "DYLD_PRINT_TO_FILE"));
+        assert!(removed.iter().any(|name| name == "SERVICE_PASSWORD"));
+        assert!(removed.iter().any(|name| name == "MY_PRIVATE_TOKEN"));
+        assert!(!removed.iter().any(|name| name == "TOKENIZERS_PARALLELISM"));
+
+        let plan = sandbox_exec_wrap(
+            &s,
+            &[],
+            "/bin/echo",
+            "/bin/echo ok",
+            &ConfineOpts {
+                preset: Preset::ReadOnly,
+                ..Default::default()
+            },
+        )
+        .expect("build sandbox plan");
+        let ConfinePlan::Sandboxed {
+            env_remove,
+            cleanup,
+            ..
+        } = plan
+        else {
+            panic!("expected sandboxed plan");
+        };
+        assert!(env_remove
+            .iter()
+            .any(|name| name == "DYLD_INSERT_LIBRARIES"));
+        assert!(env_remove.iter().any(|name| name == "DYLD_PRINT_TO_FILE"));
+        assert!(env_remove.iter().any(|name| name == "SERVICE_PASSWORD"));
+        for path in cleanup {
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+        }
+
+        let open = Caps::resolve(&ConfineOpts::default(), s.cwd());
+        assert!(prelaunch_env_remove(&s, &open).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_directory_is_private_at_creation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let scratch = make_scratch().expect("create scratch");
+        let mode = std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        std::fs::remove_dir(scratch).unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn unsupported_platform_refuses_unless_downgrade_is_explicit() {
+        let s = state();
+        let opts = ConfineOpts {
+            preset: Preset::ReadOnly,
+            ..Default::default()
+        };
+        assert_eq!(detect_backend(), Backend::Unavailable);
+        match plan(&s, &[], &toks(&["echo", "ok"]), "echo ok", &opts) {
+            ConfinePlan::Refuse { message, code } => {
+                assert_eq!(code, 2);
+                assert!(message.contains("cannot enforce"));
+            }
+            _ => panic!("unsupported backend must fail closed"),
+        }
+
+        let downgraded = ConfineOpts {
+            best_effort: true,
+            ..opts
+        };
+        assert!(matches!(
+            plan(&s, &[], &toks(&["echo", "ok"]), "echo ok", &downgraded),
+            ConfinePlan::BestEffort
+        ));
     }
 }

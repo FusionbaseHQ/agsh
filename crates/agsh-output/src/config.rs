@@ -5,7 +5,8 @@
 //! LLM. It drives normalization, redaction, budgeting, and the configurable
 //! `[[compactor]]` rule engine.
 
-use std::path::PathBuf;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -13,6 +14,57 @@ use crate::budget::BudgetOptions;
 use crate::normalize::NormalizeOptions;
 use crate::redact::{compile_pattern_strings, default_patterns, RedactOptions};
 use crate::OutputMode;
+
+const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+
+/// Default and absolute ceiling for one command's combined persisted stdout and
+/// stderr. The hard ceiling is intentionally not configurable: a malformed or
+/// hostile local config must not turn trace capture back into an unbounded disk
+/// sink.
+pub const DEFAULT_MAX_RAW_BYTES: u64 = 100 * 1024 * 1024;
+pub const HARD_MAX_RAW_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawStorageOptions {
+    pub enabled: bool,
+    pub max_bytes: u64,
+}
+
+fn read_config_file(path: &Path) -> io::Result<String> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let file = std::fs::File::from(descriptor);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "config path is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_CONFIG_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("config exceeds {MAX_CONFIG_BYTES} bytes"),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_CONFIG_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("config exceeds {MAX_CONFIG_BYTES} bytes"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -86,6 +138,35 @@ impl Default for StorageConfig {
             max_raw_per_command: "100mb".to_string(),
         }
     }
+}
+
+impl StorageConfig {
+    fn max_raw_bytes(&self) -> u64 {
+        parse_byte_size(&self.max_raw_per_command)
+            .unwrap_or(DEFAULT_MAX_RAW_BYTES)
+            .min(HARD_MAX_RAW_BYTES)
+    }
+}
+
+fn parse_byte_size(value: &str) -> Option<u64> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "");
+    let digit_end = normalized
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(normalized.len());
+    if digit_end == 0 {
+        return None;
+    }
+    let number = normalized[..digit_end]
+        .parse::<u64>()
+        .unwrap_or(HARD_MAX_RAW_BYTES);
+    let multiplier = match normalized[digit_end..].trim() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    number.checked_mul(multiplier).or(Some(HARD_MAX_RAW_BYTES))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -253,9 +334,15 @@ impl CompactorConfig {
     /// silently revert the whole token economy.
     pub fn load() -> Self {
         let (mut cfg, warnings) = match Self::config_path() {
-            Some(path) => match std::fs::read_to_string(&path) {
+            Some(path) => match read_config_file(&path) {
                 Ok(text) => Self::parse_resilient(&text),
-                Err(_) => (Self::default(), Vec::new()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    (Self::default(), Vec::new())
+                }
+                Err(error) => (
+                    Self::default(),
+                    vec![format!("cannot read {} ({error})", path.display())],
+                ),
             },
             None => (Self::default(), Vec::new()),
         };
@@ -370,6 +457,22 @@ impl CompactorConfig {
         }
     }
 
+    /// Effective persisted raw-trace policy. `store_raw = false` is represented
+    /// as a zero-byte disabled sink so capture readers can continue draining
+    /// children without writing their bytes anywhere.
+    pub fn raw_storage_options(&self) -> RawStorageOptions {
+        if !self.storage.store_raw {
+            return RawStorageOptions {
+                enabled: false,
+                max_bytes: 0,
+            };
+        }
+        RawStorageOptions {
+            enabled: true,
+            max_bytes: self.storage.max_raw_bytes(),
+        }
+    }
+
     pub fn normalize_options(
         &self,
         home: Option<String>,
@@ -469,6 +572,30 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn temporary_file(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "agsh-output-{name}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
+
+    #[test]
+    fn config_file_read_is_bounded() {
+        let path = temporary_file("oversized-config");
+        std::fs::write(&path, vec![b'x'; MAX_CONFIG_BYTES + 1]).unwrap();
+        let error = read_config_file(&path).unwrap_err();
+        assert!(error.to_string().contains("exceeds"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_rejects_non_regular_files() {
+        let error = read_config_file(std::path::Path::new("/dev/zero")).unwrap_err();
+        assert!(error.to_string().contains("regular file"), "{error}");
+    }
+
     #[test]
     fn defaults_when_empty() {
         let cfg = CompactorConfig::from_toml("");
@@ -479,6 +606,30 @@ mod tests {
             !cfg.session.restore_banner,
             "restore banner must be OPT-IN (it interrupts every new shell)"
         );
+    }
+
+    #[test]
+    fn raw_trace_limit_parses_units_and_clamps_absurd_values() {
+        let cfg = CompactorConfig::from_toml("[storage]\nmax_raw_per_command = \"2kb\"\n");
+        assert_eq!(cfg.raw_storage_options().max_bytes, 2 * 1024);
+
+        let cfg = CompactorConfig::from_toml(
+            "[storage]\nmax_raw_per_command = \"999999999999999999999gb\"\n",
+        );
+        assert_eq!(cfg.raw_storage_options().max_bytes, HARD_MAX_RAW_BYTES);
+
+        let cfg = CompactorConfig::from_toml("[storage]\nmax_raw_per_command = \"not-a-size\"\n");
+        assert_eq!(cfg.raw_storage_options().max_bytes, DEFAULT_MAX_RAW_BYTES);
+    }
+
+    #[test]
+    fn disabling_raw_storage_produces_a_zero_byte_policy() {
+        let cfg = CompactorConfig::from_toml(
+            "[storage]\nstore_raw = false\nmax_raw_per_command = \"10mb\"\n",
+        );
+        let storage = cfg.raw_storage_options();
+        assert!(!storage.enabled);
+        assert_eq!(storage.max_bytes, 0);
     }
 
     #[test]

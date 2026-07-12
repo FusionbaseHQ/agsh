@@ -21,10 +21,10 @@
 //! `pre_exec`. The payload is therefore its own session leader; killing the
 //! daemon hangs jobs up, but a *client* dying just detaches.
 //!
-//! Security: the socket lives in a 0700 directory and is itself 0600 —
-//! reachable only by the owning user (the ssh-agent model). Job environments
-//! are passed explicitly by the spawning shell (confinement propagates via
-//! `AGSH_CONFINE` like any child).
+//! Security: the socket lives in an owned 0700 directory, is created 0600, and
+//! every accepted connection must present the daemon user's peer credentials
+//! (the ssh-agent model). Job environments are passed explicitly by the
+//! spawning shell (confinement propagates via `AGSH_CONFINE` like any child).
 
 pub mod attach;
 pub mod client;
@@ -41,11 +41,18 @@ pub use protocol::{JobInfo, JobKind, Request, Response, SpawnSpec};
 /// Never returns on success (the process image is replaced).
 pub fn supervise_exec(argv: &[String]) -> std::io::Error {
     use std::os::unix::process::CommandExt;
+    let rustix_error = |operation: &str, error: rustix::io::Errno| {
+        std::io::Error::other(format!("supervise: {operation}: {error}"))
+    };
     // New session: detach from any inherited controlling terminal…
-    let _ = rustix::process::setsid();
+    if let Err(error) = rustix::process::setsid() {
+        return rustix_error("setsid", error);
+    }
     // …and adopt the broker's PTY (our stdin) as the controlling terminal, so
     // the line discipline delivers SIGINT/SIGQUIT/SIGHUP to the payload.
-    let _ = rustix::process::ioctl_tiocsctty(std::io::stdin());
+    if let Err(error) = rustix::process::ioctl_tiocsctty(std::io::stdin()) {
+        return rustix_error("acquire controlling terminal", error);
+    }
     if argv.is_empty() {
         return std::io::Error::other("supervise: empty command");
     }

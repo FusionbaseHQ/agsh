@@ -28,7 +28,7 @@ impl AllowPolicy {
         let allowed = names
             .into_iter()
             .map(|n| basename(n.as_ref()).to_string())
-            .filter(|n| !n.is_empty())
+            .filter(|n| valid_serialized_name(n))
             .collect();
         Self { allowed }
     }
@@ -84,6 +84,18 @@ fn basename(command: &str) -> &str {
     command.rsplit(['/', '\\']).next().unwrap_or(command)
 }
 
+/// `AGSH_CONFINE` serializes names with commas, spaces, and tabs. Reject those
+/// delimiters (and control characters) at construction so serializing and then
+/// parsing a policy can never widen one entry into multiple allowed commands.
+fn valid_serialized_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name
+            .chars()
+            .any(|character| character.is_control() || matches!(character, ',' | ' '))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +132,21 @@ mod tests {
         let p = AllowPolicy::parse_list("df, ls");
         assert_eq!(p.to_list(), "df,ls");
         assert_eq!(AllowPolicy::parse_list(&p.to_list()), p);
+    }
+
+    #[test]
+    fn rejects_serialization_delimiters_and_terminal_controls() {
+        let p = AllowPolicy::from_names(["safe,rm", "safe rm", "safe\trm", "safe\nrm"]);
+        assert!(p.is_empty());
+        assert_eq!(p.to_list(), "");
+        assert!(!p.allows("rm"));
+    }
+
+    #[test]
+    fn serialization_round_trip_never_widens_programmatic_entries() {
+        let original = AllowPolicy::from_names(["ls", "bad,rm", "/usr/bin/df"]);
+        let restored = AllowPolicy::parse_list(&original.to_list());
+        assert_eq!(restored, original);
+        assert!(!restored.allows("rm"));
     }
 }

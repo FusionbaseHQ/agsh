@@ -1,0 +1,25 @@
+agsh
+Copyright 2026 Fusionbase and the agsh contributors
+
+Portions of the generic output reducer and command compactor presets are
+adapted from rtk (Rust Token Killer):
+
+    https://github.com/rtk-ai/rtk
+    Copyright 2024 rtk-ai and rtk-ai Labs
+
+Those portions are licensed under the Apache License, Version 2.0. The complete
+license text is in LICENSES/Apache-2.0.txt. The adapted files identify their
+origin and describe agsh-specific changes.
+
+agsh also incorporates third-party Rust crates recorded in Cargo.lock. Their
+copyright notices, versions, source links, and license texts are reproduced in
+THIRD_PARTY_LICENSES.html.
+
+Prebuilt agsh binaries incorporate the Rust standard library from the pinned
+toolchain. Each binary archive includes that toolchain release's generated
+RUST_STANDARD_LIBRARY_COPYRIGHT.html, covering the standard library and its
+bundled components; the installer retains it beside the other license notices.
+
+Static Linux release binaries also incorporate musl from the Ubuntu build
+toolchain. Linux archives include that package's exact copyright/license file as
+MUSL_COPYRIGHT.txt; the installer retains it with the other notices.

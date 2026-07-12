@@ -1,11 +1,12 @@
-//! Session journaling + restore: the shell's own crash-safe session state.
+//! Session journaling + restore: crash-tolerant interactive shell state.
 //!
 //! An interactive session appends its state *deltas* (cwd, exports, vars,
 //! aliases, abbreviations, functions, options) to a per-session JSONL journal
 //! (see `agsh_store::session`) as they happen — diffed at each command
-//! boundary, so a crash, closed terminal, or reboot never loses more than the
-//! command in flight. `fg`/`fg_end` records bracket the foreground command
-//! line as a flight recorder.
+//! boundary. Single append writes isolate partial records, but appends are not
+//! synchronously flushed at every boundary, so abrupt power loss can lose
+//! recent deltas. `fg`/`fg_end` records bracket the foreground command line as
+//! a flight recorder.
 //!
 //! Restore replays the folded deltas onto the live shell — it never re-runs
 //! commands, so replay has no side effects. A session becomes *restorable*
@@ -19,6 +20,13 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::io::Read;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::process::Stdio;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::time::{Duration, Instant};
 
 use agsh_store::session::{
     default_sessions_dir, list_sessions, new_session_id, prune_sessions, RestorableSession,
@@ -338,59 +346,187 @@ pub fn restorable_sessions() -> Vec<SessionInfo> {
 pub fn restorable_sessions_in(dir: &Path) -> Vec<SessionInfo> {
     list_sessions(dir)
         .into_iter()
-        .filter(|info| {
-            let s = &info.session;
-            !s.clean_exit
-                && !s.restored
-                && s.pid != std::process::id()
-                && !pid_alive(s.pid)
-                && (s.has_state() || s.foreground.is_some() || !s.jobs.is_empty())
-        })
+        .filter(|info| session_is_restorable(&info.session, std::process::id(), process_presence))
         .collect()
 }
 
-/// Whether a process with this pid exists (signal-0 probe; EPERM still means
-/// it exists). A dead shell's journal is restorable; a live one's is not.
-fn pid_alive(pid: u32) -> bool {
+/// Result of a signal-0 process probe. `Unknown` is deliberately distinct
+/// from `Gone`: treating a transient kernel error as death could offer a live
+/// session for restore or claim that a background job was lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessPresence {
+    Alive,
+    Gone,
+    Unknown,
+}
+
+fn process_presence(pid: u32) -> ProcessPresence {
     let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else {
-        return false;
+        return ProcessPresence::Gone;
     };
     match rustix::process::test_kill_process(pid) {
-        Ok(()) => true,
-        Err(errno) => errno == rustix::io::Errno::PERM,
+        Ok(()) | Err(rustix::io::Errno::PERM) => ProcessPresence::Alive,
+        Err(rustix::io::Errno::SRCH) => ProcessPresence::Gone,
+        Err(_) => ProcessPresence::Unknown,
     }
 }
 
-/// Whether a job recorded at `registered_at` is still the same live process:
-/// the pid must exist AND its observed start time must match the recorded
-/// registration time. The second check guards against pid reuse — after a
-/// reboot or a long gap, a recycled pid must not masquerade as the old job.
-fn job_still_alive(pgid: i32, registered_at: u64) -> bool {
-    if pgid <= 0 || !pid_alive(pgid as u32) {
-        return false;
-    }
-    match process_start_unix(pgid as u32) {
-        // `ps` etime has ~1s resolution and the job was registered a moment
-        // after the process spawned; a recycled pid would differ by far more.
-        Some(started) => started.abs_diff(registered_at) <= 120,
-        None => false,
+fn session_is_restorable(
+    session: &RestorableSession,
+    current_pid: u32,
+    mut presence: impl FnMut(u32) -> ProcessPresence,
+) -> bool {
+    !session.clean_exit
+        && !session.restored
+        && session.pid != current_pid
+        // A transient/permission probe failure must not make a live shell
+        // look dead and expose its journal for replay.
+        && presence(session.pid) == ProcessPresence::Gone
+        && (session.has_state() || session.foreground.is_some() || !session.jobs.is_empty())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobLiveness {
+    Alive,
+    GoneOrReused,
+    Unknown,
+}
+
+/// Background jobs are registered immediately after spawn. Allow a small
+/// scheduling delay, but do not use a symmetric window: a recycled PID names
+/// a process that started *after* the journal record and must be rejected.
+const MAX_JOB_REGISTRATION_LAG_SECS: u64 = 10;
+
+/// `ps etime` and journal timestamps both have one-second resolution. An
+/// elapsed-time sample can therefore make the derived start second one second
+/// later than the actual start second.
+const PROCESS_START_ROUNDING_SECS: u64 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartTimeMatch {
+    Match,
+    Ambiguous,
+    Mismatch,
+}
+
+fn compare_start_time(started_at: u64, registered_at: u64) -> StartTimeMatch {
+    let earliest_possible_start = started_at.saturating_sub(PROCESS_START_ROUNDING_SECS);
+    let earliest_accepted = registered_at.saturating_sub(MAX_JOB_REGISTRATION_LAG_SECS);
+    if started_at < earliest_accepted || earliest_possible_start > registered_at {
+        StartTimeMatch::Mismatch
+    } else if started_at <= registered_at {
+        StartTimeMatch::Match
+    } else {
+        // The elapsed-time rounding interval straddles registration. This may
+        // be the old process or a replacement started one second later, so it
+        // is not safe to make a positive survivor claim.
+        StartTimeMatch::Ambiguous
     }
 }
+
+/// Classify a recorded job using injectable probes. Keeping the decision pure
+/// makes failure and PID-reuse behavior deterministic in restricted CI, where
+/// the OS may allow signal-0 but deny process metadata queries.
+fn classify_job_liveness(
+    pgid: i32,
+    registered_at: u64,
+    mut presence: impl FnMut(u32) -> ProcessPresence,
+    mut process_start: impl FnMut(u32) -> Option<u64>,
+) -> JobLiveness {
+    if pgid <= 0 {
+        return JobLiveness::GoneOrReused;
+    }
+    let pid = pgid as u32;
+    match presence(pid) {
+        ProcessPresence::Gone => return JobLiveness::GoneOrReused,
+        ProcessPresence::Unknown => return JobLiveness::Unknown,
+        ProcessPresence::Alive => {}
+    }
+
+    match process_start(pid).map(|started_at| compare_start_time(started_at, registered_at)) {
+        Some(StartTimeMatch::Match) => JobLiveness::Alive,
+        Some(StartTimeMatch::Ambiguous) => JobLiveness::Unknown,
+        Some(StartTimeMatch::Mismatch) => JobLiveness::GoneOrReused,
+        None => match presence(pid) {
+            ProcessPresence::Gone => JobLiveness::GoneOrReused,
+            ProcessPresence::Alive | ProcessPresence::Unknown => JobLiveness::Unknown,
+        },
+    }
+}
+
+/// Whether a recorded job is still provably the same live process. Unknown
+/// probe results never become a positive survivor claim.
+fn job_liveness(pgid: i32, registered_at: u64) -> JobLiveness {
+    classify_job_liveness(pgid, registered_at, process_presence, process_start_unix)
+}
+
+#[cfg(target_os = "macos")]
+const PS_PATH: &str = "/bin/ps";
+#[cfg(target_os = "linux")]
+const PS_PATH: &str = "/usr/bin/ps";
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const PROCESS_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const PROCESS_PROBE_OUTPUT_CAP: u64 = 256;
 
 /// A process's start time (unix seconds), derived from `ps -o etime=`
-/// (elapsed time; POSIX, same format on macOS and Linux — locale-proof,
-/// unlike `lstart`).
+/// (elapsed time; same format on macOS and Linux). The platform's absolute
+/// system path is used with an empty environment and fixed locale, so shell
+/// aliases, `PATH`, and `PS_FORMAT` cannot affect the identity decision. The
+/// probe has a short deadline and a bounded output read; failure is reported
+/// to callers as unknown rather than dead.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn process_start_unix(pid: u32) -> Option<u64> {
-    let out = std::process::Command::new("ps")
+    let mut child = std::process::Command::new(PS_PATH)
         .args(["-o", "etime=", "-p", &pid.to_string()])
-        .output()
+        .env_clear()
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
+
+    let deadline = Instant::now() + PROCESS_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    let etime = String::from_utf8_lossy(&out.stdout);
-    let elapsed = parse_etime(etime.trim())?;
-    Some(unix_now().saturating_sub(elapsed))
+
+    let mut stdout = child.stdout.take()?;
+    let mut bytes = Vec::new();
+    stdout
+        .by_ref()
+        .take(PROCESS_PROBE_OUTPUT_CAP + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > PROCESS_PROBE_OUTPUT_CAP {
+        return None;
+    }
+    let etime = std::str::from_utf8(&bytes).ok()?.trim();
+    if etime.is_empty() || etime.lines().count() != 1 {
+        return None;
+    }
+    let elapsed = parse_etime(etime)?;
+    unix_now().checked_sub(elapsed)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_start_unix(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// Parse `ps` elapsed time — `[[dd-]hh:]mm:ss` — into seconds.
@@ -405,7 +541,13 @@ fn parse_etime(s: &str) -> Option<u64> {
         [m, s] => (0, m.parse().ok()?, s.parse().ok()?),
         _ => return None,
     };
-    Some(days * 86_400 + h * 3_600 + m * 60 + sec)
+    if h >= 24 || m >= 60 || sec >= 60 {
+        return None;
+    }
+    days.checked_mul(86_400)?
+        .checked_add(h.checked_mul(3_600)?)?
+        .checked_add(m.checked_mul(60)?)?
+        .checked_add(sec)
 }
 
 /// Replay a dead session's folded deltas onto the live shell. Returns human
@@ -465,7 +607,9 @@ pub fn apply_session(session: &RestorableSession, state: &mut ShellState) -> Vec
                 state.export_var(k, v);
                 restored_env.push(k.as_str());
             }
-            None => state.unset(k),
+            None => {
+                state.unset(k);
+            }
         }
     }
     if !restored_env.is_empty() {
@@ -482,7 +626,9 @@ pub fn apply_session(session: &RestorableSession, state: &mut ShellState) -> Vec
                 state.set_var(k, v);
                 restored_vars.push(k.as_str());
             }
-            None => state.unset(k),
+            None => {
+                state.unset(k);
+            }
         }
     }
     if !restored_vars.is_empty() {
@@ -640,6 +786,30 @@ fn banner_enabled(state: &ShellState) -> bool {
     state.output_config().session.restore_banner
 }
 
+fn background_job_summary(total: usize, alive: usize, unknown: usize) -> String {
+    let lost = total.saturating_sub(alive.saturating_add(unknown));
+    let mut parts = Vec::new();
+    if alive > 0 {
+        parts.push(format!(
+            "{alive} background job{} still running",
+            if alive == 1 { "" } else { "s" }
+        ));
+    }
+    if lost > 0 {
+        parts.push(format!(
+            "{lost} background job{} lost",
+            if lost == 1 { "" } else { "s" }
+        ));
+    }
+    if unknown > 0 {
+        parts.push(format!(
+            "{unknown} background job{} could not be verified",
+            if unknown == 1 { "" } else { "s" }
+        ));
+    }
+    parts.join(", ")
+}
+
 /// One-line interactive-startup banner when a dead session likely lost work,
 /// or `None`. Opt-in (see [`banner_enabled`]); muted styling; never blocks.
 pub fn restore_banner(state: &ShellState) -> Option<String> {
@@ -668,21 +838,16 @@ pub fn restore_banner(state: &ShellState) -> Option<String> {
         what.push(format!("`{}` was running", truncate(&fg.cmd, 40)));
     }
     if !s.jobs.is_empty() {
-        let alive = s
-            .jobs
-            .iter()
-            .filter(|j| job_still_alive(j.pgid, j.started_at))
-            .count();
-        what.push(match (alive, s.jobs.len()) {
-            (0, n) => format!("{n} background job{} lost", if n == 1 { "" } else { "s" }),
-            (a, n) if a == n => {
-                format!(
-                    "{a} background job{} still running",
-                    if a == 1 { "" } else { "s" }
-                )
+        let mut alive = 0;
+        let mut unknown = 0;
+        for job in &s.jobs {
+            match job_liveness(job.pgid, job.started_at) {
+                JobLiveness::Alive => alive += 1,
+                JobLiveness::Unknown => unknown += 1,
+                JobLiveness::GoneOrReused => {}
             }
-            (a, n) => format!("{a}/{n} background jobs still running"),
-        });
+        }
+        what.push(background_job_summary(s.jobs.len(), alive, unknown));
     }
     let why = if s.hangup {
         "hung up"
@@ -803,18 +968,28 @@ pub fn builtin_resume(args: &[String], state: &mut ShellState) -> CommandOutcome
         ));
     }
     for job in &info.session.jobs {
-        if job_still_alive(job.pgid, job.started_at) {
-            out.push_str(&format!(
-                "  background job `{}` SURVIVED (pgid {}) — signal it with `kill -- -{}`\n",
-                truncate(&job.cmd, 60),
-                job.pgid,
-                job.pgid,
-            ));
-        } else {
-            out.push_str(&format!(
-                "  background job `{}` was running when the session died\n",
-                truncate(&job.cmd, 60),
-            ));
+        match job_liveness(job.pgid, job.started_at) {
+            JobLiveness::Alive => {
+                out.push_str(&format!(
+                    "  background job `{}` SURVIVED (pgid {}) — signal it with `kill -- -{}`\n",
+                    truncate(&job.cmd, 60),
+                    job.pgid,
+                    job.pgid,
+                ));
+            }
+            JobLiveness::GoneOrReused => {
+                out.push_str(&format!(
+                    "  background job `{}` was running when the session died\n",
+                    truncate(&job.cmd, 60),
+                ));
+            }
+            JobLiveness::Unknown => {
+                out.push_str(&format!(
+                    "  background job `{}` could not be verified (pgid {})\n",
+                    truncate(&job.cmd, 60),
+                    job.pgid,
+                ));
+            }
         }
     }
     CommandOutcome::captured(0, out.into_bytes(), Vec::new())
@@ -1013,6 +1188,38 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_shell_pid_probe_never_offers_a_live_journal() {
+        let session = fold_session(&[
+            SessionEvent::Start {
+                id: "candidate".into(),
+                pid: 42,
+                cwd: "/w".into(),
+                host: "h".into(),
+                at: 1,
+                version: "0".into(),
+            },
+            SessionEvent::Env {
+                k: "A".into(),
+                v: "1".into(),
+            },
+        ]);
+
+        assert!(!session_is_restorable(&session, 7, |pid| {
+            assert_eq!(pid, 42);
+            ProcessPresence::Unknown
+        }));
+        assert!(!session_is_restorable(&session, 7, |_| {
+            ProcessPresence::Alive
+        }));
+        assert!(session_is_restorable(&session, 7, |_| {
+            ProcessPresence::Gone
+        }));
+        assert!(!session_is_restorable(&session, 42, |_| {
+            panic!("the current shell pid must not be probed")
+        }));
+    }
+
+    #[test]
     fn resume_hint_knows_resumable_agents() {
         assert!(resume_hint("claude --model opus").contains("sessions"));
         assert!(resume_hint("codex").contains("sessions"));
@@ -1077,25 +1284,108 @@ mod tests {
 
     #[test]
     fn job_liveness_guards_against_pid_reuse() {
-        let mut child = std::process::Command::new("sleep")
+        let mut child = std::process::Command::new("/bin/sleep")
             .arg("30")
             .spawn()
             .expect("spawn sleep");
         let pid = child.id() as i32;
         let now = unix_now();
         assert!(
-            job_still_alive(pid, now),
-            "live process registered now must count as alive"
-        );
-        assert!(
-            !job_still_alive(pid, now - 10_000),
-            "same pid with a far-off registration time is a recycled pid, not our job"
+            matches!(
+                job_liveness(pid, now),
+                JobLiveness::Alive | JobLiveness::Unknown
+            ),
+            "a restricted metadata probe must not claim that a live process is gone"
         );
         let _ = child.kill();
         let _ = child.wait();
-        assert!(!job_still_alive(pid, now), "dead process is dead");
-        assert!(!job_still_alive(99_999_999, now), "nonexistent pid");
-        assert!(!job_still_alive(0, now), "pgid 0 is never a job");
+        assert_eq!(
+            job_liveness(pid, now),
+            JobLiveness::GoneOrReused,
+            "dead process is dead"
+        );
+        assert_eq!(
+            job_liveness(99_999_999, now),
+            JobLiveness::GoneOrReused,
+            "nonexistent pid"
+        );
+        assert_eq!(
+            job_liveness(0, now),
+            JobLiveness::GoneOrReused,
+            "pgid 0 is never a job"
+        );
+    }
+
+    #[test]
+    fn job_liveness_decision_is_one_sided_and_fail_closed() {
+        let registered = 10_000;
+        let classify = |started| {
+            classify_job_liveness(42, registered, |_| ProcessPresence::Alive, |_| started)
+        };
+
+        assert_eq!(classify(Some(registered)), JobLiveness::Alive);
+        assert_eq!(classify(Some(registered - 10)), JobLiveness::Alive);
+        assert_eq!(
+            classify(Some(registered - 11)),
+            JobLiveness::GoneOrReused,
+            "an unrelated old process is not the registered job"
+        );
+        assert_eq!(
+            classify(Some(registered + 1)),
+            JobLiveness::Unknown,
+            "rounding that overlaps a possible later start must not claim survival"
+        );
+        assert_eq!(
+            classify(Some(registered + 2)),
+            JobLiveness::GoneOrReused,
+            "a process started after registration is a recycled pid"
+        );
+        assert_eq!(
+            classify(None),
+            JobLiveness::Unknown,
+            "metadata denial is not evidence of death"
+        );
+        assert_eq!(
+            classify_job_liveness(
+                42,
+                registered,
+                |_| ProcessPresence::Unknown,
+                |_| panic!("start probe must not run after uncertain presence"),
+            ),
+            JobLiveness::Unknown
+        );
+    }
+
+    #[test]
+    fn failed_start_probe_rechecks_for_an_exit() {
+        let mut calls = 0;
+        let result = classify_job_liveness(
+            42,
+            10_000,
+            |_| {
+                calls += 1;
+                if calls == 1 {
+                    ProcessPresence::Alive
+                } else {
+                    ProcessPresence::Gone
+                }
+            },
+            |_| None,
+        );
+        assert_eq!(result, JobLiveness::GoneOrReused);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn background_job_summary_distinguishes_unknown_from_lost() {
+        assert_eq!(
+            background_job_summary(3, 1, 1),
+            "1 background job still running, 1 background job lost, 1 background job could not be verified"
+        );
+        assert_eq!(
+            background_job_summary(2, 0, 2),
+            "2 background jobs could not be verified"
+        );
     }
 
     #[test]
@@ -1173,5 +1463,15 @@ mod tests {
         );
         assert_eq!(parse_etime(""), None);
         assert_eq!(parse_etime("garbage"), None);
+        assert_eq!(parse_etime("00:60"), None);
+        assert_eq!(parse_etime("24:00:00"), None);
+        assert_eq!(parse_etime("01:60:00"), None);
+        assert_eq!(parse_etime("18446744073709551615-00:00:00"), None);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn process_probe_uses_an_absolute_system_binary() {
+        assert!(Path::new(PS_PATH).is_absolute(), "{PS_PATH}");
     }
 }

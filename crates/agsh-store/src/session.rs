@@ -1,11 +1,11 @@
-//! Durable per-session journal: crash-safe state recovery for interactive
-//! sessions.
+//! Bounded per-session journal for crash-tolerant interactive state recovery.
 //!
 //! Every state *delta* an interactive session produces (cwd change, export,
 //! alias/function definition, …) is appended to a per-session JSONL journal the
 //! moment it is observed, using the same O_APPEND single-write discipline as the
-//! history store — so the journal is always current and no save-on-exit step
-//! exists to miss (crash-only design). A session that ends cleanly appends an
+//! history store. No save-on-exit step exists to miss (crash-only design), but
+//! appends are not synchronously flushed at every command boundary and recent
+//! records can be lost on abrupt power failure. A clean session appends an
 //! `exit` record; a journal without one whose shell process is gone marks a
 //! session that died (crash, SIGHUP from a closed terminal, reboot) and can be
 //! restored by *replaying the deltas* — never by re-running commands, so replay
@@ -15,12 +15,19 @@
 //! foreground command line and `job`/`job_end` bracket background jobs, so a
 //! restored session knows what was running when the previous one died.
 
-use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
+
+/// Maximum encoded size of one journal event, including its trailing newline.
+pub const MAX_SESSION_EVENT_BYTES: usize = 1024 * 1024;
+/// Maximum journal bytes inspected or retained by an append operation.
+pub const MAX_SESSION_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum decoded events retained in memory while loading one journal.
+pub const MAX_SESSION_EVENTS: usize = 16 * 1024;
 
 /// One journaled session event. State deltas carry the *net new value* (last
 /// write wins on replay); lifecycle events carry timestamps.
@@ -121,12 +128,23 @@ pub enum SessionEvent {
 
 /// Append-only writer for one session's journal file (`<dir>/<id>.jsonl`).
 ///
-/// Stateless between appends: each append opens with O_APPEND and writes the
-/// whole line in one `write_all`, so concurrent processes can't interleave a
+/// Stateless between appends: each append opens with O_APPEND and submits the
+/// whole bounded line in one write, so concurrent processes can't interleave a
 /// half-line and a crash can lose at most the event being written.
 #[derive(Debug, Clone)]
 pub struct SessionJournal {
     path: PathBuf,
+}
+
+struct LockedJournalFile {
+    file: std::fs::File,
+}
+
+impl Drop for LockedJournalFile {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+    }
 }
 
 impl SessionJournal {
@@ -149,57 +167,318 @@ impl SessionJournal {
     /// so I/O errors are swallowed. Journals can carry exported secrets, so the
     /// directory is created 0700 and the file 0600 (like the trace dir).
     pub fn append(&self, event: &SessionEvent) {
-        if let Some(parent) = self.path.parent() {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            let _ = builder.create(parent);
+        let _ = self.try_append(event);
+    }
+
+    fn try_append(&self, event: &SessionEvent) -> io::Result<()> {
+        let line = serialize_event_line(event).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session journal event exceeds size limit",
+            )
+        })?;
+        ensure_session_parent(&self.path)?;
+        let file = open_journal_for_append(&self.path)?;
+        #[cfg(unix)]
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+            |error| {
+                io::Error::new(
+                    io::Error::from_raw_os_error(error.raw_os_error()).kind(),
+                    format!(
+                        "cannot lock session journal {}: {error}",
+                        self.path.display()
+                    ),
+                )
+            },
+        )?;
+        let mut locked = LockedJournalFile { file };
+        let length = locked.file.metadata()?.len();
+        let new_length = length.checked_add(line.len() as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::FileTooLarge, "session journal size overflow")
+        })?;
+        if new_length > MAX_SESSION_JOURNAL_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "session journal exceeds size limit",
+            ));
         }
-        if let Ok(mut line) = serde_json::to_string(event) {
-            line.push('\n');
-            let mut options = std::fs::OpenOptions::new();
-            options.create(true).append(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            if let Ok(mut file) = options.open(&self.path) {
-                let _ = file.write_all(line.as_bytes());
-            }
+
+        // One O_APPEND write is deliberate: a partial write leaves one corrupt
+        // line to skip instead of allowing another writer to interleave bytes.
+        let written = locked.file.write(&line)?;
+        if written != line.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "partial session journal event write",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct BoundedEventBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for BoundedEventBuffer {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if input.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session journal event exceeds size limit",
+            ));
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_event_line(event: &SessionEvent) -> Option<Vec<u8>> {
+    let mut output = BoundedEventBuffer {
+        bytes: Vec::with_capacity(256),
+        limit: MAX_SESSION_EVENT_BYTES.saturating_sub(1),
+    };
+    serde_json::to_writer(&mut output, event).ok()?;
+    output.bytes.push(b'\n');
+    Some(output.bytes)
+}
+
+fn ensure_session_parent(path: &Path) -> io::Result<()> {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = std::fs::symlink_metadata(parent)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session journal parent must be a real directory",
+            ));
+        }
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session journal parent is owned by another user",
+            ));
+        }
+        if metadata.permissions().mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_journal_private(file: &std::fs::File) -> io::Result<()> {
+    use rustix::fs::Mode;
+    use std::os::unix::fs::MetadataExt;
+
+    if file.metadata()?.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "session journal is owned by another user",
+        ));
+    }
+    rustix::fs::fchmod(file, Mode::RUSR | Mode::WUSR)
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+#[cfg(not(unix))]
+fn make_journal_private(_file: &std::fs::File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_journal_for_read(path: &Path) -> io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let file = std::fs::File::from(descriptor);
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session journal path is not a regular file",
+        ));
+    }
+    make_journal_private(&file)?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_journal_for_read(path: &Path) -> io::Result<std::fs::File> {
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session journal path is not a regular file",
+        ));
+    }
+    make_journal_private(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_journal_for_append(path: &Path) -> io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::WRONLY
+            | OFlags::CREATE
+            | OFlags::APPEND
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let file = std::fs::File::from(descriptor);
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session journal path is not a regular file",
+        ));
+    }
+    make_journal_private(&file)?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_journal_for_append(path: &Path) -> io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session journal path is not a regular file",
+        ));
+    }
+    make_journal_private(&file)?;
+    Ok(file)
+}
+
+enum BoundedLine {
+    Eof,
+    Line,
+    Oversized,
+}
+
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    output: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<BoundedLine> {
+    output.clear();
+    let mut oversized = false;
+
+    loop {
+        let (consumed, ended) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(if oversized {
+                    BoundedLine::Oversized
+                } else if output.is_empty() {
+                    BoundedLine::Eof
+                } else {
+                    BoundedLine::Line
+                });
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map_or(available.len(), |index| index + 1);
+            if !oversized {
+                let remaining = limit.saturating_add(1).saturating_sub(output.len());
+                output.extend_from_slice(&available[..consumed.min(remaining)]);
+                if output.len() > limit {
+                    output.clear();
+                    oversized = true;
+                }
+            }
+            (consumed, newline.is_some())
+        };
+        reader.consume(consumed);
+        if ended {
+            return Ok(if oversized {
+                BoundedLine::Oversized
+            } else {
+                BoundedLine::Line
+            });
+        }
+    }
+}
+
+fn push_bounded_event(events: &mut VecDeque<SessionEvent>, event: SessionEvent, limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    if matches!(event, SessionEvent::Start { .. }) {
+        events.clear();
+    } else if events.len() == limit {
+        if matches!(events.front(), Some(SessionEvent::Start { .. })) && limit > 1 {
+            events.remove(1);
+        } else {
+            events.pop_front();
+        }
+    }
+    events.push_back(event);
 }
 
 /// Read a journal, skipping corrupt or non-UTF8 lines (a bad line must not
 /// truncate the newer events after it — same rationale as the history loader).
 pub fn read_journal(path: &Path) -> Vec<SessionEvent> {
-    let mut events = Vec::new();
-    let Ok(file) = std::fs::File::open(path) else {
-        return events;
+    let mut events = VecDeque::new();
+    let Ok(mut file) = open_journal_for_read(path) else {
+        return Vec::new();
     };
-    let mut reader = BufReader::new(file);
+    let length = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let start = length.saturating_sub(MAX_SESSION_JOURNAL_BYTES);
+    if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut reader = BufReader::new(file.take(MAX_SESSION_JOURNAL_BYTES));
     let mut buf: Vec<u8> = Vec::new();
-    loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        let line = String::from_utf8_lossy(&buf);
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(event) = serde_json::from_str::<SessionEvent>(line) {
-            events.push(event);
+    if start > 0 {
+        match read_bounded_line(&mut reader, &mut buf, MAX_SESSION_EVENT_BYTES) {
+            Ok(BoundedLine::Eof) | Err(_) => return Vec::new(),
+            Ok(BoundedLine::Line | BoundedLine::Oversized) => {}
         }
     }
-    events
+    loop {
+        match read_bounded_line(&mut reader, &mut buf, MAX_SESSION_EVENT_BYTES) {
+            Ok(BoundedLine::Eof) | Err(_) => break,
+            Ok(BoundedLine::Oversized) => continue,
+            Ok(BoundedLine::Line) => {}
+        }
+        if let Ok(event) = serde_json::from_slice::<SessionEvent>(&buf) {
+            push_bounded_event(&mut events, event, MAX_SESSION_EVENTS);
+        }
+    }
+    events.into_iter().collect()
 }
 
 /// A foreground command that was running when the journal's last event was
@@ -379,6 +658,13 @@ pub fn list_sessions(dir: &Path) -> Vec<SessionInfo> {
         return out;
     };
     for entry in rd.flatten() {
+        if !entry
+            .file_type()
+            .map(|file_type| file_type.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
@@ -413,6 +699,9 @@ pub fn prune_sessions(dir: &Path, keep: usize) {
     let mut files: Vec<(PathBuf, SystemTime)> = rd
         .flatten()
         .filter_map(|entry| {
+            if !entry.file_type().ok()?.is_file() {
+                return None;
+            }
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 return None;
@@ -456,6 +745,8 @@ pub fn default_sessions_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("agsh_sess_{tag}_{}", std::process::id()));
@@ -479,30 +770,42 @@ mod tests {
     fn journal_round_trips_and_folds() {
         let dir = temp_dir("rt");
         let journal = SessionJournal::create(&dir, "s1");
-        journal.append(&start("s1", 42));
-        journal.append(&SessionEvent::Cwd {
-            path: "/work".into(),
-        });
-        journal.append(&SessionEvent::Env {
-            k: "FOO".into(),
-            v: "bar".into(),
-        });
-        journal.append(&SessionEvent::Var {
-            k: "local1".into(),
-            v: "x".into(),
-        });
-        journal.append(&SessionEvent::Alias {
-            k: "gs".into(),
-            v: "git status".into(),
-        });
-        journal.append(&SessionEvent::Func {
-            k: "hi".into(),
-            v: "echo hi".into(),
-        });
-        journal.append(&SessionEvent::Opt {
-            k: "pipefail".into(),
-            on: true,
-        });
+        journal.try_append(&start("s1", 42)).unwrap();
+        journal
+            .try_append(&SessionEvent::Cwd {
+                path: "/work".into(),
+            })
+            .unwrap();
+        journal
+            .try_append(&SessionEvent::Env {
+                k: "FOO".into(),
+                v: "bar".into(),
+            })
+            .unwrap();
+        journal
+            .try_append(&SessionEvent::Var {
+                k: "local1".into(),
+                v: "x".into(),
+            })
+            .unwrap();
+        journal
+            .try_append(&SessionEvent::Alias {
+                k: "gs".into(),
+                v: "git status".into(),
+            })
+            .unwrap();
+        journal
+            .try_append(&SessionEvent::Func {
+                k: "hi".into(),
+                v: "echo hi".into(),
+            })
+            .unwrap();
+        journal
+            .try_append(&SessionEvent::Opt {
+                k: "pipefail".into(),
+                on: true,
+            })
+            .unwrap();
 
         let events = read_journal(journal.path());
         assert_eq!(events.len(), 7);
@@ -541,6 +844,128 @@ mod tests {
         assert_eq!(events.len(), 2, "kept events around the corrupt lines");
         assert_eq!(fold_session(&events).cwd.as_deref(), Some("/w"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_never_follows_a_final_symlink() {
+        let dir = temp_dir("symlink");
+        let victim = dir.join("victim");
+        let journal_path = dir.join("s.jsonl");
+        std::fs::write(&victim, b"unchanged").unwrap();
+        symlink(&victim, &journal_path).unwrap();
+        let journal = SessionJournal::from_path(journal_path.clone());
+
+        journal.append(&start("s", 1));
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+        assert!(read_journal(&journal_path).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_special_files_are_rejected_without_blocking() {
+        let dir = temp_dir("fifo");
+        let fifo = dir.join("s.jsonl");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be available on supported Unix platforms");
+        assert!(status.success());
+        let journal = SessionJournal::from_path(fifo.clone());
+        let started = std::time::Instant::now();
+
+        journal.append(&start("s", 1));
+        assert!(read_journal(&fifo).is_empty());
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(read_journal(Path::new("/dev/null")).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oversized_line_is_skipped_without_losing_a_later_event() {
+        let dir = temp_dir("large-line");
+        let path = dir.join("s.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&vec![b'x'; MAX_SESSION_EVENT_BYTES + 1])
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        serde_json::to_writer(&mut file, &start("later", 7)).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+
+        let events = read_journal(&path);
+
+        assert_eq!(events, [start("later", 7)]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oversized_event_and_full_journal_are_bounded() {
+        let dir = temp_dir("bounds");
+        let journal = SessionJournal::create(&dir, "s");
+        journal.append(&SessionEvent::Var {
+            k: "large".into(),
+            v: "x".repeat(MAX_SESSION_EVENT_BYTES + 1),
+        });
+        journal.append(&start("s", 1));
+        assert_eq!(read_journal(journal.path()), [start("s", 1)]);
+
+        let before = std::fs::metadata(journal.path()).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(journal.path())
+            .unwrap()
+            .set_len(MAX_SESSION_JOURNAL_BYTES + 1)
+            .unwrap();
+        journal.append(&SessionEvent::Cwd { path: "/w".into() });
+
+        assert_eq!(
+            std::fs::metadata(journal.path()).unwrap().len(),
+            MAX_SESSION_JOURNAL_BYTES + 1
+        );
+        assert!(read_journal(journal.path()).is_empty());
+        assert!(before < MAX_SESSION_JOURNAL_BYTES);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn event_window_keeps_latest_start_and_later_events() {
+        let mut events = VecDeque::new();
+        push_bounded_event(&mut events, start("s", 1), 3);
+        for path in ["/one", "/two", "/three"] {
+            push_bounded_event(&mut events, SessionEvent::Cwd { path: path.into() }, 3);
+        }
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], SessionEvent::Start { .. }));
+        assert_eq!(
+            fold_session(events.make_contiguous()).cwd.as_deref(),
+            Some("/three")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_append_tightens_regular_file_permissions() {
+        let dir = temp_dir("mode");
+        let journal = SessionJournal::create(&dir, "s");
+        std::fs::write(journal.path(), b"").unwrap();
+        std::fs::set_permissions(journal.path(), std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        journal.append(&start("s", 1));
+
+        assert_eq!(
+            std::fs::metadata(journal.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -26,6 +26,10 @@ const FILE_SAMPLE: usize = 20;
 const NOTE_SAMPLE: usize = 5;
 /// Maximum number of stderr diagnostic lines collected.
 const MAX_DIAGS: usize = 50;
+/// Exact per-file grouping is useful but must not grow with arbitrary search
+/// output. Past this bound the summary reports a lower bound and raw refs retain
+/// the complete result.
+const MAX_TRACKED_FILES: usize = 4_096;
 
 /// Substrings (lower-cased) that mark an stderr line as a real diagnostic.
 const ERROR_NEEDLES: &[&str] = &[
@@ -106,6 +110,7 @@ pub fn summarize(cx: &CommandContext) -> SemanticSummary {
 
     let mut total_matches: i64 = 0;
     let mut files: HashSet<String> = HashSet::new();
+    let mut files_truncated = false;
     let mut file_sample: Vec<String> = Vec::new();
     let mut note_sample: Vec<String> = Vec::new();
     // Per-file grouping (rtk-style): file -> (match count, first snippet).
@@ -119,35 +124,43 @@ pub fn summarize(cx: &CommandContext) -> SemanticSummary {
         if flags.files_only {
             let path = raw.trim();
             if !path.is_empty() {
-                record_file(path, &mut files, &mut file_sample);
+                let (_, truncated) = record_file(path, &mut files, &mut file_sample);
+                files_truncated |= truncated;
             }
             continue;
         }
 
         if flags.count {
             if let Some((path, n)) = parse_count_line(raw) {
-                total_matches += n;
+                total_matches = total_matches.saturating_add(n);
                 if let Some(p) = path {
-                    record_file(&p, &mut files, &mut file_sample);
-                    per_file.entry(p).or_insert((0, None)).0 += n;
+                    let (tracked, truncated) = record_file(p, &mut files, &mut file_sample);
+                    files_truncated |= truncated;
+                    if let Some(tracked) = tracked {
+                        let count = &mut per_file.entry(tracked).or_insert((0, None)).0;
+                        *count = count.saturating_add(n);
+                    }
                 }
             }
             continue;
         }
 
         // Normal match line.
-        total_matches += 1;
+        total_matches = total_matches.saturating_add(1);
         let (path, text) = parse_match_line(raw, flags.no_filename);
         let snippet = {
             let t = text.trim();
             (!t.is_empty()).then(|| clip(t, MAX_LINE))
         };
         if let Some(p) = path {
-            record_file(&p, &mut files, &mut file_sample);
-            let entry = per_file.entry(p).or_insert((0, None));
-            entry.0 += 1;
-            if entry.1.is_none() {
-                entry.1 = snippet.clone();
+            let (tracked, truncated) = record_file(p, &mut files, &mut file_sample);
+            files_truncated |= truncated;
+            if let Some(tracked) = tracked {
+                let entry = per_file.entry(tracked).or_insert((0, None));
+                entry.0 = entry.0.saturating_add(1);
+                if entry.1.is_none() {
+                    entry.1 = snippet.clone();
+                }
             }
         } else if note_sample.len() < NOTE_SAMPLE {
             // No path (single-file / -h): keep a flat sample of matching lines.
@@ -172,17 +185,28 @@ pub fn summarize(cx: &CommandContext) -> SemanticSummary {
     }
 
     let file_count = files.len() as i64;
+    if files_truncated {
+        summary.set_count("files_truncated", 1);
+    }
 
     if flags.files_only {
         summary
             .set_count("files", file_count)
-            .set_headline(format!("{file_count} files with matches"));
+            .set_headline(if files_truncated {
+                format!("at least {file_count} files with matches")
+            } else {
+                format!("{file_count} files with matches")
+            });
     } else {
         summary.set_count("matches", total_matches);
         if file_count > 0 {
             summary
                 .set_count("files", file_count)
-                .set_headline(format!("{total_matches} matches in {file_count} files"));
+                .set_headline(if files_truncated {
+                    format!("{total_matches} matches in at least {file_count} files")
+                } else {
+                    format!("{total_matches} matches in {file_count} files")
+                });
         } else {
             summary.set_headline(format!("{total_matches} matches"));
         }
@@ -198,11 +222,27 @@ pub fn summarize(cx: &CommandContext) -> SemanticSummary {
     summary
 }
 
-/// Insert a file into the dedup set, keeping a bounded ordered sample.
-fn record_file(path: &str, files: &mut HashSet<String>, sample: &mut Vec<String>) {
-    if files.insert(path.to_string()) && sample.len() < FILE_SAMPLE {
-        sample.push(path.to_string());
+/// Insert a file into the dedup set, keeping a bounded ordered sample. The
+/// returned key is clipped before storage; `truncated` marks either that clip or
+/// an untracked path hitting the hard set limit.
+fn record_file(
+    path: &str,
+    files: &mut HashSet<String>,
+    sample: &mut Vec<String>,
+) -> (Option<String>, bool) {
+    let key = clip(path, MAX_LINE);
+    let truncated = key != path;
+    if files.contains(&key) {
+        return (Some(key), truncated);
     }
+    if files.len() >= MAX_TRACKED_FILES {
+        return (None, true);
+    }
+    if sample.len() < FILE_SAMPLE {
+        sample.push(key.clone());
+    }
+    files.insert(key.clone());
+    (Some(key), truncated)
 }
 
 /// Pull error-like lines out of stderr, clipped and bounded.
@@ -267,7 +307,7 @@ fn parse_flags(argv: &[String], is_rg: bool) -> Flags {
 }
 
 /// Parse a `--count` line: `path:count` or a bare `count`.
-fn parse_count_line(line: &str) -> Option<(Option<String>, i64)> {
+fn parse_count_line(line: &str) -> Option<(Option<&str>, i64)> {
     let t = line.trim();
     if t.is_empty() {
         return None;
@@ -275,7 +315,7 @@ fn parse_count_line(line: &str) -> Option<(Option<String>, i64)> {
     if let Some(idx) = t.rfind(':') {
         let (left, right) = (&t[..idx], &t[idx + 1..]);
         if !left.is_empty() && is_all_digits(right) {
-            return Some((Some(left.to_string()), right.parse().unwrap_or(0)));
+            return Some((Some(left), right.parse().unwrap_or(0)));
         }
     }
     if is_all_digits(t) {
@@ -289,18 +329,18 @@ fn parse_count_line(line: &str) -> Option<(Option<String>, i64)> {
 /// Recognises `path:line:text` (the common `-n`/ripgrep form) and `path:text`.
 /// A leading all-numeric field is treated as a line number, not a path, so
 /// single-file `grep -n` output is not mistaken for a filename.
-fn parse_match_line(line: &str, no_filename: bool) -> (Option<String>, String) {
+fn parse_match_line(line: &str, no_filename: bool) -> (Option<&str>, &str) {
     if !no_filename {
         if let Some(rest) = line.strip_prefix("Binary file ") {
             if let Some(path) = rest.strip_suffix(" matches") {
                 if !path.is_empty() {
-                    return (Some(path.to_string()), line.to_string());
+                    return (Some(path), line);
                 }
             }
         }
     }
     if no_filename {
-        return (None, line.to_string());
+        return (None, line);
     }
 
     if let Some(c1) = line.find(':') {
@@ -311,16 +351,16 @@ fn parse_match_line(line: &str, no_filename: bool) -> (Option<String>, String) {
             if let Some(c2) = rest.find(':') {
                 let mid = &rest[..c2];
                 if is_all_digits(mid) {
-                    return (Some(head.to_string()), rest[c2 + 1..].to_string());
+                    return (Some(head), &rest[c2 + 1..]);
                 }
             }
             // path:text — only when the head looks like a file path.
             if !head.contains(char::is_whitespace) && (head.contains('/') || head.contains('.')) {
-                return (Some(head.to_string()), rest.to_string());
+                return (Some(head), rest);
             }
         }
     }
-    (None, line.to_string())
+    (None, line)
 }
 
 fn is_all_digits(s: &str) -> bool {
@@ -476,5 +516,37 @@ mod tests {
         assert_eq!(s.status, "ok");
         assert_eq!(s.counts.get("matches"), Some(&1));
         assert!(s.warnings.iter().any(|w| w.contains("Permission denied")));
+    }
+
+    #[test]
+    fn distinct_file_tracking_is_hard_bounded() {
+        let a = argv(&["rg", "-l", "needle"]);
+        let out = (0..MAX_TRACKED_FILES + 10)
+            .map(|i| format!("src/file-{i}.rs\n"))
+            .collect::<String>();
+        let s = summarize(&cx(&a, 0, &out, ""));
+        assert_eq!(s.counts.get("files"), Some(&(MAX_TRACKED_FILES as i64)));
+        assert_eq!(s.counts.get("files_truncated"), Some(&1));
+        assert!(s.headline.contains("at least"));
+        assert!(s.paths.len() <= FILE_SAMPLE);
+    }
+
+    #[test]
+    fn count_mode_saturates_instead_of_overflowing() {
+        let a = argv(&["rg", "--count", "needle"]);
+        let out = format!("a.rs:{}\nb.rs:{}\n", i64::MAX, i64::MAX);
+        let s = summarize(&cx(&a, 0, &out, ""));
+        assert_eq!(s.counts.get("matches"), Some(&i64::MAX));
+    }
+
+    #[test]
+    fn very_long_paths_are_clipped_before_tracking() {
+        let a = argv(&["rg", "needle"]);
+        let path = format!("src/{}.rs", "x".repeat(MAX_LINE * 100));
+        let out = format!("{path}:1:needle\n");
+        let s = summarize(&cx(&a, 0, &out, ""));
+        assert_eq!(s.counts.get("files_truncated"), Some(&1));
+        assert!(s.paths.iter().all(|path| path.chars().count() <= MAX_LINE));
+        assert!(s.notes.iter().all(|note| note.chars().count() <= MAX_LINE));
     }
 }

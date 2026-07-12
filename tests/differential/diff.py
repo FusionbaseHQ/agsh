@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Differential test harness: run each script under agsh and a reference shell
-(bash by default) and compare stdout + exit code. stderr text is not compared
-(agsh prefixes diagnostics with `agsh:`), only used for diagnosis on failure.
+(bash by default) and compare stdout, exit code, stderr presence, and resulting
+filesystem state. Diagnostic wording is not compared because shells use
+different prefixes, but one side may not emit an unexpected diagnostic.
 
 Usage:  python3 tests/differential/diff.py
 Env:    AGSH=<path>   REF=bash|sh   VERBOSE=1
@@ -17,9 +18,6 @@ REF = os.environ.get("REF", "bash")
 # justified; everything else must match.
 EXPECTED_DIFFS = {
     # description -> reason (keep tiny and justified)
-    "glob in dir":
-        "trailing-slash glob `dir*/` should keep the slash and match dirs only; "
-        "agsh drops the slash. Known glob gap, tracked for the compat milestone.",
     "redir fd close":
         "`1>&-` then writing: bash reports a write error but still emits to the "
         "captured pipe; agsh silently drops the write. Pathological fd-close edge.",
@@ -32,17 +30,60 @@ def setup(work):
         with open(os.path.join(work,name),"w") as f: f.write(content)
     open(os.path.join(work,".hidden"),"w").close()
 
+def isolated_env(work):
+    env = dict(os.environ)
+    for key in list(env):
+        if key.startswith("AGSH_") or key in {
+            "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+            "BASH_ENV", "ENV",
+        }:
+            env.pop(key, None)
+    home = os.path.join(work, ".test-home")
+    os.makedirs(home, exist_ok=True)
+    env.update({
+        "HOME": home,
+        "XDG_CONFIG_HOME": os.path.join(home, ".config"),
+        "XDG_DATA_HOME": os.path.join(home, ".local", "share"),
+        "XDG_STATE_HOME": os.path.join(home, ".local", "state"),
+        "AGSH_HISTORY_FILE": os.path.join(home, "history.jsonl"),
+        "AGSH_SESSION_DIR": os.path.join(home, "sessions"),
+        "AGSH_BROKER_DIR": os.path.join(home, "broker"),
+    })
+    return env
+
 def runsh(shell, script, work):
     try:
-        p = subprocess.run([shell,"-c",script], cwd=work, capture_output=True, text=True, timeout=15)
+        p = subprocess.run(
+            [shell,"-c",script], cwd=work, env=isolated_env(work),
+            capture_output=True, text=True, timeout=15,
+        )
         return p.stdout, p.stderr, p.returncode
     except subprocess.TimeoutExpired:
         return "<TIMEOUT>","",-99
+
+def snapshot_tree(root):
+    snapshot = {}
+    for current, dirs, files in os.walk(root):
+        dirs.sort()
+        files.sort()
+        rel_current = os.path.relpath(current, root)
+        if rel_current != ".":
+            snapshot[rel_current] = ("dir",)
+        for name in files:
+            path = os.path.join(current, name)
+            rel = os.path.relpath(path, root)
+            if os.path.islink(path):
+                snapshot[rel] = ("symlink", os.readlink(path))
+            else:
+                with open(path, "rb") as handle:
+                    snapshot[rel] = ("file", handle.read())
+    return snapshot
 
 TESTS = [
  ("simple var", 'X=hello; echo $X'),
  ("braced var", 'X=hello; echo ${X}world'),
  ("export to child", 'export Y=1; sh -c "echo $Y"'),
+ ("exported reassignment", 'export Y=old; Y=new; sh -c \'printf "%s\\n" "$Y"\''),
  ("temp assignment", 'FOO=bar sh -c "printf %s \\"\\$FOO\\""'),
  ("temp assign no leak", 'FOO=bar sh -c "echo $FOO"; echo "after=$FOO"'),
  ("single quote suppress", "X=5; echo '$X'"),
@@ -51,12 +92,17 @@ TESTS = [
  ("default unset", 'echo ${UNSET:-fallback}'),
  ("default set empty", 'E=; echo ${E:-fb}'),
  ("default noColon empty", 'E=; echo "[${E-fb}]"'),
+ ("default quoted word", 'unset U; set -- ${U:-"a b"}; printf "%s:<%s>\\n" "$#" "$1"'),
+ ("default mixed quoted word", 'unset U; set -- p${U:-"a b"}s; printf "%s:<%s>\\n" "$#" "$1"'),
+ ("default escaped word", r'unset U; set -- ${U:-a\ b}; printf "%s:<%s>\n" "$#" "$1"'),
+ ("default quoted positional fields", 'set -- a "b c"; unset U; f(){ printf "<%s>\\n" "$@"; }; f ${U:-"$@"}; f "${U:-$@}"'),
  ("alt set", 'X=1; echo ${X:+yes}'),
  ("alt unset", 'echo "[${NOPE:+yes}]"'),
  ("length", 'X=hello; echo ${#X}'),
  ("assign default", 'echo ${Z:=assigned}; echo $Z'),
  ("prefix removal short", 'P=a/b/c; echo ${P#*/}'),
  ("prefix removal long", 'P=a/b/c; echo ${P##*/}'),
+ ("prefix removal quoted pattern", 'P="a*b"; Q="a*"; printf "%s|%s|%s\\n" "${P#'"'"'a*'"'"'}" "${P#\"$Q\"}" "${P#$Q}"'),
  ("suffix removal short", 'P=a.b.c; echo ${P%.*}'),
  ("suffix removal long", 'P=a.b.c; echo ${P%%.*}'),
  ("nested default", 'A=x; echo ${B:-$A}'),
@@ -80,6 +126,12 @@ TESTS = [
  ("cmdsub nested", 'echo $(echo $(echo deep))'),
  ("cmdsub in arg", 'X=$(printf "a b"); echo "$X"'),
  ("cmdsub strip newline", 'echo "[$(printf "x\\n\\n")]"'),
+ ("cmdsub preserves carriage return", 'x=$(printf "a\\r\\n"); printf "%sZ\\n" "$x"'),
+ ("cmdsub stderr", 'x=$(printf err >&2); printf "<%s>\\n" "$x"'),
+ ("cmdsub stderr same-command redir", 'x=$(printf err >&2) 2>cmd.err; printf "file=<"; cat cmd.err; echo ">"'),
+ ("cmdsub stderr surrounding redir", '{ x=$(printf err >&2); } 2>cmd.err; printf "file=<"; cat cmd.err; echo ">"'),
+ ("cmdsub stderr function redir scope", 'f(){ printf body >&2; }; f "$(printf argument >&2)" 2>func.err; printf " file=<"; cat func.err; echo ">"'),
+ ("procsub stderr same-command redir", 'cat <(printf out; printf err >&2) 2>proc.err; printf " file=<"; cat proc.err; echo ">"'),
  ("glob star", 'echo *.txt'),
  ("glob question", 'echo ?.txt'),
  ("glob class", 'echo [ab].txt'),
@@ -101,6 +153,10 @@ TESTS = [
  ("redir order o-then-dup", 'sh -c "echo o; echo e >&2" 2>&1 1>n.txt; echo done'),
  ("redir noclobber off", 'echo x>f1.txt; echo y>f1.txt; cat f1.txt'),
  ("redir heredoc", 'cat <<EOF\nline1\nline2\nEOF'),
+ ("redir heredoc quoted delimiter", "X=value; cat <<E'O'F\n$X\nEOF"),
+ ("redir heredoc escapes", 'X=value; cat <<EOF\n\\$X|\\\\|a\\\nb\nEOF'),
+ ("redir heredoc strip tabs", 'cat <<-EOF\n\tone\n\tEOF'),
+ ("redir heredoc in compound", 'if true; then cat <<EOF\ninside\nEOF\nfi; (cat <<'"'"'EOF'"'"'\n$HOME\nEOF\n)'),
  ("redir herestring", 'cat <<< "hello"'),
  ("redir fd close", 'echo hi 1>&-; echo after'),
  ("pipe simple", 'echo hello | tr a-z A-Z'),
@@ -161,6 +217,12 @@ TESTS = [
  ("var in dquote concat", 'X=foo; echo "${X}bar"'),
  ("nested quotes", 'echo "a'"'"'b"'),
  ("local var in func", 'f() { local x=5; echo $x; }; f; echo "[${x}]"'),
+ ("regular builtin prefix restores export", 'export AGSH_DIFF_BIND=outer; AGSH_DIFF_BIND=temp true; sh -c \'echo "$AGSH_DIFF_BIND"\''),
+ ("function prefix exported and temporary", 'AGSH_DIFF_FUNC=outer; f() { sh -c \'printf "%s" "$AGSH_DIFF_FUNC"\'; }; AGSH_DIFF_FUNC=inner f; echo ":$AGSH_DIFF_FUNC"'),
+ ("local restores exported value", 'export AGSH_DIFF_LOCAL=outer; f() { local AGSH_DIFF_LOCAL=inner; sh -c \'echo "$AGSH_DIFF_LOCAL"\'; }; f; sh -c \'echo "$AGSH_DIFF_LOCAL"\''),
+ ("declare function scope", 'f() { declare scoped=inside; echo "$scoped"; }; f; echo "${scoped-unset}"'),
+ ("declare integer persists", 'declare -i n; n=2+3; echo $n'),
+ ("export unset stays unset", 'unset AGSH_DIFF_UNSET; export AGSH_DIFF_UNSET; sh -c \'echo "${AGSH_DIFF_UNSET-unset}"\''),
  # Phase 1 (compat milestone) — cases supported by the reference bash (3.2+).
  ("substr offset len", 'v=hello; echo ${v:1:2}'),
  ("substr offset only", 'v=hello; echo ${v:2}'),
@@ -244,21 +306,27 @@ TESTS = [
 ]
 
 def main():
-    work = tempfile.mkdtemp()
-    setup(work)
     npass = nfail = 0
     fails = []
     for desc, script in TESTS:
-        ro, re_, rc = runsh(REF, script, work)
-        ao, ae, ac = runsh(AGSH, script, work)
-        # normalize: agsh NotFound differs in stderr text; compare stdout + exit code primarily
-        if ro == ao and rc == ac:
+        ref_work = tempfile.mkdtemp(prefix="agsh-diff-ref-")
+        agsh_work = tempfile.mkdtemp(prefix="agsh-diff-agsh-")
+        setup(ref_work)
+        setup(agsh_work)
+        ro, re_, rc = runsh(REF, script, ref_work)
+        ao, ae, ac = runsh(AGSH, script, agsh_work)
+        ref_tree = snapshot_tree(ref_work)
+        agsh_tree = snapshot_tree(agsh_work)
+        stderr_presence_matches = bool(re_.strip()) == bool(ae.strip())
+        if ro == ao and rc == ac and stderr_presence_matches and ref_tree == agsh_tree:
             npass += 1
         else:
             nfail += 1
-            fails.append((desc, script, (ro,rc,re_), (ao,ac,ae)))
+            fails.append((desc, script, (ro,rc,re_,ref_tree), (ao,ac,ae,agsh_tree)))
+        shutil.rmtree(ref_work, ignore_errors=True)
+        shutil.rmtree(agsh_work, ignore_errors=True)
     unexpected = []
-    for desc, script, (ro,rc,re_), (ao,ac,ae) in fails:
+    for desc, script, (ro,rc,re_,ref_tree), (ao,ac,ae,agsh_tree) in fails:
         tag = "XFAIL" if desc in EXPECTED_DIFFS else "FAIL"
         if tag == "FAIL":
             unexpected.append(desc)
@@ -266,9 +334,12 @@ def main():
         print(f"  script: {script!r}")
         print(f"  REF : out={ro!r} code={rc} err={re_.strip()[:120]!r}")
         print(f"  AGSH: out={ao!r} code={ac} err={ae.strip()[:120]!r}")
+        if ref_tree != agsh_tree:
+            changed = sorted(set(ref_tree) | set(agsh_tree))
+            changed = [path for path in changed if ref_tree.get(path) != agsh_tree.get(path)]
+            print(f"  FS  : differing paths={changed[:12]!r}")
     print(f"\n================  REF={REF}  PASS={npass}  FAIL={nfail}"
           f"  (unexpected={len(unexpected)})  ================")
-    shutil.rmtree(work, ignore_errors=True)
     if not os.path.exists(AGSH):
         print(f"ERROR: agsh binary not found at {AGSH} (run `cargo build`)")
         sys.exit(2)

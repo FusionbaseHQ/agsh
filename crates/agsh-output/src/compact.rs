@@ -5,7 +5,7 @@ use crate::compactors;
 use crate::context::CompactionContext;
 use crate::summary::{CommandContext, SemanticSummary};
 use crate::util::shell_join;
-use crate::{OutputMode, OutputObservation, RawStreamRef};
+use crate::{ObservationStreams, OutputMode, OutputObservation, RawStreamRef, RawTraceStatus};
 
 /// Render an observation with default normalization/redaction/budget.
 pub fn render_observation(
@@ -37,12 +37,51 @@ pub fn render_observation_with(
     stdout: &[u8],
     stderr: &[u8],
 ) -> OutputObservation {
+    let raw = RawStreamRef::exact(
+        format!("trace://{cmd_id}/stdout"),
+        format!("trace://{cmd_id}/stderr"),
+    );
+    render_observation_with_raw_ref(
+        ctx,
+        mode,
+        cmd_id,
+        argv,
+        exit_code,
+        ObservationStreams {
+            stdout,
+            stderr,
+            raw: &raw,
+        },
+    )
+}
+
+/// Render an observation whose exact raw streams are available at caller-owned
+/// references. The executor uses this for disk-backed traces that must outlive a
+/// one-shot shell process; the simpler entry points retain in-session `trace://`
+/// references for library callers.
+pub fn render_observation_with_raw_ref(
+    ctx: &CompactionContext,
+    mode: OutputMode,
+    cmd_id: &CommandId,
+    argv: &[String],
+    exit_code: i32,
+    streams: ObservationStreams<'_>,
+) -> OutputObservation {
+    let ObservationStreams {
+        stdout,
+        stderr,
+        raw,
+    } = streams;
     if mode == OutputMode::Silent {
-        return OutputObservation {
-            display: String::new(),
-            token_estimate: 0,
-            raw: raw_ref(cmd_id),
-        };
+        return finalize_trace_status(
+            mode,
+            raw,
+            OutputObservation {
+                display: String::new(),
+                token_estimate: 0,
+                raw: Some(raw.clone()),
+            },
+        );
     }
 
     let stdout_text = String::from_utf8_lossy(stdout);
@@ -50,11 +89,15 @@ pub fn render_observation_with(
     // Raw output never pays the cost of observation-only argv redaction.
     if matches!(mode, OutputMode::Raw | OutputMode::Rich) {
         let display = format!("{stdout_text}{stderr_text}");
-        return OutputObservation {
-            token_estimate: estimate_tokens(&display),
-            display,
-            raw: raw_ref(cmd_id),
-        };
+        return finalize_trace_status(
+            mode,
+            raw,
+            OutputObservation {
+                token_estimate: estimate_tokens(&display),
+                display,
+                raw: Some(raw.clone()),
+            },
+        );
     }
 
     let redacted_argv = argv
@@ -63,18 +106,18 @@ pub fn render_observation_with(
         .collect::<Vec<_>>();
     let observation_argv = redacted_argv.as_slice();
 
-    match mode {
+    let observation = match mode {
         OutputMode::Raw | OutputMode::Rich | OutputMode::Silent => unreachable!(),
         OutputMode::Clean => {
             let clean = ctx.clean_text(&format!("{stdout_text}{stderr_text}"));
             // A clean dump can still be huge; fall back to refs over budget.
             if estimate_tokens(&clean) > ctx.budget.max_tokens {
-                lossless_ref(cmd_id, observation_argv, exit_code)
+                lossless_ref(observation_argv, exit_code, raw)
             } else {
                 OutputObservation {
                     token_estimate: estimate_tokens(&clean),
                     display: clean,
-                    raw: raw_ref(cmd_id),
+                    raw: Some(raw.clone()),
                 }
             }
         }
@@ -88,11 +131,15 @@ pub fn render_observation_with(
             // user-configured [[compactor]] rules are unaffected.
             if mode == OutputMode::Compact && exit_code == 0 && ctx.compactor.is_none() {
                 if let Some(display) = ctx.verbatim_tiny(&stdout_text, &stderr_text) {
-                    return OutputObservation {
-                        token_estimate: estimate_tokens(&display),
-                        display,
-                        raw: raw_ref(cmd_id),
-                    };
+                    return finalize_trace_status(
+                        mode,
+                        raw,
+                        OutputObservation {
+                            token_estimate: estimate_tokens(&display),
+                            display,
+                            raw: Some(raw.clone()),
+                        },
+                    );
                 }
             }
             let out = ctx.clean_text(&stdout_text);
@@ -109,37 +156,25 @@ pub fn render_observation_with(
             // repeating every key on every row. A big lossless token cut on the most
             // agent-read surface, and the signature lets an agent learn schema +
             // row-count without fetching the raw. A user [[compactor]] still wins.
-            if ctx.compactor.is_none() {
-                if let Some(summary) = json_table_summary(&cx, &out) {
-                    return budgeted_summary(
-                        ctx,
-                        mode,
-                        cmd_id,
-                        observation_argv,
-                        exit_code,
-                        summary,
-                        (&out, &err),
-                    );
-                }
-            }
             // A configured [[compactor]] takes precedence over the built-in
             // family parsers for matching commands.
             let summary = match &ctx.compactor {
                 Some(ruleset) => crate::rules::apply_compactor(ruleset, &cx),
-                None => compactors::summarize(&cx),
+                None => json_table_summary(&cx, &out).unwrap_or_else(|| compactors::summarize(&cx)),
             };
             budgeted_summary(
                 ctx,
                 mode,
-                cmd_id,
                 observation_argv,
                 exit_code,
                 summary,
                 (&out, &err),
+                raw,
             )
         }
-        OutputMode::LosslessRef => lossless_ref(cmd_id, observation_argv, exit_code),
-    }
+        OutputMode::LosslessRef => lossless_ref(observation_argv, exit_code, raw),
+    };
+    finalize_trace_status(mode, raw, observation)
 }
 
 /// Detect a homogeneous JSON array-of-objects and summarize it as a header-once
@@ -208,11 +243,11 @@ fn json_type(value: &serde_json::Value) -> &'static str {
 fn budgeted_summary(
     ctx: &CompactionContext,
     mode: OutputMode,
-    cmd_id: &CommandId,
     argv: &[String],
     exit_code: i32,
     mut summary: SemanticSummary,
     raw_output: (&str, &str),
+    raw: &RawStreamRef,
 ) -> OutputObservation {
     let (stdout, stderr) = raw_output;
     let render = |s: &SemanticSummary| {
@@ -233,38 +268,134 @@ fn budgeted_summary(
         text = render(&summary);
     }
     if estimate_tokens(&text) > ctx.budget.max_tokens {
-        return lossless_ref(cmd_id, argv, exit_code);
+        return lossless_ref(argv, exit_code, raw);
     }
 
     // Attach a raw-output pointer ONLY when the compact view actually dropped
     // content — otherwise the raw is already shown above and a ref is just noise.
-    if !output_fully_shown(&text, stdout, stderr) {
-        let (out_ref, err_ref) = raw_ref_strings(cmd_id);
-        summary.set_raw_refs(out_ref, err_ref);
+    if (!raw.is_complete() || !output_fully_shown(&text, stdout, stderr))
+        && (!raw.stdout.is_empty() || !raw.stderr.is_empty())
+    {
+        summary.set_raw_refs(raw.stdout.clone(), raw.stderr.clone());
         text = render(&summary);
     }
 
     OutputObservation {
         token_estimate: estimate_tokens(&text),
         display: text,
-        raw: raw_ref(cmd_id),
+        raw: Some(raw.clone()),
     }
 }
 
-fn lossless_ref(cmd_id: &CommandId, argv: &[String], exit_code: i32) -> OutputObservation {
-    let (out_ref, err_ref) = raw_ref_strings(cmd_id);
-    let display = format!(
-        "command: {}\nexit: {}\nraw_stdout: {}\nraw_stderr: {}\n",
-        shell_join(argv),
-        exit_code,
-        out_ref,
-        err_ref,
-    );
+fn lossless_ref(argv: &[String], exit_code: i32, raw: &RawStreamRef) -> OutputObservation {
+    let mut display = format!("command: {}\nexit: {}\n", shell_join(argv), exit_code);
+    push_stream_reference(&mut display, "stdout", &raw.stdout, raw.stdout_status);
+    push_stream_reference(&mut display, "stderr", &raw.stderr, raw.stderr_status);
+    if let Some(notice) = raw_trace_notice(raw) {
+        display.push_str(&notice);
+        display.push('\n');
+    }
     OutputObservation {
         token_estimate: estimate_tokens(&display),
         display,
-        raw: raw_ref(cmd_id),
+        raw: Some(raw.clone()),
     }
+}
+
+fn push_stream_reference(
+    display: &mut String,
+    stream: &str,
+    reference: &str,
+    status: RawTraceStatus,
+) {
+    match status {
+        RawTraceStatus::Complete => {
+            display.push_str(&format!("raw_{stream}: {reference}\n"));
+        }
+        RawTraceStatus::Truncated => {
+            display.push_str(&format!("raw_{stream}_partial: {reference}\n"));
+        }
+        RawTraceStatus::Unavailable => {
+            display.push_str(&format!(
+                "raw_{stream}: unavailable (trace storage unavailable)\n"
+            ));
+        }
+        RawTraceStatus::Disabled => {
+            display.push_str(&format!("raw_{stream}: unavailable (storage disabled)\n"));
+        }
+    }
+}
+
+fn raw_trace_notice(raw: &RawStreamRef) -> Option<String> {
+    if raw.is_complete() {
+        return None;
+    }
+    if matches!(raw.stdout_status, RawTraceStatus::Disabled)
+        && matches!(raw.stderr_status, RawTraceStatus::Disabled)
+    {
+        return Some("raw_trace: unavailable (raw storage disabled)".to_string());
+    }
+    if matches!(raw.stdout_status, RawTraceStatus::Unavailable)
+        || matches!(raw.stderr_status, RawTraceStatus::Unavailable)
+    {
+        return Some(format!(
+            "raw_trace: unavailable (stdout={}, stderr={})",
+            raw.stdout_status.as_str(),
+            raw.stderr_status.as_str()
+        ));
+    }
+    let limit = raw
+        .storage_limit_bytes
+        .map(|bytes| format!(" at the {bytes}-byte per-command storage limit"))
+        .unwrap_or_default();
+    Some(format!(
+        "raw_trace: incomplete{limit} (stdout={}, stderr={})",
+        raw.stdout_status.as_str(),
+        raw.stderr_status.as_str()
+    ))
+}
+
+pub fn finalize_trace_status(
+    mode: OutputMode,
+    raw: &RawStreamRef,
+    mut observation: OutputObservation,
+) -> OutputObservation {
+    if mode == OutputMode::Semantic {
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&observation.display) {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "raw_trace".to_string(),
+                    serde_json::json!({
+                        "complete": raw.is_complete(),
+                        "stdout": raw.stdout_status.as_str(),
+                        "stderr": raw.stderr_status.as_str(),
+                        "limit_bytes": raw.storage_limit_bytes,
+                    }),
+                );
+                if let Ok(display) = serde_json::to_string_pretty(&value) {
+                    observation.display = display;
+                    observation.display.push('\n');
+                    observation.token_estimate = estimate_tokens(&observation.display);
+                    return observation;
+                }
+            }
+        }
+    }
+
+    let Some(notice) = raw_trace_notice(raw) else {
+        return observation;
+    };
+    if mode == OutputMode::Silent || observation.display.contains("raw_trace: ") {
+        return observation;
+    }
+
+    if !observation.display.ends_with('\n') && !observation.display.is_empty() {
+        observation.display.push('\n');
+    }
+    observation.display.push_str(&notice);
+    observation.display.push('\n');
+    observation.token_estimate = estimate_tokens(&observation.display);
+    observation
 }
 
 /// Whether the rendered `display` already contains all of the raw output, so a
@@ -273,38 +404,6 @@ fn output_fully_shown(display: &str, stdout: &str, stderr: &str) -> bool {
     stdout.lines().chain(stderr.lines()).all(|line| {
         let trimmed = line.trim();
         trimmed.is_empty() || display.contains(trimmed)
-    })
-}
-
-/// The two strings for a `raw:` reference. When `$AGSH_TRACE_DIR` is set — the
-/// interception/observe path persists each command's raw bytes there — these are
-/// catable file paths that resolve from any process (`<dir>/<pid>_<id>.out`).
-/// Otherwise they're in-session `trace://` references (resolved by the `trace`
-/// builtin within the same live shell).
-fn raw_ref_strings(cmd_id: &CommandId) -> (String, String) {
-    if let Some(dir) = std::env::var_os("AGSH_TRACE_DIR") {
-        let dir = std::path::Path::new(&dir);
-        let pid = std::process::id();
-        (
-            dir.join(format!("{pid}_{cmd_id}.out"))
-                .display()
-                .to_string(),
-            dir.join(format!("{pid}_{cmd_id}.err"))
-                .display()
-                .to_string(),
-        )
-    } else {
-        (
-            format!("trace://{cmd_id}/stdout"),
-            format!("trace://{cmd_id}/stderr"),
-        )
-    }
-}
-
-fn raw_ref(cmd_id: &CommandId) -> Option<RawStreamRef> {
-    Some(RawStreamRef {
-        stdout: format!("trace://{cmd_id}/stdout"),
-        stderr: format!("trace://{cmd_id}/stderr"),
     })
 }
 
@@ -547,5 +646,201 @@ mod tests {
                 obs.display
             );
         }
+    }
+
+    #[test]
+    fn truncated_raw_trace_is_never_described_as_lossless() {
+        let id = CommandId::new();
+        let raw = RawStreamRef::persisted(
+            "/tmp/stdout-prefix",
+            "/tmp/stderr",
+            crate::RawTraceStatus::Truncated,
+            crate::RawTraceStatus::Complete,
+            1024,
+        );
+        let obs = render_observation_with_raw_ref(
+            &CompactionContext::defaults(),
+            OutputMode::LosslessRef,
+            &id,
+            &["producer".to_string()],
+            37,
+            ObservationStreams {
+                stdout: b"preview",
+                stderr: b"",
+                raw: &raw,
+            },
+        );
+
+        assert!(obs
+            .display
+            .contains("raw_stdout_partial: /tmp/stdout-prefix"));
+        assert!(obs.display.contains("raw_trace: incomplete"));
+        assert!(obs.display.contains("1024-byte"));
+        assert!(!obs.display.contains("raw_stdout: /tmp/stdout-prefix"));
+    }
+
+    #[test]
+    fn rich_mode_explicitly_reports_an_incomplete_raw_trace() {
+        let id = CommandId::new();
+        let raw = RawStreamRef::persisted(
+            "/tmp/stdout-prefix",
+            "/tmp/stderr",
+            crate::RawTraceStatus::Truncated,
+            crate::RawTraceStatus::Complete,
+            2048,
+        );
+        let obs = render_observation_with_raw_ref(
+            &CompactionContext::defaults(),
+            OutputMode::Rich,
+            &id,
+            &["producer".to_string()],
+            0,
+            ObservationStreams {
+                stdout: b"rendered preview",
+                stderr: b"",
+                raw: &raw,
+            },
+        );
+
+        assert!(obs.display.starts_with("rendered preview"));
+        assert!(obs.display.contains("raw_trace: incomplete"));
+        assert!(obs.display.contains("stdout=truncated, stderr=complete"));
+    }
+
+    #[test]
+    fn semantic_mode_reports_trace_truncation_as_structured_json() {
+        let id = CommandId::new();
+        let raw = RawStreamRef::persisted(
+            "/tmp/stdout-prefix",
+            "/tmp/stderr",
+            crate::RawTraceStatus::Truncated,
+            crate::RawTraceStatus::Complete,
+            512,
+        );
+        let obs = render_observation_with_raw_ref(
+            &CompactionContext::defaults(),
+            OutputMode::Semantic,
+            &id,
+            &["producer".to_string()],
+            0,
+            ObservationStreams {
+                stdout: b"preview\n",
+                stderr: b"",
+                raw: &raw,
+            },
+        );
+        let json: serde_json::Value = serde_json::from_str(&obs.display).unwrap();
+        assert_eq!(json["raw_trace"]["complete"], false);
+        assert_eq!(json["raw_trace"]["stdout"], "truncated");
+        assert_eq!(json["raw_trace"]["stderr"], "complete");
+        assert_eq!(json["raw_trace"]["limit_bytes"], 512);
+    }
+
+    #[test]
+    fn semantic_mode_always_serializes_complete_trace_status() {
+        let id = CommandId::new();
+        let raw = RawStreamRef::persisted(
+            "/tmp/stdout",
+            "/tmp/stderr",
+            crate::RawTraceStatus::Complete,
+            crate::RawTraceStatus::Complete,
+            1024,
+        );
+        let obs = render_observation_with_raw_ref(
+            &CompactionContext::defaults(),
+            OutputMode::Semantic,
+            &id,
+            &["producer".to_string()],
+            0,
+            ObservationStreams {
+                stdout: b"visible\n",
+                stderr: b"",
+                raw: &raw,
+            },
+        );
+        let json: serde_json::Value = serde_json::from_str(&obs.display).unwrap();
+
+        assert_eq!(json["raw_trace"]["complete"], true);
+        assert_eq!(json["raw_trace"]["stdout"], "complete");
+        assert_eq!(json["raw_trace"]["stderr"], "complete");
+        assert_eq!(json["raw_trace"]["limit_bytes"], 1024);
+    }
+
+    #[test]
+    fn semantic_json_table_keeps_structured_trace_status() {
+        let id = CommandId::new();
+        let raw = RawStreamRef::persisted(
+            "/tmp/stdout-prefix",
+            "/tmp/stderr",
+            crate::RawTraceStatus::Truncated,
+            crate::RawTraceStatus::Complete,
+            512,
+        );
+        let obs = render_observation_with_raw_ref(
+            &CompactionContext::defaults(),
+            OutputMode::Semantic,
+            &id,
+            &["producer".to_string()],
+            0,
+            ObservationStreams {
+                stdout: br#"[{"name":"a"},{"name":"b"}]"#,
+                stderr: b"",
+                raw: &raw,
+            },
+        );
+        let json: serde_json::Value = serde_json::from_str(&obs.display).unwrap();
+
+        assert_eq!(json["raw_trace"]["complete"], false);
+        assert_eq!(json["raw_trace"]["stdout"], "truncated");
+        assert_eq!(json["raw_trace"]["stderr"], "complete");
+    }
+
+    #[test]
+    fn unavailable_raw_trace_is_never_described_as_disabled_or_lossless() {
+        let id = CommandId::new();
+        let raw = RawStreamRef::unavailable();
+        let obs = render_observation_with_raw_ref(
+            &CompactionContext::defaults(),
+            OutputMode::LosslessRef,
+            &id,
+            &["producer".to_string()],
+            0,
+            ObservationStreams {
+                stdout: b"preview",
+                stderr: b"",
+                raw: &raw,
+            },
+        );
+
+        assert!(obs
+            .display
+            .contains("raw_stdout: unavailable (trace storage unavailable)"));
+        assert!(obs.display.contains("raw_trace: unavailable"));
+        assert!(!obs.display.contains("storage disabled"));
+        assert!(!obs.display.contains("raw_stdout: trace://"));
+    }
+
+    #[test]
+    fn semantic_mode_serializes_unavailable_trace_status() {
+        let id = CommandId::new();
+        let raw = RawStreamRef::unavailable();
+        let obs = render_observation_with_raw_ref(
+            &CompactionContext::defaults(),
+            OutputMode::Semantic,
+            &id,
+            &["producer".to_string()],
+            0,
+            ObservationStreams {
+                stdout: b"preview\n",
+                stderr: b"",
+                raw: &raw,
+            },
+        );
+        let json: serde_json::Value = serde_json::from_str(&obs.display).unwrap();
+
+        assert_eq!(json["raw_trace"]["complete"], false);
+        assert_eq!(json["raw_trace"]["stdout"], "unavailable");
+        assert_eq!(json["raw_trace"]["stderr"], "unavailable");
+        assert_eq!(json["raw_trace"]["limit_bytes"], serde_json::Value::Null);
     }
 }

@@ -1,7 +1,10 @@
 # Differential tests (agsh vs bash/sh)
 
-`diff.py` runs each script under agsh and a reference shell and compares
-**stdout + exit code** (stderr text is ignored; agsh prefixes diagnostics).
+`diff.py` runs each script under agsh and a reference shell in separate,
+identically initialized temporary directories. It compares stdout, exit status,
+whether stderr is present, and the resulting file/directory/symlink tree. Exact
+stderr wording is intentionally not compared because shells use different
+diagnostic prefixes.
 
 ```sh
 cargo build

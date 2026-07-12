@@ -50,25 +50,28 @@ type PosixSpawnFn = unsafe extern "C" fn(
 //   * Linux `LD_PRELOAD` shadows the symbol everywhere including here, so we must
 //     look up the next definition with `dlsym(RTLD_NEXT, …)`.
 #[cfg(target_os = "linux")]
-unsafe fn real_sym<T>(name: &[u8]) -> T {
+unsafe fn real_sym<T>(name: &[u8]) -> Option<T> {
     debug_assert_eq!(
         *name.last().unwrap(),
         0,
         "symbol name must be NUL-terminated"
     );
     let ptr = libc::dlsym(libc::RTLD_NEXT, name.as_ptr() as *const c_char);
-    debug_assert!(!ptr.is_null());
-    std::mem::transmute_copy::<*mut c_void, T>(&ptr)
+    if ptr.is_null() {
+        None
+    } else {
+        Some(std::mem::transmute_copy::<*mut c_void, T>(&ptr))
+    }
 }
 
 macro_rules! real_getter {
     ($name:ident, $ty:ty, $sym:literal, $direct:path) => {
         #[cfg(target_os = "macos")]
-        unsafe fn $name() -> $ty {
-            $direct
+        unsafe fn $name() -> Option<$ty> {
+            Some($direct)
         }
         #[cfg(target_os = "linux")]
-        unsafe fn $name() -> $ty {
+        unsafe fn $name() -> Option<$ty> {
             real_sym(concat!($sym, "\0").as_bytes())
         }
     };
@@ -128,7 +131,10 @@ unsafe fn rewrite_argv(
     mode: &CStr,
     path: *const c_char,
     argv: *const *const c_char,
-) -> (Vec<CString>, Vec<*const c_char>) {
+) -> Option<(Vec<CString>, Vec<*const c_char>)> {
+    if argv.is_null() {
+        return None;
+    }
     let out = CString::new("--output").unwrap();
     let obs = CString::new("--observe").unwrap();
     let mut new: Vec<*const c_char> = vec![
@@ -144,7 +150,19 @@ unsafe fn rewrite_argv(
         i += 1;
     }
     new.push(std::ptr::null());
-    (vec![out, obs], new)
+    Some((vec![out, obs], new))
+}
+
+unsafe fn missing_real_symbol() -> c_int {
+    #[cfg(target_os = "linux")]
+    {
+        *libc::__errno_location() = libc::ENOSYS;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        *libc::__error() = libc::ENOSYS;
+    }
+    -1
 }
 
 // --- The hooks (shared logic; registered per-platform below) ----------------
@@ -154,34 +172,43 @@ unsafe extern "C" fn hook_execve(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> c_int {
-    let real = real_execve();
+    let Some(real) = real_execve() else {
+        return missing_real_symbol();
+    };
     if let Some((agsh, mode)) = config() {
         if is_shell(path) {
-            let (_own, new_argv) = rewrite_argv(&agsh, &mode, path, argv);
-            return real(agsh.as_ptr(), new_argv.as_ptr(), envp);
+            if let Some((_own, new_argv)) = rewrite_argv(&agsh, &mode, path, argv) {
+                return real(agsh.as_ptr(), new_argv.as_ptr(), envp);
+            }
         }
     }
     real(path, argv, envp)
 }
 
 unsafe extern "C" fn hook_execv(path: *const c_char, argv: *const *const c_char) -> c_int {
-    let real = real_execv();
+    let Some(real) = real_execv() else {
+        return missing_real_symbol();
+    };
     if let Some((agsh, mode)) = config() {
         if is_shell(path) {
-            let (_own, new_argv) = rewrite_argv(&agsh, &mode, path, argv);
-            return real(agsh.as_ptr(), new_argv.as_ptr());
+            if let Some((_own, new_argv)) = rewrite_argv(&agsh, &mode, path, argv) {
+                return real(agsh.as_ptr(), new_argv.as_ptr());
+            }
         }
     }
     real(path, argv)
 }
 
 unsafe extern "C" fn hook_execvp(file: *const c_char, argv: *const *const c_char) -> c_int {
-    let real = real_execvp();
+    let Some(real) = real_execvp() else {
+        return missing_real_symbol();
+    };
     if let Some((agsh, mode)) = config() {
         if is_shell(file) {
-            let (_own, new_argv) = rewrite_argv(&agsh, &mode, file, argv);
-            // agsh path is absolute, so execvp resolves it directly.
-            return real(agsh.as_ptr(), new_argv.as_ptr());
+            if let Some((_own, new_argv)) = rewrite_argv(&agsh, &mode, file, argv) {
+                // agsh path is absolute, so execvp resolves it directly.
+                return real(agsh.as_ptr(), new_argv.as_ptr());
+            }
         }
     }
     real(file, argv)
@@ -195,18 +222,23 @@ unsafe extern "C" fn hook_posix_spawn(
     argv: *const *mut c_char,
     envp: *const *mut c_char,
 ) -> c_int {
-    let real = real_posix_spawn();
+    let Some(real) = real_posix_spawn() else {
+        return missing_real_symbol();
+    };
     if let Some((agsh, mode)) = config() {
         if is_shell(path) {
-            let (_own, new_argv) = rewrite_argv(&agsh, &mode, path, argv as *const *const c_char);
-            return real(
-                pid,
-                agsh.as_ptr(),
-                file_actions,
-                attrp,
-                new_argv.as_ptr() as *const *mut c_char,
-                envp,
-            );
+            if let Some((_own, new_argv)) =
+                rewrite_argv(&agsh, &mode, path, argv as *const *const c_char)
+            {
+                return real(
+                    pid,
+                    agsh.as_ptr(),
+                    file_actions,
+                    attrp,
+                    new_argv.as_ptr() as *const *mut c_char,
+                    envp,
+                );
+            }
         }
     }
     real(pid, path, file_actions, attrp, argv, envp)
@@ -220,18 +252,23 @@ unsafe extern "C" fn hook_posix_spawnp(
     argv: *const *mut c_char,
     envp: *const *mut c_char,
 ) -> c_int {
-    let real = real_posix_spawnp();
+    let Some(real) = real_posix_spawnp() else {
+        return missing_real_symbol();
+    };
     if let Some((agsh, mode)) = config() {
         if is_shell(file) {
-            let (_own, new_argv) = rewrite_argv(&agsh, &mode, file, argv as *const *const c_char);
-            return real(
-                pid,
-                agsh.as_ptr(),
-                file_actions,
-                attrp,
-                new_argv.as_ptr() as *const *mut c_char,
-                envp,
-            );
+            if let Some((_own, new_argv)) =
+                rewrite_argv(&agsh, &mode, file, argv as *const *const c_char)
+            {
+                return real(
+                    pid,
+                    agsh.as_ptr(),
+                    file_actions,
+                    attrp,
+                    new_argv.as_ptr() as *const *mut c_char,
+                    envp,
+                );
+            }
         }
     }
     real(pid, file, file_actions, attrp, argv, envp)
@@ -312,5 +349,71 @@ mod register {
         envp: *const *mut c_char,
     ) -> c_int {
         hook_posix_spawnp(pid, file, fa, attr, argv, envp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_matching_uses_the_exact_basename() {
+        for path in ["bash", "/bin/sh", "/usr/local/bin/zsh", "dash", "ksh"] {
+            let path = CString::new(path).unwrap();
+            assert!(unsafe { is_shell(path.as_ptr()) }, "{path:?}");
+        }
+        for path in ["bashful", "/tmp/notbash", "fish", ""] {
+            let path = CString::new(path).unwrap();
+            assert!(!unsafe { is_shell(path.as_ptr()) }, "{path:?}");
+        }
+        assert!(!unsafe { is_shell(std::ptr::null()) });
+    }
+
+    #[test]
+    fn argv_rewrite_preserves_original_operands_and_terminator() {
+        let agsh = CString::new("/opt/agsh").unwrap();
+        let mode = CString::new("semantic").unwrap();
+        let shell = CString::new("/bin/bash").unwrap();
+        let arg = CString::new("-c").unwrap();
+        let script = CString::new("printf ok").unwrap();
+        let argv = [
+            shell.as_ptr(),
+            arg.as_ptr(),
+            script.as_ptr(),
+            std::ptr::null(),
+        ];
+
+        let (_owned, rewritten) = unsafe {
+            rewrite_argv(&agsh, &mode, shell.as_ptr(), argv.as_ptr()).expect("rewrite argv")
+        };
+        let words = rewritten[..rewritten.len() - 1]
+            .iter()
+            .map(|pointer| unsafe { CStr::from_ptr(*pointer) }.to_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            words,
+            [
+                b"/opt/agsh".as_slice(),
+                b"--output".as_slice(),
+                b"semantic".as_slice(),
+                b"--observe".as_slice(),
+                b"/bin/bash".as_slice(),
+                b"-c".as_slice(),
+                b"printf ok".as_slice(),
+            ]
+        );
+        assert!(rewritten.last().is_some_and(|pointer| pointer.is_null()));
+    }
+
+    #[test]
+    fn null_argv_is_not_dereferenced() {
+        let agsh = CString::new("/opt/agsh").unwrap();
+        let mode = CString::new("compact").unwrap();
+        let shell = CString::new("/bin/sh").unwrap();
+
+        let rewritten = unsafe { rewrite_argv(&agsh, &mode, shell.as_ptr(), std::ptr::null()) };
+
+        assert!(rewritten.is_none());
     }
 }
