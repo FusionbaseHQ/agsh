@@ -1,6 +1,6 @@
 # Releasing agsh
 
-Releases are built by [`.github/workflows/release.yml`](../.github/workflows/release.yml):
+Releases are built by [`.github/workflows/release.yml`](../../.github/workflows/release.yml):
 pushing a stable `vMAJOR.MINOR.PATCH` tag runs the full two-platform gate (fmt,
 clippy, cargo tests, golden checks, bash/sh differential tests, and PTY
 interactive tests), builds

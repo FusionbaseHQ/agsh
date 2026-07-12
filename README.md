@@ -197,7 +197,7 @@ sh install.sh
 
 When the first release is published, its installer will itself be a checksummed,
 attested release asset. GitHub CLI users can then verify its provenance with the command in
-[`docs/RELEASING.md`](docs/RELEASING.md). Pin the payload with
+[`docs/internal/RELEASING.md`](docs/internal/RELEASING.md). Pin the payload with
 `AGSH_VERSION=v0.3.0`, change the target directory with `AGSH_INSTALL_DIR`, and
 set `AGSH_REQUIRE_ATTESTATION=1` to require the downloaded binary archive's
 release-workflow attestation from that exact version tag (this requires a recent
