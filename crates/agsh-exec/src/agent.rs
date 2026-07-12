@@ -10,7 +10,9 @@
 //! No socket server or MCP: a terminal app drives the shell directly; these are
 //! ordinary commands the agent runs.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{CommandOutcome, ShellState};
 
@@ -260,14 +262,77 @@ pub fn patch(args: &[String], state: &ShellState, stdin: Option<&[u8]>) -> Comma
             b"patch: no diff on stdin (pipe a unified diff or use a heredoc)\n".to_vec(),
         );
     };
-    let diff = String::from_utf8_lossy(diff_bytes);
+    let diff = match std::str::from_utf8(diff_bytes) {
+        Ok(diff) => diff,
+        Err(e) => {
+            return CommandOutcome::captured(
+                1,
+                Vec::new(),
+                format!("patch: diff is not valid UTF-8: {e}\n").into_bytes(),
+            )
+        }
+    };
     let path = resolve_path(state, file);
-    let original = std::fs::read_to_string(&path).unwrap_or_default();
+    let target = match std::fs::canonicalize(&path) {
+        Ok(target) => target,
+        Err(e) => {
+            return CommandOutcome::captured(
+                1,
+                Vec::new(),
+                format!("patch: {file}: {e}\n").into_bytes(),
+            )
+        }
+    };
+    let mut source = match std::fs::File::open(&target) {
+        Ok(source) => source,
+        Err(e) => {
+            return CommandOutcome::captured(
+                1,
+                Vec::new(),
+                format!("patch: {file}: {e}\n").into_bytes(),
+            )
+        }
+    };
+    let permissions = match source.metadata() {
+        Ok(metadata) if metadata.is_file() => metadata.permissions(),
+        Ok(_) => {
+            return CommandOutcome::captured(
+                1,
+                Vec::new(),
+                format!("patch: {file}: not a regular file\n").into_bytes(),
+            )
+        }
+        Err(e) => {
+            return CommandOutcome::captured(
+                1,
+                Vec::new(),
+                format!("patch: {file}: {e}\n").into_bytes(),
+            )
+        }
+    };
+    let mut original_bytes = Vec::new();
+    if let Err(e) = source.read_to_end(&mut original_bytes) {
+        return CommandOutcome::captured(
+            1,
+            Vec::new(),
+            format!("patch: {file}: {e}\n").into_bytes(),
+        );
+    }
+    let original = match std::str::from_utf8(&original_bytes) {
+        Ok(original) => original,
+        Err(e) => {
+            return CommandOutcome::captured(
+                1,
+                Vec::new(),
+                format!("patch: {file}: file is not valid UTF-8: {e}\n").into_bytes(),
+            )
+        }
+    };
 
-    match apply_unified_diff(&original, &diff) {
-        Ok(patched) => match std::fs::write(&path, &patched) {
+    match apply_unified_diff(original, diff) {
+        Ok(patched) => match atomic_replace(&target, patched.as_bytes(), permissions) {
             Ok(()) => {
-                let (plus, minus) = diff_stats(&diff);
+                let (plus, minus) = diff_stats(diff);
                 CommandOutcome::captured(
                     0,
                     format!("patched {file} (+{plus} -{minus})\n").into_bytes(),
@@ -284,6 +349,61 @@ pub fn patch(args: &[String], state: &ShellState, stdin: Option<&[u8]>) -> Comma
             CommandOutcome::captured(1, Vec::new(), format!("patch: {file}: {e}\n").into_bytes())
         }
     }
+}
+
+static PATCH_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Replace an existing file only after its complete new contents are durable.
+/// The temporary is created in the destination directory so the final rename is
+/// atomic on the supported Unix platforms.
+fn atomic_replace(
+    path: &Path,
+    contents: &[u8],
+    permissions: std::fs::Permissions,
+) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination has no parent directory",
+        )
+    })?;
+    let mut last_collision = None;
+
+    for _ in 0..128 {
+        let id = PATCH_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(".agsh-patch-{}-{id}.tmp", std::process::id()));
+        let mut temp = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(temp) => temp,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_collision = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let result = (|| {
+            temp.write_all(contents)?;
+            temp.set_permissions(permissions)?;
+            temp.sync_all()?;
+            drop(temp);
+            std::fs::rename(&temp_path, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        return result;
+    }
+
+    Err(last_collision.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create a unique patch temporary file",
+        )
+    }))
 }
 
 /// `risk <command>`: run the deterministic risk analysis on a command WITHOUT
@@ -574,6 +694,16 @@ fn base_name(path: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn patch_fixture(label: &str) -> (PathBuf, ShellState) {
+        let id = PATCH_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("agsh-agent-{label}-{}-{id}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut state = ShellState::from_current_process();
+        state.set_cwd(dir.clone());
+        (dir, state)
+    }
+
     #[test]
     fn slice_head_tail_range_grep() {
         let text = "a\nb\nc\nd\ne\n";
@@ -643,5 +773,129 @@ mod tests {
         let original = "a\nb\n";
         let diff = "@@ -2,1 +2,2 @@\n b\n+c\n";
         assert_eq!(apply_unified_diff(original, diff).unwrap(), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn patch_missing_file_fails_without_creating_it() {
+        let (dir, state) = patch_fixture("patch-missing");
+        let path = dir.join("missing.txt");
+        let outcome = patch(
+            &["missing.txt".to_string()],
+            &state,
+            Some(b"@@ -0,0 +1 @@\n+created\n"),
+        );
+
+        assert_eq!(outcome.exit_code, 1);
+        assert!(!path.exists());
+        assert!(String::from_utf8_lossy(&outcome.stderr).contains("missing.txt"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn patch_non_utf8_file_fails_without_modifying_it() {
+        let (dir, state) = patch_fixture("patch-non-utf8-file");
+        let path = dir.join("binary.dat");
+        let original = b"\xff\xfeoriginal\0bytes";
+        std::fs::write(&path, original).unwrap();
+
+        let outcome = patch(
+            &["binary.dat".to_string()],
+            &state,
+            Some(b"@@ -0,0 +1 @@\n+replacement\n"),
+        );
+
+        assert_eq!(outcome.exit_code, 1);
+        assert!(String::from_utf8_lossy(&outcome.stderr).contains("not valid UTF-8"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn patch_non_utf8_diff_fails_without_modifying_file() {
+        let (dir, state) = patch_fixture("patch-non-utf8-diff");
+        let path = dir.join("source.txt");
+        let original = b"original\n";
+        std::fs::write(&path, original).unwrap();
+
+        let outcome = patch(&["source.txt".to_string()], &state, Some(b"\xff\xfe"));
+
+        assert_eq!(outcome.exit_code, 1);
+        assert!(String::from_utf8_lossy(&outcome.stderr).contains("diff is not valid UTF-8"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_unreadable_file_fails_without_modifying_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, state) = patch_fixture("patch-unreadable");
+        let path = dir.join("source.txt");
+        let original = b"original\n";
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // An elevated test process can read mode-000 files, so it cannot exercise
+        // the permission-denied path reliably.
+        if std::fs::File::open(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+
+        let outcome = patch(
+            &["source.txt".to_string()],
+            &state,
+            Some(b"@@ -1 +1 @@\n-original\n+replacement\n"),
+        );
+
+        assert_eq!(outcome.exit_code, 1);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o000
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn patch_atomically_replaces_file_and_preserves_permissions() {
+        let (dir, state) = patch_fixture("patch-atomic");
+        let path = dir.join("source.txt");
+        std::fs::write(&path, b"alpha\nbeta\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        #[cfg(unix)]
+        let original_inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&path).unwrap().ino()
+        };
+
+        let outcome = patch(
+            &["source.txt".to_string()],
+            &state,
+            Some(b"@@ -1,2 +1,2 @@\n alpha\n-beta\n+BETA\n"),
+        );
+
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"alpha\nBETA\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            assert_ne!(std::fs::metadata(&path).unwrap().ino(), original_inode);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                0o640
+            );
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

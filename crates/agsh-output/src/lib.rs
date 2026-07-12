@@ -21,5 +21,5 @@ pub use context::CompactionContext;
 pub use mode::OutputMode;
 pub use normalize::{normalize, NormalizeOptions};
 pub use observation::{OutputObservation, RawStreamRef};
-pub use redact::{redact, RedactOptions};
+pub use redact::{is_sensitive_env_name, redact, RedactOptions};
 pub use summary::{CommandContext, SemanticSummary};

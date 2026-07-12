@@ -68,6 +68,38 @@ pub fn compile_pattern_strings(patterns: &[String]) -> Vec<Regex> {
     patterns.iter().filter_map(|p| Regex::new(p).ok()).collect()
 }
 
+/// Deterministically classify environment names whose values should be treated
+/// as secrets in observations. This is deliberately name-based: it never asks a
+/// model to infer sensitivity and avoids broad substrings such as `TOKEN` in
+/// `TOKENIZERS_PARALLELISM`.
+pub fn is_sensitive_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    const EXACT: &[&str] = &[
+        "DATABASE_URL",
+        "MONGODB_URI",
+        "REDIS_URL",
+        "SQLALCHEMY_DATABASE_URI",
+        "SSH_AUTH_SOCK",
+    ];
+    const WORDS: &[&str] = &[
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "API_KEY",
+        "PRIVATE_KEY",
+        "ACCESS_KEY",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "COOKIE",
+    ];
+
+    EXACT.contains(&upper.as_str())
+        || WORDS
+            .iter()
+            .any(|word| upper == *word || upper.ends_with(&format!("_{word}")))
+}
+
 /// Redact secrets from `input`. Literal secret values are matched first, then
 /// token-shaped patterns.
 pub fn redact(input: &str, options: &RedactOptions) -> String {
@@ -145,5 +177,22 @@ mod tests {
             redact("secret ghp_aaaaaaaaaaaaaaaaaaaaaa", &options),
             "secret ghp_aaaaaaaaaaaaaaaaaaaaaa"
         );
+    }
+
+    #[test]
+    fn recognizes_sensitive_environment_names() {
+        for name in [
+            "GITHUB_TOKEN",
+            "MY_PRIVATE_TOKEN",
+            "SERVICE_PASSWORD",
+            "OPENAI_API_KEY",
+            "DEPLOY_CREDENTIALS",
+            "DATABASE_URL",
+        ] {
+            assert!(is_sensitive_env_name(name), "expected sensitive: {name}");
+        }
+        for name in ["PATH", "HOME", "RUST_LOG", "TOKENIZERS_PARALLELISM"] {
+            assert!(!is_sensitive_env_name(name), "false positive: {name}");
+        }
     }
 }

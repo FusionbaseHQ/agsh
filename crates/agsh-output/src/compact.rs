@@ -37,26 +37,39 @@ pub fn render_observation_with(
     stdout: &[u8],
     stderr: &[u8],
 ) -> OutputObservation {
+    if mode == OutputMode::Silent {
+        return OutputObservation {
+            display: String::new(),
+            token_estimate: 0,
+            raw: raw_ref(cmd_id),
+        };
+    }
+
     let stdout_text = String::from_utf8_lossy(stdout);
     let stderr_text = String::from_utf8_lossy(stderr);
+    // Raw output never pays the cost of observation-only argv redaction.
+    if matches!(mode, OutputMode::Raw | OutputMode::Rich) {
+        let display = format!("{stdout_text}{stderr_text}");
+        return OutputObservation {
+            token_estimate: estimate_tokens(&display),
+            display,
+            raw: raw_ref(cmd_id),
+        };
+    }
+
+    let redacted_argv = argv
+        .iter()
+        .map(|arg| ctx.redact_text(arg))
+        .collect::<Vec<_>>();
+    let observation_argv = redacted_argv.as_slice();
 
     match mode {
-        // Raw is exact: never normalize or redact it. Rich rendering is handled
-        // by the executor (it needs the type renderers + theme); here it falls
-        // back to raw passthrough.
-        OutputMode::Raw | OutputMode::Rich => {
-            let display = format!("{stdout_text}{stderr_text}");
-            OutputObservation {
-                token_estimate: estimate_tokens(&display),
-                display,
-                raw: raw_ref(cmd_id),
-            }
-        }
+        OutputMode::Raw | OutputMode::Rich | OutputMode::Silent => unreachable!(),
         OutputMode::Clean => {
             let clean = ctx.clean_text(&format!("{stdout_text}{stderr_text}"));
             // A clean dump can still be huge; fall back to refs over budget.
             if estimate_tokens(&clean) > ctx.budget.max_tokens {
-                lossless_ref(cmd_id, argv, exit_code)
+                lossless_ref(cmd_id, observation_argv, exit_code)
             } else {
                 OutputObservation {
                     token_estimate: estimate_tokens(&clean),
@@ -86,7 +99,7 @@ pub fn render_observation_with(
             let err = ctx.clean_text(&stderr_text);
             let cx = CommandContext {
                 cmd_id: cmd_id.to_string(),
-                argv,
+                argv: observation_argv,
                 exit_code,
                 stdout: &out,
                 stderr: &err,
@@ -102,7 +115,7 @@ pub fn render_observation_with(
                         ctx,
                         mode,
                         cmd_id,
-                        argv,
+                        observation_argv,
                         exit_code,
                         summary,
                         (&out, &err),
@@ -115,14 +128,17 @@ pub fn render_observation_with(
                 Some(ruleset) => crate::rules::apply_compactor(ruleset, &cx),
                 None => compactors::summarize(&cx),
             };
-            budgeted_summary(ctx, mode, cmd_id, argv, exit_code, summary, (&out, &err))
+            budgeted_summary(
+                ctx,
+                mode,
+                cmd_id,
+                observation_argv,
+                exit_code,
+                summary,
+                (&out, &err),
+            )
         }
-        OutputMode::LosslessRef => lossless_ref(cmd_id, argv, exit_code),
-        OutputMode::Silent => OutputObservation {
-            display: String::new(),
-            token_estimate: 0,
-            raw: raw_ref(cmd_id),
-        },
+        OutputMode::LosslessRef => lossless_ref(cmd_id, observation_argv, exit_code),
     }
 }
 
@@ -508,5 +524,28 @@ mod tests {
         );
         assert!(obs.display.contains("raw_stdout: trace://"));
         assert!(obs.token_estimate <= 60);
+    }
+
+    #[test]
+    fn command_metadata_is_redacted_in_semantic_and_lossless_ref_modes() {
+        let id = CommandId::new();
+        let secret = "supersecretvalue";
+        let mut ctx = CompactionContext::defaults();
+        ctx.redact.literal_secrets.push(secret.to_string());
+        let argv = ["printf".to_string(), secret.to_string()];
+
+        for mode in [OutputMode::Semantic, OutputMode::LosslessRef] {
+            let obs = render_observation_with(&ctx, mode, &id, &argv, 0, b"", b"");
+            assert!(
+                obs.display.contains("[REDACTED]"),
+                "display={:?}",
+                obs.display
+            );
+            assert!(
+                !obs.display.contains(secret),
+                "secret leaked: {:?}",
+                obs.display
+            );
+        }
     }
 }

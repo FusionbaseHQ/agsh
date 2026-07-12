@@ -4637,13 +4637,22 @@ fn compaction_context(state: &ShellState, argv: &[String]) -> CompactionContext 
     let config = state.output_config();
     let home = state.lookup("HOME").map(str::to_string);
     let workspace = Some(state.cwd().display().to_string());
-    let literal_secrets = config
+    let mut secret_names = config
         .security
         .redact_env_names
         .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for name in state.vars().keys().chain(state.exported_env().keys()) {
+        if agsh_output::is_sensitive_env_name(name) {
+            secret_names.insert(name.clone());
+        }
+    }
+    let literal_secrets = secret_names
+        .iter()
         .filter_map(|name| state.lookup(name).map(str::to_string))
-        .filter(|v| !v.is_empty())
-        .collect::<Vec<_>>();
+        .filter(|value| value.len() >= 4)
+        .collect();
     CompactionContext {
         normalize: config.normalize_options(home, workspace),
         redact: config.redact_options(literal_secrets),

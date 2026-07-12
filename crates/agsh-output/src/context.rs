@@ -32,6 +32,12 @@ impl CompactionContext {
         redact(&normalize::normalize(input, &self.normalize), &self.redact)
     }
 
+    /// Redact without normalizing. Command metadata should retain its spelling
+    /// and paths while still removing literal and token-shaped secrets.
+    pub fn redact_text(&self, input: &str) -> String {
+        redact(input, &self.redact)
+    }
+
     /// The tiny-output fast path: when a command's combined output is at most
     /// [`TINY_LINES`] short lines, no observation is more compact than the
     /// output itself, so return it verbatim — cleaned (ANSI strip, control

@@ -458,9 +458,9 @@ pub fn apply_session(session: &RestorableSession, state: &mut ShellState) -> Vec
                         .filter(|s| !s.is_empty())
                         .map(str::to_string)
                         .collect();
-                    if !names.is_empty() {
-                        state.set_confine(&names);
-                    }
+                    // A present empty value is the serialized deny-all policy;
+                    // only an absent AGSH_CONFINE means unconfined.
+                    state.set_confine(&names);
                 }
                 state.export_var(k, v);
                 restored_env.push(k.as_str());
@@ -913,6 +913,8 @@ mod tests {
         state.set_abbreviation("gco", "git checkout");
         state.set_function("greet", crate::state::ShellFunction::new("echo hello"));
         state.set_errexit(true);
+        state.set_confine(&[]);
+        state.export_var("AGSH_CONFINE", "");
         recorder.command_finished(&state, 0);
         // Session dies here (no Exit event); fold and replay onto a new shell.
         let folded = fold_session(&read_journal(recorder.journal_handle().path()));
@@ -929,6 +931,8 @@ mod tests {
             Some("echo hello")
         );
         assert!(fresh.errexit());
+        assert!(fresh.is_confined());
+        assert!(fresh.confine_policy().is_some_and(|p| p.is_empty()));
         assert!(!notes.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

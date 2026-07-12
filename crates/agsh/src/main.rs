@@ -765,9 +765,9 @@ fn apply_confinement(state: &mut ShellState, options: &CliOptions) {
 
     if let Ok(list) = std::env::var("AGSH_CONFINE") {
         let names = parse_list(&list);
-        if !names.is_empty() {
-            state.set_confine(&names);
-        }
+        // Presence is significant: an empty serialized allowlist means
+        // deny-all, while an absent variable means the session is unconfined.
+        state.set_confine(&names);
     }
 
     // `--allow LIST` without `--run`: confine THIS interactive session (the

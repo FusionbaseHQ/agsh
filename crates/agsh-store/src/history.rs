@@ -6,7 +6,7 @@
 //! session can be reconstructed. Ranking helpers take `now` explicitly so they
 //! are deterministic and testable.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -160,6 +160,109 @@ pub struct HistoryStore {
 
 const DEFAULT_MAX: usize = 50_000;
 
+fn ensure_parent_dir(path: &Path) -> io::Result<()> {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(parent)
+}
+
+#[cfg(unix)]
+fn make_file_private(file: &std::fs::File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = file.metadata()?.permissions();
+    if permissions.mode() & 0o7777 != 0o600 {
+        permissions.set_mode(0o600);
+        file.set_permissions(permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_file_private(_file: &std::fs::File) -> io::Result<()> {
+    Ok(())
+}
+
+fn open_history_for_read(path: &Path) -> io::Result<std::fs::File> {
+    let file = std::fs::File::open(path)?;
+    make_file_private(&file)?;
+    Ok(file)
+}
+
+fn open_history_for_append(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    make_file_private(&file)?;
+    Ok(file)
+}
+
+fn create_rewrite_temp(path: &Path) -> io::Result<(PathBuf, std::fs::File)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("history");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+
+    for _ in 0..128 {
+        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(
+            ".{name}.tmp.{}.{stamp:x}.{sequence:x}",
+            std::process::id()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp) {
+            Ok(file) => {
+                if let Err(error) = make_file_private(&file) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(error);
+                }
+                return Ok((temp, file));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a history rewrite file",
+    ))
+}
+
 impl HistoryStore {
     pub fn in_memory() -> Self {
         Self {
@@ -180,7 +283,7 @@ impl HistoryStore {
         let max = max.max(1);
         let mut entries: Vec<HistoryEntry> = Vec::new();
         let mut total = 0usize;
-        if let Ok(file) = std::fs::File::open(&path) {
+        if let Ok(file) = open_history_for_read(&path) {
             // Read line-by-line as bytes and lossy-decode: a corrupt/non-UTF8 line
             // just fails to parse and is skipped, instead of truncating the whole
             // (newest) history the way `.lines().map_while(Result::ok)` did at the
@@ -231,7 +334,6 @@ impl HistoryStore {
     /// half-written log.
     fn rewrite(&self) {
         let Some(path) = &self.path else { return };
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
         let mut buf = String::new();
         for entry in &self.entries {
             if let Ok(line) = serde_json::to_string(entry) {
@@ -239,13 +341,29 @@ impl HistoryStore {
                 buf.push('\n');
             }
         }
-        if let Ok(mut file) = std::fs::File::create(&tmp) {
-            if file.write_all(buf.as_bytes()).is_ok() && file.flush().is_ok() {
-                let _ = std::fs::rename(&tmp, path);
-            } else {
-                let _ = std::fs::remove_file(&tmp);
+        let _ = (|| -> io::Result<()> {
+            ensure_parent_dir(path)?;
+            let (temp, mut file) = create_rewrite_temp(path)?;
+            if let Err(error) = file
+                .write_all(buf.as_bytes())
+                .and_then(|()| file.sync_all())
+            {
+                let _ = std::fs::remove_file(&temp);
+                return Err(error);
             }
-        }
+            drop(file);
+            if let Err(error) = std::fs::rename(&temp, path) {
+                let _ = std::fs::remove_file(&temp);
+                return Err(error);
+            }
+            #[cfg(unix)]
+            if let Some(parent) = path.parent() {
+                if let Ok(directory) = std::fs::File::open(parent) {
+                    let _ = directory.sync_all();
+                }
+            }
+            Ok(())
+        })();
     }
 
     /// Append a new (not-yet-finalized) entry; returns its index.
@@ -271,16 +389,10 @@ impl HistoryStore {
 
     fn persist(&self, entry: &HistoryEntry) {
         let Some(path) = &self.path else { return };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        let _ = ensure_parent_dir(path);
         if let Ok(mut line) = serde_json::to_string(entry) {
             line.push('\n');
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
+            if let Ok(mut file) = open_history_for_append(path) {
                 // One write_all of the whole line (not writeln!'s two writes): with
                 // O_APPEND this lands atomically, so concurrent sessions can't
                 // interleave a half-line.
@@ -725,6 +837,77 @@ mod tests {
         // The on-disk log was compacted, so it cannot grow without bound.
         let on_disk = std::fs::read_to_string(&path).unwrap().lines().count();
         assert!(on_disk <= 10, "log not compacted: {on_disk} lines");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_history_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("agsh_histperm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.jsonl");
+
+        let mut store = HistoryStore::with_file(path.clone(), 10);
+        store.push(entry("secret command", "/x", 1));
+        store.finalize_last(0, 1);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "history file mode was {mode:o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_history_tightens_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("agsh_histtight_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.jsonl");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _store = HistoryStore::with_file(path.clone(), 10);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "history file mode was {mode:o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compaction_does_not_follow_predictable_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("agsh_histsymlink_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.jsonl");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "do not overwrite").unwrap();
+
+        let mut text = String::new();
+        for i in 0..100u64 {
+            text.push_str(&serde_json::to_string(&entry(&format!("cmd{i}"), "/x", i)).unwrap());
+            text.push('\n');
+        }
+        std::fs::write(&path, text).unwrap();
+
+        let old_temp = path.with_extension(format!("tmp{}", std::process::id()));
+        symlink(&victim, &old_temp).unwrap();
+
+        let store = HistoryStore::with_file(path.clone(), 10);
+
+        assert_eq!(store.len(), 10);
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not overwrite"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 10);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

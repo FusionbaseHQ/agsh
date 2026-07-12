@@ -272,6 +272,24 @@ fn clean_mode_strips_ansi_and_redacts_secrets() {
 }
 
 #[test]
+fn semantic_mode_redacts_sensitive_environment_values_and_argv() {
+    let secret = "supersecretvalue";
+    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args([
+            "--output",
+            "semantic",
+            "-c",
+            "printf '%s\\n' \"$MY_PRIVATE_TOKEN\"",
+        ])
+        .env("MY_PRIVATE_TOKEN", secret)
+        .output()
+        .expect("run agsh");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[REDACTED]"), "stdout={stdout:?}");
+    assert!(!stdout.contains(secret), "secret leaked: {stdout:?}");
+}
+
+#[test]
 fn semantic_mode_emits_trace_refs_that_resolve() {
     // In a capturing session, a command's raw output is recorded and a later
     // `trace <id>` reads it back exactly.
@@ -483,6 +501,37 @@ fn confine_inherited_from_env() {
         .output()
         .expect("run agsh");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+#[test]
+fn confine_inherited_empty_env_denies_every_external_command() {
+    // Presence is significant: an empty serialized allowlist is deny-all, not
+    // the same as an absent AGSH_CONFINE variable.
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args(["-c", "/bin/echo should-not-run"])
+        .env("AGSH_CONFINE", "")
+        .output()
+        .expect("run agsh");
+
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("should-not-run"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not permitted"));
+}
+
+#[test]
+fn confine_deny_all_propagates_to_background_child() {
+    // Intersecting disjoint sticky policies produces deny-all. Background
+    // commands run in a child agsh, which must preserve that empty policy.
+    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        .args([
+            "-c",
+            "confine true; confine false; /bin/echo should-not-run & wait",
+        ])
+        .env_remove("AGSH_CONFINE")
+        .output()
+        .expect("run agsh");
+
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("should-not-run"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not permitted"));
 }
 
 #[test]

@@ -146,6 +146,11 @@ pub enum Backend {
     Unavailable,
 }
 
+/// The trusted macOS Seatbelt launcher. Backend detection and execution must use
+/// this same absolute path so a confined command can never select a PATH-provided
+/// `sandbox-exec` replacement after the backend probe succeeds.
+const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
+
 /// What the caller should do with a confined payload.
 pub enum ConfinePlan {
     /// Refuse: print `message` to stderr and exit with `code`.
@@ -247,7 +252,7 @@ impl Caps {
 
 /// Probe for a real OS enforcement backend.
 pub fn detect_backend() -> Backend {
-    if cfg!(target_os = "macos") && std::path::Path::new("/usr/bin/sandbox-exec").exists() {
+    if cfg!(target_os = "macos") && std::path::Path::new(SANDBOX_EXEC_PATH).exists() {
         return Backend::SandboxExec;
     }
     // Linux Landlock would be selected here once the `landlock` crate is vendored
@@ -625,7 +630,8 @@ pub fn sandbox_exec_wrap(
     let full_payload = format!("{prefix}{payload_shell}");
 
     let command = format!(
-        "sandbox-exec -f {} /bin/sh -c {}",
+        "{} -f {} /bin/sh -c {}",
+        shell_quote(SANDBOX_EXEC_PATH),
         shell_quote(&profile_path.display().to_string()),
         shell_quote(&full_payload)
     );
@@ -845,6 +851,41 @@ mod tests {
         let q = shell_quote("/tmp/a$(touch /tmp/pwn)b");
         assert_eq!(q, "'/tmp/a$(touch /tmp/pwn)b'");
         assert!(!q.contains('"')); // never double-quoted (would re-expand)
+    }
+
+    #[test]
+    fn sandbox_wrapper_uses_the_absolute_detected_launcher() {
+        let mut s = state();
+        // A hostile PATH entry must not affect the launcher chosen after the
+        // fixed-path backend probe has succeeded.
+        s.set_var("PATH", "/tmp/agsh-hostile-path");
+        let plan = sandbox_exec_wrap(
+            &s,
+            &[],
+            "/bin/echo",
+            "/bin/echo ok",
+            &ConfineOpts::default(),
+        )
+        .expect("build sandbox plan");
+        let ConfinePlan::Sandboxed {
+            command, cleanup, ..
+        } = plan
+        else {
+            panic!("expected sandboxed plan");
+        };
+        for path in cleanup {
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+        }
+
+        assert!(
+            command.starts_with("'/usr/bin/sandbox-exec' -f "),
+            "sandbox launcher must be absolute, got {command:?}"
+        );
+        assert!(!command.starts_with("sandbox-exec "));
     }
 
     #[test]
