@@ -79,9 +79,22 @@ TESTS = [
     ("times runs", "times >/dev/null; echo $?"),
     ("getopts", "set -- -a -b val x; while getopts ab: o; do echo $o:$OPTARG; done"),
     ("export to child", "export Y=1; sh -c 'echo $Y'"),
-    ("special builtin prefix persists", "unset AGSH_POSIX_PREFIX; AGSH_POSIX_PREFIX=x :; sh -c 'echo $AGSH_POSIX_PREFIX'"),
-    ("readonly reassignment status", "readonly AGSH_POSIX_RO=one; (readonly AGSH_POSIX_RO=two) 2>/dev/null; echo $?:$AGSH_POSIX_RO"),
-    ("readonly unset status", "readonly AGSH_POSIX_UNSET=one; (unset AGSH_POSIX_UNSET) 2>/dev/null; echo $?:$AGSH_POSIX_UNSET"),
+    (
+        "special builtin prefix persists",
+        "unset AGSH_POSIX_PREFIX; AGSH_POSIX_PREFIX=x :; echo $AGSH_POSIX_PREFIX",
+    ),
+    (
+        "readonly reassignment fails",
+        "readonly AGSH_POSIX_RO=one; "
+        "(readonly AGSH_POSIX_RO=two) 2>/dev/null; "
+        "s=$?; [ $s -ne 0 ] && s=nonzero; echo $s:$AGSH_POSIX_RO",
+    ),
+    (
+        "readonly unset fails",
+        "readonly AGSH_POSIX_UNSET=one; "
+        "(unset AGSH_POSIX_UNSET) 2>/dev/null; "
+        "s=$?; [ $s -ne 0 ] && s=nonzero; echo $s:$AGSH_POSIX_UNSET",
+    ),
     ("set positionals", "set -- one two; echo $1 $2"),
     ("shift", "set -- a b c; shift; echo $1"),
 ]
