@@ -15804,16 +15804,16 @@ mod tests {
         let root = unique_temp_dir("capture-drain-ambiguous-ack");
         let cwd_file = root.join("worker.cwd");
         let timeout_helper = root.join("timeout-helper");
-        write_executable(
-            &timeout_helper,
-            &format!("pwd > '{}'; /bin/sleep 30", cwd_file.display()),
-        );
+        write_executable(&timeout_helper, "/bin/sleep 30");
         let wrong_ack_helper = root.join("wrong-ack-helper");
-        write_executable(&wrong_ack_helper, "printf X; /bin/sleep 30");
+        write_executable(
+            &wrong_ack_helper,
+            &format!("pwd > '{}'; printf X; /bin/sleep 30", cwd_file.display()),
+        );
 
         for (helper, timeout) in [
-            (&timeout_helper, Duration::from_millis(500)),
-            (&wrong_ack_helper, Duration::from_millis(50)),
+            (&timeout_helper, Duration::from_millis(50)),
+            (&wrong_ack_helper, CAPTURE_DRAIN_ACK_TIMEOUT),
         ] {
             let (mut fallback_reader, mut retained_writer) = io::pipe().unwrap();
             let worker_reader = fallback_reader.as_fd().try_clone_to_owned().unwrap();
