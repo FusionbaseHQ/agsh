@@ -15,14 +15,6 @@ that outlive terminal disconnects, and lower-token agent observations.
 
 </div>
 
-> [!IMPORTANT]
-> **Pre-1.0 status:** `agsh` is usable early-stage software, not yet a
-> production replacement for a mature POSIX shell. Linux kernel confinement
-> and the authenticated agent server are not implemented, and native shell
-> compatibility still has documented gaps. See the
-> [implementation status](docs/IMPLEMENTATION_PLAN.md) and
-> [security model](docs/SECURITY_MODEL.md) before relying on it.
-
 ---
 
 ```console
@@ -177,14 +169,11 @@ autosuggestions, reverse search.
 
 ## Install in 60 seconds
 
-> The release-asset installer becomes available with the first public GitHub
-> Release. Until that release is published, use the source build below.
-
-**Prepared first-release assets** target macOS 11+ arm64/x86_64 and Ubuntu
+**Release assets** target macOS 11+ arm64/x86_64 and Ubuntu
 22.04+ x86_64/arm64; release qualification currently runs on macOS 15 and
 Ubuntu 22.04, so older macOS versions are not yet part of the tested support
 matrix. The Linux shell is static musl. The installer verifies checksums, needs
-no sudo, and targets `~/.local/bin`. Archives will also contain
+no sudo, and targets `~/.local/bin`. Archives also contain
 the optional deep-interception library; on Linux that library targets the Ubuntu
 22.04 glibc baseline while the shell binary remains static:
 
@@ -195,10 +184,10 @@ less install.sh
 sh install.sh
 ```
 
-When the first release is published, its installer will itself be a checksummed,
-attested release asset. GitHub CLI users can then verify its provenance with the command in
+The installer is itself a checksummed, attested release asset. GitHub CLI users
+can verify its provenance with the command in
 [`docs/internal/RELEASING.md`](docs/internal/RELEASING.md). Pin the payload with
-`AGSH_VERSION=v0.3.0`, change the target directory with `AGSH_INSTALL_DIR`, and
+`AGSH_VERSION=v0.2.0`, change the target directory with `AGSH_INSTALL_DIR`, and
 set `AGSH_REQUIRE_ATTESTATION=1` to require the downloaded binary archive's
 release-workflow attestation from that exact version tag (this requires a recent
 GitHub CLI with `--source-ref` support). A checksum fetched from the same release

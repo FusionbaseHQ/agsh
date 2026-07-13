@@ -224,7 +224,7 @@ fn parse_trust_store(text: &str) -> io::Result<BTreeMap<PathBuf, TrustDigest>> {
         if line.is_empty() {
             continue;
         }
-        // Pre-0.3 stores used an unversioned 64-bit DefaultHasher value. It is
+        // Legacy stores used an unversioned 64-bit DefaultHasher value. It is
         // deliberately ignored rather than trusted; the next successful
         // `agtrust` rewrites the store in the cryptographic format.
         if line

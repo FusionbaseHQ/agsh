@@ -120,7 +120,7 @@ done
 [ "${artifact##*/}" = "$EXPECTED_ARCHIVE_NAME" ] || exit 65
 [ "$repo" = FusionbaseHQ/agsh ] || exit 65
 [ "$signer_workflow" = FusionbaseHQ/agsh/.github/workflows/release.yml ] || exit 65
-[ "$source_ref" = refs/tags/v0.3.0 ] || exit 65
+[ "$source_ref" = refs/tags/v0.2.0 ] || exit 65
 [ "$deny_self_hosted" -eq 1 ] || exit 65
 printf '%s\n' "$source_ref" >"$GH_ARGS_LOG"
 printf '%s\n' "${artifact##*/}" >"$GH_ASSET_LOG"
@@ -128,12 +128,12 @@ printf '%s\n' "${artifact##*/}" >"$GH_ASSET_LOG"
 EOF
 chmod 755 "$TMP/fake-bin/uname" "$TMP/fake-bin/curl" "$TMP/fake-bin/gh"
 
-NAME="agsh-v0.3.0-$FIXTURE_TARGET"
+NAME="agsh-v0.2.0-$FIXTURE_TARGET"
 PAYLOAD="$TMP/package/$NAME"
 mkdir -p "$PAYLOAD/LICENSES"
 cat >"$PAYLOAD/agsh" <<'EOF'
 #!/bin/sh
-printf '%s\n' 'agsh 0.3.0'
+printf '%s\n' 'agsh 0.2.0'
 EOF
 chmod 755 "$PAYLOAD/agsh"
 printf 'fixture library\n' >"$PAYLOAD/$FIXTURE_INTERCEPT_LIB"
@@ -165,7 +165,7 @@ run_installer() {
     install_dir=$1
     PATH="$TMP/fake-bin:/usr/bin:/bin" \
         HOME="$TMP/home" \
-        AGSH_VERSION=v0.3.0 \
+        AGSH_VERSION=v0.2.0 \
         AGSH_INSTALL_DIR="$install_dir" \
         AGSH_DOC_DIR="$install_dir/docs" \
         AGSH_REQUIRE_ATTESTATION="${TEST_REQUIRE_ATTESTATION:-1}" \
@@ -193,25 +193,25 @@ test -x "$TMP/install/agsh"
 test ! -L "$TMP/install/agsh"
 test "$(cat "$TMP/victim")" = "do not overwrite through symlink"
 test -x "$TMP/install/$FIXTURE_INTERCEPT_LIB"
-test "$("$TMP/install/agsh" --version)" = "agsh 0.3.0"
+test "$("$TMP/install/agsh" --version)" = "agsh 0.2.0"
 test -f "$TMP/install/docs/LICENSE"
 test -f "$TMP/install/docs/NOTICE"
 test -f "$TMP/install/docs/THIRD_PARTY_LICENSES.html"
 test -f "$TMP/install/docs/RUST_STANDARD_LIBRARY_COPYRIGHT.html"
 test -f "$TMP/install/docs/Apache-2.0.txt"
-test "$(cat "$TMP/gh.args")" = refs/tags/v0.3.0
+test "$(cat "$TMP/gh.args")" = refs/tags/v0.2.0
 test "$(cat "$TMP/gh.asset")" = "$NAME.tar.gz"
 grep -F -x -q \
-    "https://github.com/FusionbaseHQ/agsh/releases/download/v0.3.0/$NAME.tar.gz" \
+    "https://github.com/FusionbaseHQ/agsh/releases/download/v0.2.0/$NAME.tar.gz" \
     "$TMP/curl.urls"
 case "$FIXTURE_PLATFORM" in
 linux-x86_64)
-    test "$NAME.tar.gz" = agsh-v0.3.0-x86_64-unknown-linux-musl.tar.gz
+    test "$NAME.tar.gz" = agsh-v0.2.0-x86_64-unknown-linux-musl.tar.gz
     test -f "$TMP/install/docs/MUSL_COPYRIGHT.txt"
     test ! -e "$TMP/install/libagsh_intercept.dylib"
     ;;
 darwin-arm64)
-    test "$NAME.tar.gz" = agsh-v0.3.0-aarch64-apple-darwin.tar.gz
+    test "$NAME.tar.gz" = agsh-v0.2.0-aarch64-apple-darwin.tar.gz
     test ! -e "$TMP/install/docs/MUSL_COPYRIGHT.txt"
     test -x "$TMP/install/libagsh_intercept.dylib"
     test ! -e "$TMP/install/libagsh_intercept.so"
@@ -243,7 +243,7 @@ test -z "$(find "$TMP/directory-target" -mindepth 1 -maxdepth 1 -print -quit)"
 
 # A validly checksummed archive for the wrong binary version must fail before
 # creating the requested install directory.
-sed 's/agsh 0.3.0/agsh 9.9.9/' "$PAYLOAD/agsh" >"$PAYLOAD/agsh.wrong"
+sed 's/agsh 0.2.0/agsh 9.9.9/' "$PAYLOAD/agsh" >"$PAYLOAD/agsh.wrong"
 mv "$PAYLOAD/agsh.wrong" "$PAYLOAD/agsh"
 chmod 755 "$PAYLOAD/agsh"
 make_fixture "$FIXTURE_ARCHIVE" "$FIXTURE_CHECKSUMS"
@@ -254,7 +254,7 @@ fi
 grep -q 'binary version does not match' "$TMP/wrong-version.err"
 test ! -e "$TMP/wrong-version/agsh"
 test ! -e "$TMP/wrong-version/$FIXTURE_INTERCEPT_LIB"
-sed 's/agsh 9.9.9/agsh 0.3.0/' "$PAYLOAD/agsh" >"$PAYLOAD/agsh.correct"
+sed 's/agsh 9.9.9/agsh 0.2.0/' "$PAYLOAD/agsh" >"$PAYLOAD/agsh.correct"
 mv "$PAYLOAD/agsh.correct" "$PAYLOAD/agsh"
 chmod 755 "$PAYLOAD/agsh"
 make_fixture "$FIXTURE_ARCHIVE" "$FIXTURE_CHECKSUMS"

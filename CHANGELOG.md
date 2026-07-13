@@ -4,13 +4,16 @@ All notable changes to `agsh` are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-No public release has been published yet. The numbered sections below are
-pre-release development milestones; release-asset entries describe the prepared
-first-public-release pipeline until a corresponding Git tag and GitHub Release exist.
+`0.2.0` is the first public release. The `0.1.0` section records a private
+development milestone that preceded it.
 
 ## [Unreleased]
 
-## [0.3.0] - Unreleased release candidate
+## [0.2.0] - 2026-07-13
+
+The first public release combines the session-resilience and developer-workflow
+features prepared during private development with the production-hardening and
+release-integrity work required to ship them.
 
 ### Security
 - Make kernel confinement fail closed when its backend is unavailable, validate
@@ -29,7 +32,7 @@ first-public-release pipeline until a corresponding Git tag and GitHub Release e
   generations, publish shell state after complete verification, and refuse the
   requested mode when provisioning fails instead of running with partial policy.
 
-### Fixed
+### Hardening fixes
 - Correct quoting and expansion across here-documents, parameter operators,
   nested `$@`/`$*`, temporary assignments, exported/read-only variables, and
   associative-array keys; add focused golden and differential regressions.
@@ -97,7 +100,7 @@ first-public-release pipeline until a corresponding Git tag and GitHub Release e
   both CI and the release gate, including exact target archive, `.so`/`.dylib`,
   and platform-license membership.
 
-## [0.2.0] - 2026-07-06 development milestone
+### Session resilience and developer experience
 
 The resilience milestone: agsh now separates the three lifetimes every other
 shell welds together — the terminal, the shell state, and the processes.
@@ -140,7 +143,7 @@ commands without giving up shell-native storage.
 - **Release workflow** — prepares prebuilt binaries (macOS arm64/x86_64, Linux
   x86_64/aarch64 musl), checksums, and `install.sh`. Tagged macOS builds require
   Developer ID signing and notarization secrets and fail closed when absent.
-  No public artifact exists until that workflow publishes the first release.
+  The protected workflow is the sole publisher of public release artifacts.
 
 ### Added — history and command entry
 - **Native rich `history` workbench** — the history UI is scrollable over all
@@ -218,7 +221,7 @@ commands without giving up shell-native storage.
 
 ## [0.1.0] - 2026-06-30 development milestone
 
-Initial public-development baseline of the Aegis Shell — a from-scratch,
+Initial private-development baseline of the Aegis Shell — a from-scratch,
 POSIX-inspired pre-1.0 shell written in Rust for both humans and AI coding agents.
 
 ### Shell language & execution

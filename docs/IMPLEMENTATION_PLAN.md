@@ -6,12 +6,12 @@ because types or command-line syntax exist for it.
 
 ## Release stance
 
-`agsh` 0.3 is pre-1.0 software. The local interactive shell, command executor,
-output layer, and keep broker are usable and have broad automated coverage, but
-the project is not yet a production replacement for a mature POSIX shell. In
-particular, Linux kernel confinement and the authenticated agent server do not
-exist. No public release has been published yet; `0.3.0` is the current release
-candidate. See [SECURITY_MODEL.md](SECURITY_MODEL.md) for the security boundary.
+`agsh` 0.2.0 is the first public release. The local interactive shell,
+command executor, output layer, and keep broker have broad automated coverage on
+macOS and Ubuntu. Optional capabilities that are not part of this release remain
+explicitly scoped below: Linux kernel confinement and the authenticated agent
+server are not implemented. See [SECURITY_MODEL.md](SECURITY_MODEL.md) for the
+security boundary.
 
 ## Phase status
 

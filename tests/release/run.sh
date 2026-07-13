@@ -7,7 +7,7 @@ ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/agsh-release-test.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
-for tag in v0.3.0-rc.1 v0.3.0+build.1; do
+for tag in v0.2.0-rc.1 v0.2.0+build.1; do
     if (cd "$ROOT" && scripts/validate-release.sh "$tag") \
         >"$TMP/out" 2>"$TMP/err"
     then
@@ -85,7 +85,7 @@ run_guard() {
         FAKE_GH_COUNT="$TMP/gh.count" \
         FAKE_GH_MODE="$mode" \
         GITHUB_REPOSITORY=FusionbaseHQ/agsh \
-        GITHUB_REF_NAME=v0.3.0 \
+        GITHUB_REF_NAME=v0.2.0 \
         GITHUB_SHA=expected-commit \
         bash -c '. "$1"; verify_release_tag_binding' _ "$guard"
 }

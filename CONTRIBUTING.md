@@ -1,7 +1,7 @@
 # Contributing to `agsh`
 
-Thanks for your interest! `agsh` is an early-stage project; contributions,
-bug reports, and ideas are welcome.
+Thanks for your interest! `agsh` is actively developed; contributions, bug
+reports, and ideas are welcome.
 
 ## Development setup
 

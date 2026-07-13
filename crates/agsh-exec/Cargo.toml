@@ -16,10 +16,10 @@ agsh-compat = { path = "../agsh-compat" }
 agsh-core = { path = "../agsh-core" }
 agsh-index = { path = "../agsh-index" }
 agsh-output = { path = "../agsh-output" }
-agsh-policy = { version = "0.3.0", path = "../agsh-policy" }
-agsh-render = { version = "0.3.0", path = "../agsh-render" }
-agsh-store = { version = "0.3.0", path = "../agsh-store" }
-agsh-style = { version = "0.3.0", path = "../agsh-style" }
+agsh-policy = { version = "0.2.0", path = "../agsh-policy" }
+agsh-render = { version = "0.2.0", path = "../agsh-render" }
+agsh-store = { version = "0.2.0", path = "../agsh-store" }
+agsh-style = { version = "0.2.0", path = "../agsh-style" }
 regex = "1.12.4"
 rustix = { version = "1.1.4", features = ["process", "termios", "pty", "time"] }
 serde = { version = "1.0.228", features = ["derive"] }

@@ -9,7 +9,7 @@
 # verifies its SHA-256 against the release's checksums.txt, and installs it.
 # No sudo needed. Environment overrides:
 #
-#   AGSH_VERSION      release tag to install (default: latest, e.g. v0.3.0)
+#   AGSH_VERSION      release tag to install (default: latest, e.g. v0.2.0)
 #   AGSH_INSTALL_DIR  install directory (default: ~/.local/bin)
 #   AGSH_DOC_DIR      license/notice directory (default: <install>/../share/doc/agsh)
 #   AGSH_REQUIRE_ATTESTATION=1  require `gh attestation verify` to pass

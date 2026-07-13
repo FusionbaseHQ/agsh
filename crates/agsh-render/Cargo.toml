@@ -11,7 +11,7 @@ readme.workspace = true
 publish.workspace = true
 
 [dependencies]
-agsh-style = { version = "0.3.0", path = "../agsh-style" }
+agsh-style = { version = "0.2.0", path = "../agsh-style" }
 serde_json = "1"
 csv = "1"
 base64 = "0.22"
