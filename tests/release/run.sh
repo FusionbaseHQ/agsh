@@ -33,6 +33,28 @@ grep -F -q -- 'sudo --non-interactive "$unshare_bin" --net -- "$setpriv_bin"' "$
 grep -F -q -- '--reuid "$runner_uid" --regid "$runner_gid" --init-groups' "$workflow"
 grep -F -q -- '--no-new-privs --' "$workflow"
 grep -F -q -- 'CARGO_NET_OFFLINE=true' "$workflow"
+grep -F -q -- 'cargo_bin=$(rustup which --toolchain "$toolchain" cargo)' "$workflow"
+grep -F -q -- 'rustc_bin=$(rustup which --toolchain "$toolchain" rustc)' "$workflow"
+grep -F -q -- '"PATH=$toolchain_bin:$PATH"' "$workflow"
+grep -F -q -- '"RUSTC=$rustc_bin"' "$workflow"
+grep -F -q -- 'RUSTUP_AUTO_INSTALL=0' "$workflow"
+grep -F -q -- '"$cargo_bin" build --workspace --release --locked --offline' "$workflow"
+if grep -F -q -- 'cargo_bin=$(command -v cargo)' "$workflow"; then
+    printf '%s\n' 'release tests: source verifier invokes the rustup cargo proxy' >&2
+    exit 1
+fi
+grep -F -q -- "if: matrix.target == 'aarch64-unknown-linux-musl'" "$workflow"
+grep -F -q -- 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' "$workflow"
+grep -F -q -- "if [ \"\${{ runner.os }}\" = Linux ]; then" "$workflow"
+grep -F -q -- "grep -q ' INTERP ' \"\$program_headers\"" "$workflow"
+grep -F -q -- "grep -q '(NEEDED)' \"\$dynamic_entries\"" "$workflow"
+grep -F -q -- 'test "$("$bin" --version)" = "agsh $expected_version"' "$workflow"
+if grep -F -q -- 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER' "$workflow" ||
+    grep -F -q -- 'CARGO_TARGET_$(echo' "$workflow"
+then
+    printf '%s\n' 'release tests: x86_64 musl build forces the broken musl-gcc PIE path' >&2
+    exit 1
+fi
 
 guard="$TMP/verify-release-tag-binding.sh"
 awk '

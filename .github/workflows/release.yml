@@ -142,7 +142,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          echo "CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER=musl-gcc" >> "$GITHUB_ENV"
+      # x86_64 uses rustc's default self-contained musl link path. Forcing
+      # musl-gcc there produces a broken PIE executable (rust-lang/rust#95926).
+      - name: Configure native aarch64 musl linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV"
       - name: Set minimum macOS deployment target
         if: runner.os == 'macOS'
         run: echo 'MACOSX_DEPLOYMENT_TARGET=11.0' >> "$GITHUB_ENV"
@@ -165,10 +169,26 @@ jobs:
           lib="target/${{ matrix.intercept_target }}/release/${{ matrix.intercept_lib }}"
           test -f "$bin"
           test -f "$lib"
+          if [ "${{ runner.os }}" = Linux ]; then
+            program_headers="$RUNNER_TEMP/agsh-program-headers"
+            dynamic_entries="$RUNNER_TEMP/agsh-dynamic-entries"
+            readelf -lW "$bin" > "$program_headers"
+            readelf -dW "$bin" > "$dynamic_entries"
+            if grep -q ' INTERP ' "$program_headers"; then
+              echo "::error::$bin has a runtime program interpreter"
+              exit 1
+            fi
+            if grep -q '(NEEDED)' "$dynamic_entries"; then
+              echo "::error::$bin has a dynamic-library dependency"
+              exit 1
+            fi
+          fi
+          expected_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test -n "$expected_version"
           case "$(uname -s):$(uname -m):${{ matrix.target }}" in
             Darwin:arm64:aarch64-apple-darwin | Darwin:x86_64:x86_64-apple-darwin | \
             Linux:x86_64:x86_64-unknown-linux-musl | Linux:aarch64:aarch64-unknown-linux-musl)
-              "$bin" --version
+              test "$("$bin" --version)" = "agsh $expected_version"
               test "$("$bin" -c 'echo release-smoke')" = "release-smoke"
               smoke_src="$RUNNER_TEMP/agsh-dlopen-smoke.c"
               smoke_bin="$RUNNER_TEMP/agsh-dlopen-smoke"
@@ -323,7 +343,15 @@ jobs:
           rustup default "$toolchain"
           (
             cd "$VERIFY_ROOT/$NAME"
-            cargo_bin=$(command -v cargo)
+            # Bypass rustup proxies inside the offline namespace. The project
+            # toolchain file requests development components that the minimal
+            # verifier install intentionally does not need.
+            cargo_bin=$(rustup which --toolchain "$toolchain" cargo)
+            rustc_bin=$(rustup which --toolchain "$toolchain" rustc)
+            toolchain_bin=${cargo_bin%/*}
+            test -x "$cargo_bin"
+            test -x "$rustc_bin"
+            test "${rustc_bin%/*}" = "$toolchain_bin"
             unshare_bin=$(command -v unshare)
             setpriv_bin=$(command -v setpriv)
             runner_uid=$(id -u)
@@ -333,9 +361,12 @@ jobs:
               --no-new-privs -- \
               /usr/bin/env \
               "HOME=$HOME" \
-              "PATH=$PATH" \
+              "PATH=$toolchain_bin:$PATH" \
               "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
               "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+              "RUSTC=$rustc_bin" \
+              "RUSTUP_TOOLCHAIN=$toolchain" \
+              RUSTUP_AUTO_INSTALL=0 \
               CARGO_NET_OFFLINE=true \
               "CARGO_TARGET_DIR=$RUNNER_TEMP/corresponding-source-target" \
               "$cargo_bin" build --workspace --release --locked --offline

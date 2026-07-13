@@ -39,7 +39,9 @@ inside a new Linux network namespace whose only interface is a down loopback
 device. Cargo, build scripts, proc macros, and compiler subprocesses therefore
 cannot fetch undeclared build inputs. The pinned Rust toolchain remains a
 general-purpose build tool selected by `rust-toolchain.toml` and is installed
-before network isolation begins.
+before network isolation begins. The verifier resolves the installed Cargo and
+Rust compiler executables before entering the namespace, so rustup proxies cannot
+attempt a component sync after networking has been removed.
 
 ## Cutting a release
 
