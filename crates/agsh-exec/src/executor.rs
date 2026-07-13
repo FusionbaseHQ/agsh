@@ -15623,8 +15623,11 @@ mod tests {
         let state = ShellState::from_current_process();
         let status = with_cancellable_shell_stage(|| {
             let mut command = Command::new("/bin/sh");
+            // Make the marker come from the foreground child. If the trapped
+            // shell writes it itself, macOS Bash 3.2 can receive SIGINT before
+            // entering its wait and defer the trap until a later sleep exits.
             command.arg("-c").arg(format!(
-                "trap 'exit 130' INT; printf started >'{}'; while :; do sleep 1; done",
+                "trap 'exit 130' INT; /bin/sh -c 'printf started >\"{}\"; exec sleep 30'",
                 marker.display()
             ));
             configure_cancellable_shell_stage_child(&mut command);
