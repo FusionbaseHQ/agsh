@@ -3957,3 +3957,33 @@ fn agenv_is_a_registered_builtin_with_help() {
     assert!(stdout.contains("builtin"), "{stdout}");
     assert!(stdout.contains("restore"), "{stdout}");
 }
+
+#[test]
+fn agenv_restore_accepts_glob_selectors() {
+    let base = history_test_dir("agenv_restore_glob");
+    let history = base.join("history.jsonl");
+    seed_history_file(
+        &history,
+        &["export API_1=one", "export API_2=two", "export OTHER=three"],
+    );
+
+    // Quoted and unquoted: with no matching files in cwd the unexpanded
+    // pattern reaches the builtin, like bash's default no-match behavior.
+    for pattern in ["'API_*'", "API_*"] {
+        let source =
+            format!("agenv restore {pattern} && echo \"a=$API_1 b=$API_2 o=${{OTHER:-unset}}\"");
+        let output = isolated_agsh(&base, &history)
+            .args(["-c", &source])
+            .output()
+            .expect("run agenv restore with glob selector");
+        assert_eq!(output.status.code(), Some(0), "{pattern}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("restored API_1=one"), "{pattern}: {stdout}");
+        assert!(stdout.contains("restored API_2=two"), "{pattern}: {stdout}");
+        assert!(
+            stdout.contains("a=one b=two o=unset"),
+            "{pattern}: {stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(base);
+}

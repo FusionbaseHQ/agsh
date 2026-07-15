@@ -12766,7 +12766,7 @@ fn match_extglob(op: u8, alts: &[&[u8]], rest: &[u8], name: &[u8], depth: usize)
     }
 }
 
-fn glob_match_bytes(pattern: &[u8], name: &[u8]) -> bool {
+pub(crate) fn glob_match_bytes(pattern: &[u8], name: &[u8]) -> bool {
     glob_match_bytes_with_depth(pattern, name, 0)
 }
 

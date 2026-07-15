@@ -26,7 +26,9 @@ agenv — view, set, and restore exported environment variables.
   agenv get NAME …          explicit get form (for names shadowing a subcommand)
   agenv unset NAME …        remove NAME from the environment
   agenv history [FILTER]    assignments recorded in history, newest per name
+                            (FILTER: substring, or a glob like `API_*`)
   agenv restore NAME …      re-apply the recorded assignment for NAME
+  agenv restore 'API_*'     glob selectors re-apply every matching name
   agenv restore --all       re-apply every recorded assignment (newest per name)
   agenv restore             preview what `agenv restore --all` would re-apply
 
@@ -73,7 +75,7 @@ fn usage(message: &str) -> CommandOutcome {
 fn list_env(filter: Option<&str>, state: &ShellState) -> CommandOutcome {
     let mut out = String::new();
     for (name, value) in state.exported_env() {
-        if filter.is_some_and(|f| !name.contains(f)) {
+        if filter.is_some_and(|f| !filter_matches(f, name)) {
             continue;
         }
         out.push_str(name);
@@ -174,7 +176,7 @@ fn history_list(args: &[String], state: &ShellState) -> CommandOutcome {
     let entries = state.history_entries_for_reading();
     let mut found = scan_history_assignments(&entries);
     if let Some(filter) = filter {
-        found.retain(|assignment| assignment.name.contains(filter));
+        found.retain(|assignment| filter_matches(filter, &assignment.name));
     }
     if found.is_empty() {
         return CommandOutcome::captured(
@@ -248,19 +250,30 @@ fn restore(args: &[String], state: &mut ShellState) -> CommandOutcome {
         }
         candidates.iter().collect()
     } else {
-        let mut picked = Vec::new();
-        for name in &names {
-            match candidates.iter().find(|a| a.name == *name) {
-                Some(assignment) => picked.push(assignment),
-                None => {
-                    stderr.push_str(&format!(
-                        "agenv: restore: {name}: no export assignment found in history\n"
-                    ));
-                    status = 1;
+        // Each selector is an exact name or a glob pattern (`API_*`); a
+        // candidate picked by several selectors is restored once.
+        let mut matched: HashSet<usize> = HashSet::new();
+        for selector in &names {
+            let mut hit = false;
+            for (index, candidate) in candidates.iter().enumerate() {
+                if selector_matches(selector, &candidate.name) {
+                    hit = true;
+                    matched.insert(index);
                 }
             }
+            if !hit {
+                stderr.push_str(&format!(
+                    "agenv: restore: {selector}: no export assignment found in history\n"
+                ));
+                status = 1;
+            }
         }
-        picked
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| matched.contains(index))
+            .map(|(_, assignment)| assignment)
+            .collect()
     };
 
     // Apply oldest-first so an assignment referencing another restored
@@ -516,6 +529,30 @@ fn split_assignment_word(
     Some((name.to_string(), value, false))
 }
 
+/// Restore selector: a glob pattern when it carries glob metacharacters
+/// (matched with the shell's own matcher, so `API_*`, `API_?`, and
+/// `API_[12]` behave exactly like `case` patterns), an exact name otherwise.
+fn selector_matches(selector: &str, name: &str) -> bool {
+    if is_glob_pattern(selector) {
+        crate::executor::glob_match_bytes(selector.as_bytes(), name.as_bytes())
+    } else {
+        selector == name
+    }
+}
+
+/// `history`/`list` filter: glob when it looks like one, substring otherwise.
+fn filter_matches(filter: &str, name: &str) -> bool {
+    if is_glob_pattern(filter) {
+        crate::executor::glob_match_bytes(filter.as_bytes(), name.as_bytes())
+    } else {
+        name.contains(filter)
+    }
+}
+
+fn is_glob_pattern(text: &str) -> bool {
+    text.contains(['*', '?', '['])
+}
+
 fn name_column_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
     names.map(str::len).max().unwrap_or(0).min(28)
 }
@@ -758,6 +795,75 @@ mod tests {
         let outcome = run(&mut state, &["restore", "AGENV_SUB"]);
         assert_eq!(outcome.exit_code, 0, "{}", stderr(&outcome));
         assert_eq!(state.lookup("AGENV_SUB"), Some("ran"));
+    }
+
+    #[test]
+    fn restore_glob_pattern_reapplies_every_matching_name() {
+        let mut state = hermetic_state();
+        record(&mut state, "export API_1=one", 0);
+        record(&mut state, "export API_2=two", 0);
+        record(&mut state, "export OTHER=three", 0);
+
+        let outcome = run(&mut state, &["restore", "API_*"]);
+        assert_eq!(outcome.exit_code, 0, "{}", stderr(&outcome));
+        assert_eq!(state.lookup("API_1"), Some("one"));
+        assert_eq!(state.lookup("API_2"), Some("two"));
+        assert_eq!(state.lookup("OTHER"), None, "pattern must not overreach");
+
+        // `?` and `[…]` behave like case patterns too.
+        let mut state = hermetic_state();
+        record(&mut state, "export API_1=one", 0);
+        record(&mut state, "export API_10=ten", 0);
+        let outcome = run(&mut state, &["restore", "API_?"]);
+        assert_eq!(outcome.exit_code, 0, "{}", stderr(&outcome));
+        assert_eq!(state.lookup("API_1"), Some("one"));
+        assert_eq!(state.lookup("API_10"), None);
+        let outcome = run(&mut state, &["restore", "API_[19]0"]);
+        assert_eq!(outcome.exit_code, 0, "{}", stderr(&outcome));
+        assert_eq!(state.lookup("API_10"), Some("ten"));
+    }
+
+    #[test]
+    fn restore_overlapping_selectors_restore_once_and_report_misses() {
+        let mut state = hermetic_state();
+        record(&mut state, "export API_1=one", 0);
+
+        let outcome = run(&mut state, &["restore", "API_1", "API_*"]);
+        assert_eq!(outcome.exit_code, 0, "{}", stderr(&outcome));
+        assert_eq!(
+            stdout(&outcome).matches("restored API_1=one").count(),
+            1,
+            "{}",
+            stdout(&outcome)
+        );
+
+        let outcome = run(&mut state, &["restore", "NOPE_*"]);
+        assert_eq!(outcome.exit_code, 1);
+        assert!(stderr(&outcome).contains("NOPE_*"), "{}", stderr(&outcome));
+        // A miss alongside a hit still restores the hit and fails overall.
+        let outcome = run(&mut state, &["restore", "NOPE_*", "API_1"]);
+        assert_eq!(outcome.exit_code, 1);
+        assert!(stdout(&outcome).contains("restored API_1=one"));
+    }
+
+    #[test]
+    fn history_and_list_filters_accept_globs() {
+        let mut state = hermetic_state();
+        record(&mut state, "export API_1=one", 0);
+        record(&mut state, "export OTHER=three", 0);
+
+        let listing = run(&mut state, &["history", "API_*"]);
+        let text = stdout(&listing);
+        assert!(text.contains("API_1"), "{text}");
+        assert!(!text.contains("OTHER"), "{text}");
+
+        assert_eq!(
+            run(&mut state, &["API_GLOB_A=1", "API_GLOB_B=2"]).exit_code,
+            0
+        );
+        let list = run(&mut state, &["list", "API_GLOB_*"]);
+        let text = stdout(&list);
+        assert_eq!(text, "API_GLOB_A=1\nAPI_GLOB_B=2\n");
     }
 
     #[test]

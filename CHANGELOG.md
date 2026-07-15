@@ -14,7 +14,9 @@ development milestone that preceded it.
   `agenv set NAME VALUE`), and unset exported environment variables, plus
   history awareness — `agenv history` lists the newest recorded
   `export`/`agenv` assignment per name and `agenv restore NAME…`/`--all`
-  re-applies them, re-expanding values with the shell's own expander at
+  re-applies them; restore selectors and history/list filters also accept
+  glob patterns (`agenv restore 'API_*'` re-applies every matching name),
+  re-expanding values with the shell's own expander at
   restore time (listing and previewing never expand anything). Non-interactive
   shells read the persistent history file without locking or compacting it.
 - Forgiving spaced assignments in `export` and `agenv`: `export XYZ = 123`,
