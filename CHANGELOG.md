@@ -9,6 +9,19 @@ development milestone that preceded it.
 
 ## [Unreleased]
 
+### Added
+- `agenv` builtin: view (`agenv`, `agenv NAME`), set (`agenv NAME=VALUE`,
+  `agenv set NAME VALUE`), and unset exported environment variables, plus
+  history awareness — `agenv history` lists the newest recorded
+  `export`/`agenv` assignment per name and `agenv restore NAME…`/`--all`
+  re-applies them, re-expanding values with the shell's own expander at
+  restore time (listing and previewing never expand anything). Non-interactive
+  shells read the persistent history file without locking or compacting it.
+- Forgiving spaced assignments in `export` and `agenv`: `export XYZ = 123`,
+  `export XYZ =123`, and `export XYZ= 123` now mean `export XYZ=123` (an agsh
+  extension; joining is rescue-only, so every form POSIX shells accept keeps
+  its exact meaning).
+
 ## [0.2.0] - 2026-07-13
 
 The first public release combines the session-resilience and developer-workflow

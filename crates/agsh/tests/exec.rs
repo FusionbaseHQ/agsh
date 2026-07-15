@@ -3841,3 +3841,119 @@ fn unsafe_temp_parent_refuses_shim_modes_before_payload_execution() {
 
     std::fs::remove_dir_all(base).unwrap();
 }
+
+fn seed_history_file(path: &Path, commands: &[&str]) {
+    let mut body = String::new();
+    for (index, command) in commands.iter().enumerate() {
+        body.push_str(&format!(
+            "{{\"command\":{command:?},\"exit_code\":0,\"started_at\":{}}}\n",
+            1_700_000_000 + index as u64
+        ));
+    }
+    std::fs::write(path, body).expect("seed history file");
+}
+
+#[test]
+fn export_accepts_spaced_assignments_end_to_end() {
+    let output = run_isolated_command(
+        "export_spaced",
+        "export XYZ = 123; echo \"v=$XYZ\"; /usr/bin/printenv XYZ",
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("v=123"), "{stdout}");
+    assert!(
+        stdout.lines().any(|line| line == "123"),
+        "child env: {stdout}"
+    );
+}
+
+#[test]
+fn agenv_sets_gets_and_lists() {
+    let output = run_isolated_command(
+        "agenv_set_get",
+        "agenv FOO=bar; agenv FOO; agenv list FOO; agenv SP = 1; agenv get SP",
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("bar\nFOO=bar\n"), "{stdout}");
+    assert!(stdout.ends_with("1\n"), "{stdout}");
+}
+
+#[test]
+fn agenv_restores_exports_from_persistent_history_without_writing_it() {
+    let base = history_test_dir("agenv_restore_all");
+    let history = base.join("history.jsonl");
+    seed_history_file(
+        &history,
+        &[
+            "export ALPHA=one",
+            "export ALPHA=two",
+            "export QUOTED=\"a b\"",
+            "export SPACED = 42",
+            "echo noise",
+        ],
+    );
+    let before = std::fs::read(&history).expect("history before");
+
+    let output = isolated_agsh(&base, &history)
+        .args([
+            "-c",
+            "agenv restore --all && echo \"A=$ALPHA Q=$QUOTED S=$SPACED\"",
+        ])
+        .output()
+        .expect("run agenv restore --all");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("restored ALPHA=two"), "{stdout}");
+    assert!(stdout.contains("A=two Q=a b S=42"), "{stdout}");
+
+    let after = std::fs::read(&history).expect("history after");
+    assert_eq!(
+        before, after,
+        "read-only history scan must not rewrite the file"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn agenv_history_and_preview_expand_nothing() {
+    let base = history_test_dir("agenv_history_preview");
+    let history = base.join("history.jsonl");
+    seed_history_file(&history, &["export SUB=$(echo ran)"]);
+
+    let output = isolated_agsh(&base, &history)
+        .args(["-c", "agenv history; agenv restore; agenv get SUB"])
+        .output()
+        .expect("run agenv history + preview");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("$(echo ran)"), "raw source shown: {stdout}");
+    assert!(stdout.contains("would restore"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SUB: not set"),
+        "listing must not set: {stderr}"
+    );
+
+    let restored = isolated_agsh(&base, &history)
+        .args(["-c", "agenv restore SUB && agenv get SUB"])
+        .output()
+        .expect("run agenv restore SUB");
+    assert_eq!(restored.status.code(), Some(0), "{restored:?}");
+    let stdout = String::from_utf8_lossy(&restored.stdout);
+    assert!(
+        stdout.ends_with("ran\n"),
+        "substitution runs at restore: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn agenv_is_a_registered_builtin_with_help() {
+    let output = run_isolated_command("agenv_type", "type agenv; help agenv");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("builtin"), "{stdout}");
+    assert!(stdout.contains("restore"), "{stdout}");
+}

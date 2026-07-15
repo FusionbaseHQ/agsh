@@ -533,11 +533,28 @@ impl HistoryStore {
         // shell is writing. Only optional compaction requires the nonblocking
         // guard, so startup never waits behind another process.
         let rewrite_guard = try_lock_history(&path).ok();
+        let loaded = Self::load_bounded(&path, max, load_limit);
+        let store = Self {
+            entries: loaded.entries,
+            path: Some(path),
+            max,
+            retained_bytes: loaded.retained_bytes,
+        };
+        // Compact a log that has outgrown the retained window down to `max`.
+        if rewrite_guard.is_some() && (loaded.needs_rewrite || loaded.total > max.saturating_mul(2))
+        {
+            store.rewrite();
+        }
+        store
+    }
+    /// Stream the (bounded) tail of `path` into memory. Shared by the
+    /// file-attached constructor and [`load_entries_read_only`]; never writes.
+    fn load_bounded(path: &Path, max: usize, load_limit: u64) -> LoadedEntries {
         let mut entries: Vec<HistoryEntry> = Vec::new();
         let mut retained_bytes = 0usize;
         let mut total = 0usize;
         let mut needs_rewrite = false;
-        if let Ok(mut file) = open_history_for_read(&path) {
+        if let Ok(mut file) = open_history_for_read(path) {
             // Read line-by-line as bytes and lossy-decode: a corrupt/non-UTF8 line
             // just fails to parse and is skipped, instead of truncating the whole
             // (newest) history the way `.lines().map_while(Result::ok)` did at the
@@ -558,11 +575,11 @@ impl HistoryStore {
                 false
             };
             if file.seek(SeekFrom::Start(start)).is_err() {
-                return Self {
+                return LoadedEntries {
                     entries,
-                    path: Some(path),
-                    max,
                     retained_bytes,
+                    total: 0,
+                    needs_rewrite: false,
                 };
             }
             let mut reader = BufReader::new(file).take(load_limit);
@@ -626,17 +643,12 @@ impl HistoryStore {
             entries.drain(0..drop);
             retained_bytes = retained_bytes.saturating_sub(dropped);
         }
-        let store = Self {
+        LoadedEntries {
             entries,
-            path: Some(path),
-            max,
             retained_bytes,
-        };
-        // Compact a log that has outgrown the retained window down to `max`.
-        if rewrite_guard.is_some() && (needs_rewrite || total > max.saturating_mul(2)) {
-            store.rewrite();
+            total,
+            needs_rewrite,
         }
-        store
     }
 
     /// Atomically rewrite the backing file with the current (bounded) entries,
@@ -747,6 +759,11 @@ impl HistoryStore {
                 let _ = file.write_all(line.as_bytes());
             }
         }
+    }
+
+    /// True when this store is attached to (and persists into) a history file.
+    pub fn is_file_backed(&self) -> bool {
+        self.path.is_some()
     }
 
     pub fn entries(&self) -> &[HistoryEntry] {
@@ -1140,6 +1157,22 @@ pub fn username() -> Option<String> {
         .ok()
         .or_else(|| std::env::var("LOGNAME").ok())
         .filter(|u| !u.trim().is_empty())
+}
+
+/// Result of streaming a history file's bounded tail into memory.
+struct LoadedEntries {
+    entries: Vec<HistoryEntry>,
+    retained_bytes: usize,
+    total: usize,
+    needs_rewrite: bool,
+}
+
+/// Read the (bounded) tail of a history file without attaching to it: no lock
+/// is taken and the file is never compacted or otherwise written. For
+/// read-only consumers — e.g. `agenv history` in a non-interactive shell,
+/// where file-backed history is deliberately never attached.
+pub fn load_entries_read_only(path: &Path, max: usize) -> Vec<HistoryEntry> {
+    HistoryStore::load_bounded(path, max.max(1), MAX_HISTORY_FILE_BYTES).entries
 }
 
 /// Default history file: `$AGSH_HISTORY_FILE`, else

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 pub mod agent;
+pub mod agenv;
 pub mod builtins;
 pub mod confine;
 pub mod executor;

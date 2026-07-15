@@ -551,6 +551,7 @@ fn builtin_description(name: &str) -> Option<&'static str> {
         "agtrace" => "inspect captured command output",
         "agtrust" => "manage agsh trust decisions",
         "agcontext" => "show project/session context for agents",
+        "agenv" => "view/set exported env vars; restore past exports from history",
         "confine" => "restrict a command to an allowlist (agent guardrail)",
         "mode" => "show or set session default modes (e.g. mode:output compact)",
         "mode:output" => "set the session default output mode",

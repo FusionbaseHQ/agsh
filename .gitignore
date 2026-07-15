@@ -12,3 +12,6 @@ __pycache__/
 /out.txt
 /confine_test.py
 crates/agsh-exec/out.txt
+
+# Local Claude Code settings
+/.claude/

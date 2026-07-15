@@ -1,0 +1,20 @@
+# RUN: %agsh %s
+# agenv basics: set (all spacing forms), get, list filter, unset diagnostics.
+export SPACED = 42
+echo "spaced=$SPACED"
+agenv FOO=bar
+agenv FOO
+agenv list FOO
+agenv WITH = "two words"
+agenv get WITH
+agenv set PAIR 7
+agenv PAIR
+agenv unset FOO
+agenv get FOO
+# CHECK: spaced=42
+# CHECK: bar
+# CHECK: FOO=bar
+# CHECK: two words
+# CHECK: 7
+# CHECKERR: agenv: FOO: not set
+# CHECKEXIT: 1

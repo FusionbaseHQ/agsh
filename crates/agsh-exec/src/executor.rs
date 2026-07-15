@@ -11044,7 +11044,10 @@ fn next_quoted_at_marker(text: &str, start: usize) -> Option<(usize, usize)> {
     None
 }
 
-fn expand_word(segments: &[WordSegment], state: &mut ShellState) -> Result<String, ShellError> {
+pub(crate) fn expand_word(
+    segments: &[WordSegment],
+    state: &mut ShellState,
+) -> Result<String, ShellError> {
     let fragments = expand_word_fragments(segments, state, false)?;
     Ok(fragments_to_string(&fragments))
 }

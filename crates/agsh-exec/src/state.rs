@@ -1134,6 +1134,10 @@ pub struct ShellState {
     abbreviations: BTreeMap<String, String>,
     functions: BTreeMap<String, ShellFunction>,
     history: Arc<Mutex<HistoryStore>>,
+    /// When the history store is not file-backed (non-interactive shells),
+    /// read-only history consumers may additionally read the persistent
+    /// history file. Unit tests disable this to stay hermetic.
+    history_read_fallback: bool,
     path_cache: PathCache,
     path_cache_value: Option<String>,
     last_status: i32,
@@ -1338,6 +1342,7 @@ impl ShellState {
             abbreviations: BTreeMap::new(),
             functions: BTreeMap::new(),
             history: Arc::new(Mutex::new(HistoryStore::in_memory())),
+            history_read_fallback: true,
             path_cache: PathCache::default(),
             path_cache_value: None,
             last_status: 0,
@@ -3536,6 +3541,34 @@ impl ShellState {
             .lock()
             .map(|s| s.entries().to_vec())
             .unwrap_or_default()
+    }
+
+    /// History entries for read-only consumers (`agenv history` / `agenv
+    /// restore`), oldest first. Interactive shells attach the file-backed
+    /// store, which already holds everything. Non-interactive shells never
+    /// attach — and must never compact — the persistent file, so it is read
+    /// without locking or writing, and this session's in-memory entries are
+    /// appended as the newest.
+    pub fn history_entries_for_reading(&self) -> Vec<HistoryEntry> {
+        let (file_backed, mut in_memory) = match self.history.lock() {
+            Ok(store) => (store.is_file_backed(), store.entries().to_vec()),
+            Err(_) => (false, Vec::new()),
+        };
+        if file_backed || !self.history_read_fallback {
+            return in_memory;
+        }
+        let mut entries = history::default_history_path()
+            .map(|path| history::load_entries_read_only(&path, 50_000))
+            .unwrap_or_default();
+        entries.append(&mut in_memory);
+        entries
+    }
+
+    /// Keep unit tests hermetic: never read the developer's real history file
+    /// through the non-interactive fallback.
+    #[cfg(test)]
+    pub(crate) fn disable_history_read_fallback_for_test(&mut self) {
+        self.history_read_fallback = false;
     }
 
     /// The most recent command beginning with `prefix`, for autosuggestion.

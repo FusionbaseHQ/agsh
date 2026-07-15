@@ -75,6 +75,7 @@ pub fn builtin_names() -> &'static [&'static str] {
         "agtrust",
         "agview",
         "agcontext",
+        "agenv",
         "peek",
         "agpatch",
         "risk",
@@ -517,6 +518,7 @@ pub fn is_builtin(name: &str) -> bool {
             | "agz"
             | "agjump"
             | "agcontext"
+            | "agenv"
             | "peek"
             | "agpeek"
             | "agpatch"
@@ -562,6 +564,7 @@ Sandbox
   pty CMD                 run CMD under a pseudo-terminal
 
 Agent & workflow tools
+  agenv [NAME[=VALUE]]    view / set exported env vars; restore past exports from history
   history search QUERY    search native history by scope/mode; Ctrl-R opens the picker
   sessions [N]            list / resume the Claude & Codex sessions for this folder
   resume [list | N]       restore the shell state of a session that died (crash/HUP)
@@ -591,6 +594,7 @@ agsnapshot). Type `help <command>` for usage and examples.
 /// Detailed, example-driven help for one agsh command; `None` for unknown names.
 fn help_topic(name: &str) -> Option<&'static str> {
     Some(match name {
+        "agenv" => crate::agenv::AGENV_HELP,
         "mode" | "mode:output" | "mode:intercept" => {
             "\
 mode — control, for the session, how command output is presented to an agent.
@@ -926,6 +930,7 @@ pub fn run_builtin(
         "trap" => Ok(builtin_trap(args, state)),
         "declare" | "typeset" => Ok(builtin_declare(args, state)),
         "agcontext" => Ok(crate::agent::context(args, state)),
+        "agenv" => Ok(crate::agenv::builtin_agenv(args, state)),
         "agpeek" | "peek" => Ok(crate::agent::peek(args, state)),
         "agrisk" | "risk" => Ok(crate::agent::risk(args, state)),
         "agsnapshot" | "snapshot" => Ok(crate::agent::snapshot(args, state)),
@@ -2194,7 +2199,9 @@ fn builtin_export(args: &[String], state: &mut ShellState) -> Result<CommandOutc
         }
         operand_start += 1;
     }
-    let operands = &args[operand_start..];
+    // Forgiving spacing: `export XYZ = 123` / `XYZ =123` / `XYZ= 123` mean
+    // `XYZ=123` (an agsh extension; POSIX shells reject the stray tokens).
+    let operands = coalesce_spaced_assignments(&args[operand_start..]);
     if print && operands.is_empty() {
         let mut out = String::new();
         for key in state.exported_variable_names() {
@@ -2207,7 +2214,7 @@ fn builtin_export(args: &[String], state: &mut ShellState) -> Result<CommandOutc
 
     let mut stderr = String::new();
     let mut status = 0;
-    for arg in operands {
+    for arg in &operands {
         if let Some((key, value)) = arg.split_once('=') {
             if !is_identifier(key) {
                 stderr.push_str(&format!("export: {arg}: not a valid identifier\n"));
@@ -3190,7 +3197,7 @@ fn render_history_command(command: &str, index: usize, total: usize, theme: &The
     }
 }
 
-fn ago(started_at: u64) -> String {
+pub(crate) fn ago(started_at: u64) -> String {
     let now = epoch_secs_now();
     let secs = now.saturating_sub(started_at);
     if secs < 60 {
@@ -4396,7 +4403,7 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-fn is_identifier(text: &str) -> bool {
+pub(crate) fn is_identifier(text: &str) -> bool {
     let mut chars = text.chars();
     match chars.next() {
         Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
@@ -4405,8 +4412,167 @@ fn is_identifier(text: &str) -> bool {
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
+/// `NAME=…` with a valid identifier before the first `=`.
+pub(crate) fn is_assignment_word(word: &str) -> bool {
+    word.split_once('=')
+        .is_some_and(|(name, _)| is_identifier(name))
+}
+
+/// Join spaced assignment operands — `NAME = VALUE`, `NAME =VALUE`,
+/// `NAME= VALUE` — into single `NAME=VALUE` words for `export` and `agenv`.
+/// Joining is rescue-only: a sequence is coalesced only when the stray token
+/// would otherwise be rejected as "not a valid identifier", so every form
+/// that already works keeps its exact meaning (e.g. `export A= B` still means
+/// "A is empty, and export B").
+pub(crate) fn coalesce_spaced_assignments(operands: &[String]) -> Vec<String> {
+    let mut joined = Vec::with_capacity(operands.len());
+    let mut i = 0;
+    while i < operands.len() {
+        let word = &operands[i];
+        let next = operands.get(i + 1);
+        if is_identifier(word) {
+            match next {
+                // `NAME = VALUE` (a lone `=` is never a valid operand).
+                Some(eq) if eq == "=" => {
+                    let value = operands.get(i + 2).map(String::as_str).unwrap_or("");
+                    joined.push(format!("{word}={value}"));
+                    i += if operands.len() > i + 2 { 3 } else { 2 };
+                    continue;
+                }
+                // `NAME =VALUE` (a word starting with `=` is never valid).
+                Some(eq_value) if eq_value.starts_with('=') => {
+                    joined.push(format!("{word}{eq_value}"));
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        } else if let Some((name, "")) = word.split_once('=') {
+            // `NAME= VALUE`: join only when VALUE would otherwise be an
+            // error, so `export A= B` keeps meaning "A is empty, export B".
+            if is_identifier(name) {
+                if let Some(value) = next {
+                    if !is_identifier(value)
+                        && !is_assignment_word(value)
+                        && !value.starts_with('=')
+                        && value != "--"
+                    {
+                        joined.push(format!("{word}{value}"));
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+        }
+        joined.push(word.clone());
+        i += 1;
+    }
+    joined
+}
+
 fn shell_single_quote(value: &str) -> String {
     value.replace('\'', "'\\''")
+}
+
+#[cfg(test)]
+mod export_spacing_tests {
+    use super::*;
+
+    fn owned(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    fn run_export(state: &mut ShellState, args: &[&str]) -> CommandOutcome {
+        builtin_export(&owned(args), state).expect("export runs")
+    }
+
+    #[test]
+    fn spaced_assignment_forms_all_set_and_export() {
+        let mut state = ShellState::from_current_process();
+        for (args, name, value) in [
+            (vec!["SPACED_A", "=", "1"], "SPACED_A", "1"),
+            (vec!["SPACED_B", "=2"], "SPACED_B", "2"),
+            (vec!["SPACED_C=", "3x"], "SPACED_C", "3x"),
+            (vec!["SPACED_D=4"], "SPACED_D", "4"),
+        ] {
+            let outcome = run_export(&mut state, &args);
+            assert_eq!(
+                outcome.exit_code,
+                0,
+                "{args:?}: {}",
+                String::from_utf8_lossy(&outcome.stderr)
+            );
+            assert_eq!(state.lookup(name), Some(value), "{args:?}");
+            assert!(state.is_exported(name), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn spaced_value_with_spaces_comes_from_one_token() {
+        let mut state = ShellState::from_current_process();
+        // As typed: export MSG = "hello world" (the quotes made one token).
+        let outcome = run_export(&mut state, &["MSG", "=", "hello world"]);
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(state.lookup("MSG"), Some("hello world"));
+    }
+
+    #[test]
+    fn currently_valid_forms_keep_their_meaning() {
+        let mut state = ShellState::from_current_process();
+        assert!(state.try_set_var("KEEP_B", "b-value"));
+        // `export A= KEEP_B` still means: A is empty, and KEEP_B is exported.
+        let outcome = run_export(&mut state, &["A=", "KEEP_B"]);
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(state.lookup("A"), Some(""));
+        assert!(state.is_exported("KEEP_B"));
+        assert_eq!(state.lookup("KEEP_B"), Some("b-value"));
+    }
+
+    #[test]
+    fn trailing_spaced_equals_sets_empty_value() {
+        let mut state = ShellState::from_current_process();
+        let outcome = run_export(&mut state, &["EMPTY_X", "="]);
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(state.lookup("EMPTY_X"), Some(""));
+        assert!(state.is_exported("EMPTY_X"));
+    }
+
+    #[test]
+    fn lone_equals_without_a_name_still_errors() {
+        let mut state = ShellState::from_current_process();
+        let outcome = run_export(&mut state, &["=", "1"]);
+        assert_eq!(outcome.exit_code, 1);
+        assert!(String::from_utf8_lossy(&outcome.stderr).contains("not a valid identifier"));
+    }
+
+    #[test]
+    fn coalescing_is_rescue_only() {
+        assert_eq!(
+            coalesce_spaced_assignments(&owned(&["A", "=", "1"])),
+            ["A=1"]
+        );
+        assert_eq!(coalesce_spaced_assignments(&owned(&["A", "=1"])), ["A=1"]);
+        assert_eq!(coalesce_spaced_assignments(&owned(&["A=", "1"])), ["A=1"]);
+        assert_eq!(coalesce_spaced_assignments(&owned(&["A", "="])), ["A="]);
+        // Valid today, so never joined:
+        assert_eq!(
+            coalesce_spaced_assignments(&owned(&["A=", "B"])),
+            ["A=", "B"]
+        );
+        assert_eq!(
+            coalesce_spaced_assignments(&owned(&["A=", "B=2"])),
+            ["A=", "B=2"]
+        );
+        assert_eq!(
+            coalesce_spaced_assignments(&owned(&["A=1", "B=2"])),
+            ["A=1", "B=2"]
+        );
+        // Sequences join independently.
+        assert_eq!(
+            coalesce_spaced_assignments(&owned(&["A", "=", "1", "B", "=2", "C=3"])),
+            ["A=1", "B=2", "C=3"]
+        );
+    }
 }
 
 #[cfg(test)]

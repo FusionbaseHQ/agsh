@@ -220,6 +220,7 @@ agview photo.png                 # inline images (iTerm2/Kitty/WezTerm/Ghostty,
                                  #   truecolor half-blocks everywhere else)
 semantic git status              # what your agent would see
 sessions                         # Claude/Codex sessions in this folder — resumable
+agenv restore --all              # re-apply the exports you've made before, from history
 ```
 
 Non-interactive use works everywhere immediately: `agsh -c 'echo hello'`.
