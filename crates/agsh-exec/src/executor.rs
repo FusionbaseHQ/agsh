@@ -10386,6 +10386,11 @@ fn expand_invocation(
             .argv
             .first()
             .is_some_and(|a| a.starts_with("((") && a.ends_with("))"));
+    // `agenv` operands are variable names and glob *selectors* (`agenv
+    // restore API_*`), never filenames: suppress pathname expansion so a
+    // matching file in cwd (e.g. AGENTS.md for `A*`) cannot hijack the
+    // pattern. Parameters, quotes, and word-splitting expand as usual.
+    let pathname_glob = invocation.argv.first().map(String::as_str) != Some("agenv");
     let mut argv = Vec::new();
     for (index, arg) in invocation.argv.iter().enumerate() {
         // Input process substitution `<(cmd)` -> a temp-file path.
@@ -10401,7 +10406,11 @@ fn expand_invocation(
         if no_split {
             argv.push(expand_word(&segments, state)?);
         } else {
-            argv.extend(expand_word_segments_to_argv_fields(&segments, state)?);
+            argv.extend(expand_word_segments_to_argv_fields_with_pathname_glob(
+                &segments,
+                state,
+                pathname_glob,
+            )?);
         }
     }
 
@@ -10426,6 +10435,14 @@ fn expand_word_segments_to_argv_fields(
     segments: &[WordSegment],
     state: &mut ShellState,
 ) -> Result<Vec<String>, ShellError> {
+    expand_word_segments_to_argv_fields_with_pathname_glob(segments, state, true)
+}
+
+fn expand_word_segments_to_argv_fields_with_pathname_glob(
+    segments: &[WordSegment],
+    state: &mut ShellState,
+    pathname_glob: bool,
+) -> Result<Vec<String>, ShellError> {
     let expanded_fields = expand_argument_fields(segments, state)?;
     let brace_expanded = if has_unquoted_brace(segments) {
         expanded_fields
@@ -10448,7 +10465,7 @@ fn expand_word_segments_to_argv_fields(
 
     let mut fields = Vec::new();
     for field in brace_expanded {
-        if !state.noglob() && field.has_active_glob() {
+        if pathname_glob && !state.noglob() && field.has_active_glob() {
             let opts = GlobOpts {
                 globstar: state.shopt("globstar"),
                 dotglob: state.shopt("dotglob"),

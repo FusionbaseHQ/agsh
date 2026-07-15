@@ -3967,8 +3967,11 @@ fn agenv_restore_accepts_glob_selectors() {
         &["export API_1=one", "export API_2=two", "export OTHER=three"],
     );
 
-    // Quoted and unquoted: with no matching files in cwd the unexpanded
-    // pattern reaches the builtin, like bash's default no-match behavior.
+    // A file matching the pattern sits in cwd: pathname expansion is
+    // suppressed for agenv arguments, so the unquoted pattern still reaches
+    // the builtin instead of becoming the filename.
+    std::fs::write(base.join("API_NOTES.md"), "decoy").expect("create decoy file");
+
     for pattern in ["'API_*'", "API_*"] {
         let source =
             format!("agenv restore {pattern} && echo \"a=$API_1 b=$API_2 o=${{OTHER:-unset}}\"");
@@ -3983,6 +3986,11 @@ fn agenv_restore_accepts_glob_selectors() {
         assert!(
             stdout.contains("a=one b=two o=unset"),
             "{pattern}: {stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("API_NOTES.md"),
+            "{pattern}: filename hijacked the pattern: {stderr}"
         );
     }
     let _ = std::fs::remove_dir_all(base);

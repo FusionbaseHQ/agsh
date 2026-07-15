@@ -15,7 +15,8 @@ development milestone that preceded it.
   history awareness — `agenv history` lists the newest recorded
   `export`/`agenv` assignment per name and `agenv restore NAME…`/`--all`
   re-applies them; restore selectors and history/list filters also accept
-  glob patterns (`agenv restore 'API_*'` re-applies every matching name),
+  glob patterns (`agenv restore API_*` re-applies every matching name — no
+  quoting needed, since agenv arguments are never pathname-expanded),
   re-expanding values with the shell's own expander at
   restore time (listing and previewing never expand anything). Non-interactive
   shells read the persistent history file without locking or compacting it.

@@ -28,7 +28,8 @@ agenv — view, set, and restore exported environment variables.
   agenv history [FILTER]    assignments recorded in history, newest per name
                             (FILTER: substring, or a glob like `API_*`)
   agenv restore NAME …      re-apply the recorded assignment for NAME
-  agenv restore 'API_*'     glob selectors re-apply every matching name
+  agenv restore API_*       glob selectors re-apply every matching name (no
+                            quoting needed: agenv args never match filenames)
   agenv restore --all       re-apply every recorded assignment (newest per name)
   agenv restore             preview what `agenv restore --all` would re-apply
 
