@@ -9,6 +9,12 @@ development milestone that preceded it.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-04
+
+The first public release combines the session-resilience and developer-workflow
+features prepared during private development with the production-hardening and
+release-integrity work required to ship them.
+
 ### Added
 - `agenv` builtin: view (`agenv`, `agenv NAME`), set (`agenv NAME=VALUE`,
   `agenv set NAME VALUE`), and unset exported environment variables, plus
@@ -24,12 +30,6 @@ development milestone that preceded it.
   `export XYZ =123`, and `export XYZ= 123` now mean `export XYZ=123` (an agsh
   extension; joining is rescue-only, so every form POSIX shells accept keeps
   its exact meaning).
-
-## [0.2.0] - 2026-07-13
-
-The first public release combines the session-resilience and developer-workflow
-features prepared during private development with the production-hardening and
-release-integrity work required to ship them.
 
 ### Security
 - Make kernel confinement fail closed when its backend is unavailable, validate
