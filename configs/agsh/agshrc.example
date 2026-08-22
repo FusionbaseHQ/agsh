@@ -6,6 +6,9 @@ export PATH="$HOME/.local/bin:$PATH"
 alias ll="ls -la"
 alias gs="git status"
 
-set output.human.mode = "raw"
-set output.agent.mode = "semantic"
-set prompt.git = true
+# `set` manages shell options/positionals; output selection uses the `mode`
+# builtin. Raw is already the default, so this line is illustrative and safe.
+mode:output raw
+
+# For a one-shot agent invocation, prefer an explicit environment setting:
+# AGSH_OUTPUT_MODE=semantic agsh -c 'cargo test'

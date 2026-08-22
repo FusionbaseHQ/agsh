@@ -5,7 +5,7 @@
 **A resilient shell for persistent sessions and structured agent workflows.**
 
 [![CI](https://github.com/FusionbaseHQ/agsh/actions/workflows/ci.yml/badge.svg)](https://github.com/FusionbaseHQ/agsh/actions/workflows/ci.yml)
-[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-8b949e.svg)](#install-in-60-seconds)
 [![Rust](https://img.shields.io/badge/built%20with-Rust%2C%20unsafe%20isolated-f74c00.svg)](#-safe-by-construction)
 
@@ -16,6 +16,14 @@ that outlive terminal disconnects, and lower-token agent observations.
 </div>
 
 ---
+
+> **Release status: pre-1.0 preview.** The command executor, raw stream paths,
+> output layer, and keep broker have broad macOS/Linux test coverage, but agsh is
+> not yet a drop-in replacement for every POSIX/Bash script or a cross-platform
+> security boundary. Full terminal job control, Linux kernel confinement, the
+> authenticated agent server, and wider OS/terminal qualification remain open.
+> See the [implementation status](docs/IMPLEMENTATION_PLAN.md) and
+> [security model](docs/SECURITY_MODEL.md) before depending on it in production.
 
 ```console
 ~/api ❯ agsh --keep
@@ -130,7 +138,7 @@ and semantic observations compose it with family compactors and retained raw
 references; clean, silent, and rich modes retain their distinct behavior. Rules
 stay configurable through the same `[[compactor]]` TOML format.
 
-### 🛡️ A sandbox you can actually enforce
+### 🛡️ Confinement that fails closed
 
 ```sh
 confine read-only  -- python analyze.py   # read+run; deny writes/network/common credential paths
@@ -169,11 +177,11 @@ autosuggestions, reverse search.
 
 ## Install in 60 seconds
 
-**Release assets** target macOS 11+ arm64/x86_64 and Ubuntu
-22.04+ x86_64/arm64; release qualification currently runs on macOS 15 and
-Ubuntu 22.04, so older macOS versions are not yet part of the tested support
-matrix. The Linux shell is static musl. The installer verifies checksums, needs
-no sudo, and targets `~/.local/bin`. Archives also contain
+**Tagged release assets** use a macOS 11 deployment target for arm64/x86_64 and
+an Ubuntu 22.04 build baseline for x86_64/arm64. The qualified support matrix is
+currently macOS 15 and Ubuntu 22.04; older macOS versions are best-effort until
+they are exercised in CI. The Linux shell is static musl. The installer verifies
+checksums, needs no sudo, and targets `~/.local/bin`. Archives also contain
 the optional deep-interception library; on Linux that library targets the Ubuntu
 22.04 glibc baseline while the shell binary remains static:
 
@@ -251,7 +259,7 @@ default = "compact"   # interactive sessions only
 
 Session defaults apply to **interactive** sessions only — `agsh -c`, scripts,
 and pipes stay `raw`, so automation is never silently transformed. Secrets are
-redacted from observations by default (`[security]` in the config).
+redacted from observations by default (`[security]` in `token.toml`).
 
 </details>
 
@@ -274,8 +282,9 @@ Three independent layers (see [docs/SESSIONS.md](docs/SESSIONS.md)):
 
 The layers compose: a kept session still journals, so after broker/host death
 `resume` can recover the state records that reached durable storage.
-Per-job logs rotate, but old job logs and the daemon log do not yet have a
-global retention ceiling; broker storage requires operator cleanup over time.
+Broker process and disk ceilings are described in
+[docs/SESSIONS.md](docs/SESSIONS.md); retained output is operational scrollback,
+not permanent storage.
 
 </details>
 
@@ -349,7 +358,10 @@ decision.
 
 ## The promises
 
-1. **Normal commands run normally.** No silent rewrites, ever.
+1. **Common external commands stay external.** Tools such as `ls`, `git`, and
+   `cargo` resolve through `PATH` rather than hidden native replacements.
+   Remaining shell-compatibility gaps are tracked explicitly; unsupported
+   syntax must fail visibly instead of silently rewriting command behavior.
 2. **Pipes and redirects receive exact bytes.** Observation modes affect only
    displayed observations; automatic rich rendering is additionally TTY-gated.
 3. **Supported captured commands give agents structure; retained raw remains
@@ -377,7 +389,8 @@ decision.
 
 Copyright © 2026 Fusionbase and the `agsh` contributors.
 
-Licensed under the **GNU Affero General Public License v3.0** — see
+Licensed under the **GNU Affero General Public License v3.0 only
+(`AGPL-3.0-only`)** — see
 [`LICENSE`](LICENSE). The AGPL's network-use clause (section 13) applies: if
 you run a modified version of `agsh` and let users interact with it over a
 network, you must offer them the corresponding source. Contributions are

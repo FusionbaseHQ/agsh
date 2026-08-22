@@ -38,6 +38,22 @@ builtin, `AGSH_OUTPUT_MODE`, interactive `token.toml`, then `raw`. Noninteractiv
 overridden. There is no agent server yet, so `[mode].agent_default` does not
 currently select a protocol-session default.
 
+For one-shot CLI execution, each completed command-list item is presented before
+its traps and before the next item starts. A semantic or compact list can
+therefore emit multiple consecutive observations instead of one whole-list
+observation; this preserves chronology when raw wrappers and trap handlers are
+mixed with captured siblings. The executor's library `CommandOutcome` remains
+an aggregate with the original raw stdout/stderr and status. Presentation bytes
+are tracked privately and never replace those raw fields.
+
+The outermost synchronous output wrapper owns presentation through functions,
+`eval`, sourced code, control structures, and shell pipeline worker threads.
+Nested wrappers cannot escape that policy. Command substitution, process
+substitution, pipes, and redirects remain raw data planes, so an inner
+`lossless-ref` on one of those planes does not require observation trace
+storage. Background jobs intentionally start a new shell process and do not
+inherit the caller's in-process wrapper policy.
+
 A top-level graph containing a parsed asynchronous-list `&` currently forces
 `raw` for the whole graph. Capturing and replaying each job at a later `wait`
 would change launch-time descriptor routing and output chronology, while an
@@ -89,21 +105,28 @@ the capturing process, such a cutoff is marked incomplete even when every byte
 seen before handoff was stored. If the trusted helper cannot be launched, the
 reader keeps draining to real EOF rather than closing the pipe and changing the
 descendant's behavior; command completion may therefore wait in that degraded
-case. Nested, non-spooled compound output has a hard
-64 MiB aggregate memory ceiling and fails explicitly rather than growing an
-unbounded buffer; disk-backed exact segments retain bounded in-memory previews.
+case, and the reader keeps its admission until EOF. Nested, non-spooled compound
+output and its pending private presentation share a hard 64 MiB aggregate
+memory ceiling and fail explicitly rather than growing an unbounded buffer. A
+raw presentation cannot silently double that resident cap; disk-backed exact
+segments retain bounded in-memory previews.
 
 These helpers are safety drains, not structured asynchronous collectors. Each
 worker owns exactly one retained stream and discards only bytes produced after
 capture cutoff. A command whose descendants retain both stdout and stderr can
 therefore leave two fixed-buffer workers alive until kernel EOF, potentially for
-the descendant's full lifetime. This process-per-retained-stream cost is a
-documented pre-1.0 limitation. There is no global admission bound yet, so
-repeated commands with indefinitely retained descriptors can create an
-unbounded aggregate number of live workers. A session-wide supervised drain
-service should eventually replace them. This does not make compact or semantic
-capture generally available for parsed asynchronous graphs, which still use
-the raw fallback.
+the descendant's full lifetime. A shell admits at most 64 active capture drains,
+counting both capture readers and acknowledged workers. Admission is reserved
+when the reader is created and the same reservation moves to its worker only
+after the readiness acknowledgement. The 65th captured stream therefore fails
+setup explicitly instead of running and later waiting forever at a saturated
+handoff; already-started pipeline stages are terminated and reaped. Capacity
+rejection publishes no observation or complete raw reference, and its temporary
+spool is discarded. The limit never evicts a worker or closes an already-admitted
+live pipe. This process-per-retained-stream fallback remains a pre-1.0
+limitation, and a session-wide supervised drain service should eventually
+replace it. The drain cap does not make compact or semantic capture generally
+available for parsed asynchronous graphs, which still use the raw fallback.
 
 Recovery is intentionally finite. The in-session trace index retains 200
 commands. The persisted directory defaults to 512 files (roughly 256 commands)

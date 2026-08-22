@@ -1,3 +1,5 @@
+# DESIGN REFERENCE — NOT LOADED by agsh 0.2. The `confine` implementation uses
+# explicit built-in presets; there is no policy-file loader yet.
 [policy]
 name = "agent.workspace"
 principal_glob = "agent.*"

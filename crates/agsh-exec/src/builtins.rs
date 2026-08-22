@@ -70,6 +70,7 @@ pub fn builtin_names() -> &'static [&'static str] {
         // the real tool); conflict-free ones keep the clean bare name.
         "agtrace",
         "pty",
+        "agpty",
         "agz",
         "agjump",
         "agtrust",
@@ -514,11 +515,14 @@ pub fn is_builtin(name: &str) -> bool {
             | "["
             | "[["
             | "agtrace"
+            | "pty"
+            | "agpty"
             | "agtrust"
             | "agz"
             | "agjump"
             | "agcontext"
             | "agenv"
+            | "agview"
             | "peek"
             | "agpeek"
             | "agpatch"
@@ -803,8 +807,9 @@ are limited to 4 MiB per stream and 30 seconds.
         }
         "pty" => {
             "\
-pty CMD — run CMD under a pseudo-terminal, so tools that check for a TTY (color,
-interactive prompts, progress bars) behave as they would in a real terminal.
+pty CMD — capture CMD through a pseudo-terminal, so output-only tools that check
+for a TTY can emit color or progress output. Interactive input forwarding is not
+implemented; piped or fd-0 redirected input is rejected before CMD starts.
 "
         }
         "agmath" => {
@@ -3976,8 +3981,8 @@ fn builtin_type(args: &[String], state: &ShellState) -> Result<CommandOutcome, S
                 out.push_str(&format!("{arg} is abbreviated to {value}\n"))
             }
             CommandResolution::Plugin(name) => out.push_str(&format!("{name} is an agsh plugin\n")),
-            CommandResolution::NotFound(name) => {
-                err.push_str(&format!("agsh: type: {name}: not found\n"));
+            CommandResolution::NotExecutable(_) | CommandResolution::NotFound(_) => {
+                err.push_str(&format!("agsh: type: {arg}: not found\n"));
                 exit_code = 1;
             }
         }
@@ -4176,7 +4181,7 @@ fn command_description(
         } else {
             resolved
         }),
-        CommandResolution::NotFound(_) => None,
+        CommandResolution::NotExecutable(_) | CommandResolution::NotFound(_) => None,
     }
 }
 

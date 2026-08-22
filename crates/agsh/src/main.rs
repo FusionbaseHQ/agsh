@@ -698,7 +698,13 @@ fn run_attach(id: Option<&str>) -> i32 {
         Some(id) => id.to_string(),
         None => {
             // Pick the newest detached session; list the rest if ambiguous.
-            let jobs = client.list().unwrap_or_default();
+            let jobs = match client.list() {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    eprintln!("agsh: --attach: cannot list kept sessions: {error}");
+                    return 1;
+                }
+            };
             let mut detached: Vec<_> = jobs
                 .iter()
                 .filter(|j| j.kind == agsh_broker::JobKind::Session && j.running && !j.attached)
@@ -730,23 +736,16 @@ fn finish_session_attach(client: &agsh_broker::Client, id: &str) -> i32 {
             eprintln!("agsh: detached — session [{id}] keeps running (`agsh --attach {id}`)");
             0
         }
-        Ok(agsh_broker::AttachOutcome::Ended) => {
-            // Stream closed: session exit, or another terminal took the attach
-            // over (last attach wins) — the session's status tells them apart.
-            match client.status(id) {
-                Ok(info) if info.running => {
-                    eprintln!(
-                        "agsh: attach taken over by another terminal — session [{id}] keeps \
-                         running (`agsh --attach {id}`)"
-                    );
-                    0
-                }
-                status => {
-                    let code = status.ok().and_then(|info| info.exit_code).unwrap_or(0);
-                    eprintln!("agsh: kept session [{id}] ended (code {code})");
-                    code
-                }
-            }
+        Ok(agsh_broker::AttachOutcome::TakenOver) => {
+            eprintln!(
+                "agsh: attach taken over by another terminal — session [{id}] keeps \
+                 running (`agsh --attach {id}`)"
+            );
+            0
+        }
+        Ok(agsh_broker::AttachOutcome::Exited(code)) => {
+            eprintln!("agsh: kept session [{id}] ended (code {code})");
+            code
         }
         Err(error) => {
             eprintln!("agsh: attach: {error}");
@@ -1029,28 +1028,12 @@ fn run_one_inner(
     state: &mut ShellState,
     options: &ExecutionOptions,
 ) -> Result<i32, agsh_core::ShellError> {
-    // `agview <files>` is sugar for rendering files by type: run `cat` over them in
-    // the rich display mode. Otherwise honor a per-command output-mode wrapper
-    // (e.g. `semantic git diff`, `raw npm test`).
-    let (mode_override, effective_line): (Option<OutputMode>, String) =
-        if let Some(rest) = view_target(line) {
-            (Some(OutputMode::Rich), format!("cat -- {rest}"))
-        } else {
-            let (mode, rest) = peel_output_mode(line);
-            (mode, rest.to_string())
-        };
-    let mut effective_options = match mode_override {
-        // A per-command wrapper (`compact ls`, `raw npm test`) wins outright.
-        Some(output_mode) => ExecutionOptions {
-            output_mode,
-            allow_process_replacement: options.allow_process_replacement,
-        },
-        // Otherwise use the session default — the runtime `mode` builtin can
-        // change it mid-session; falls back to the startup mode.
-        None => ExecutionOptions {
-            output_mode: state.default_output_mode().unwrap_or(options.output_mode),
-            allow_process_replacement: options.allow_process_replacement,
-        },
+    // Use the session default unless the executor encounters an invocation-level
+    // wrapper (`semantic cmd`, `agview file`, and so on). Keeping wrappers in the
+    // command graph makes them work uniformly in lists and nested shell sources.
+    let mut effective_options = ExecutionOptions {
+        output_mode: state.default_output_mode().unwrap_or(options.output_mode),
+        allow_process_replacement: options.allow_process_replacement,
     };
 
     // `clear`/`reset` exist only to emit terminal-control escapes to the TTY. A
@@ -1059,12 +1042,12 @@ fn run_one_inner(
     // terminal, run a standalone terminal-control command raw so it actually works.
     if effective_options.output_mode.should_capture()
         && std::io::stdout().is_terminal()
-        && is_terminal_control_line(&effective_line)
+        && is_terminal_control_line(line)
     {
         effective_options.output_mode = OutputMode::Raw;
     }
 
-    let graph = parse_line(&effective_line)?;
+    let graph = parse_line(line)?;
     let outcome = executor.run_graph(&graph, state, &effective_options)?;
     print_captured_if_needed(&outcome, &effective_options)?;
     Ok(outcome.exit_code)
@@ -1093,33 +1076,6 @@ fn is_terminal_control_line(line: &str) -> bool {
         ),
         _ => false,
     }
-}
-
-/// If `line` is an `agview` command, return the file arguments (possibly empty).
-/// `agview` renders its files by type in the rich display mode. (Prefixed because
-/// bare `view` is vim's read-only mode on most systems.)
-fn view_target(line: &str) -> Option<&str> {
-    let trimmed = line.trim();
-    if trimmed == "agview" {
-        return Some("");
-    }
-    trimmed.strip_prefix("agview ").map(str::trim)
-}
-
-/// Peel a leading output-mode keyword used as a per-command wrapper. Returns the
-/// requested mode (if the first whitespace-separated token names a mode and is
-/// followed by a command) and the remaining command line.
-fn peel_output_mode(line: &str) -> (Option<OutputMode>, &str) {
-    let trimmed = line.trim_start();
-    if let Some((first, rest)) = trimmed.split_once(char::is_whitespace) {
-        if let Ok(mode) = OutputMode::from_str(first) {
-            let rest = rest.trim_start();
-            if !rest.is_empty() {
-                return (Some(mode), rest);
-            }
-        }
-    }
-    (None, line)
 }
 
 fn run_capture_drain() -> i32 {

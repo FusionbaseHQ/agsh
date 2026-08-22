@@ -1,3 +1,5 @@
+# DESIGN REFERENCE — NOT LOADED by agsh 0.2. Runtime configuration currently
+# consists of token.toml plus the interactive agshrc; see docs/CONFIGURATION.md.
 [shell]
 default_mode = "native"
 posix_compat = true

@@ -13,6 +13,36 @@ use crate::protocol::{
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn invalid_job_state(info: &JobInfo, detail: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "broker returned invalid state for job {}: {detail}",
+            info.id
+        ),
+    )
+}
+
+fn validate_job_info(info: JobInfo) -> std::io::Result<JobInfo> {
+    if info.running && info.exit_code.is_some() {
+        return Err(invalid_job_state(&info, "running job has an exit code"));
+    }
+    if !info.running && info.exit_code.is_none() {
+        return Err(invalid_job_state(
+            &info,
+            "finished job is missing exit code",
+        ));
+    }
+    if info.attached && !info.running {
+        return Err(invalid_job_state(&info, "finished job is marked attached"));
+    }
+    Ok(info)
+}
+
+fn validate_job_list(jobs: Vec<JobInfo>) -> std::io::Result<Vec<JobInfo>> {
+    jobs.into_iter().map(validate_job_info).collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct Client {
     socket: PathBuf,
@@ -92,7 +122,7 @@ impl Client {
     pub fn spawn_job(&self, spec: SpawnSpec) -> std::io::Result<JobInfo> {
         let request = Request::Spawn(spec);
         match self.roundtrip(&request)? {
-            Response::Job { info } => Ok(info),
+            Response::Job { info } => validate_job_info(info),
             Response::Err { message } => Err(std::io::Error::other(message)),
             other => Err(std::io::Error::other(format!(
                 "unexpected broker reply: {other:?}"
@@ -102,7 +132,7 @@ impl Client {
 
     pub fn list(&self) -> std::io::Result<Vec<JobInfo>> {
         match self.roundtrip(&Request::List)? {
-            Response::Jobs { jobs } => Ok(jobs),
+            Response::Jobs { jobs } => validate_job_list(jobs),
             Response::Err { message } => Err(std::io::Error::other(message)),
             other => Err(std::io::Error::other(format!(
                 "unexpected broker reply: {other:?}"
@@ -111,8 +141,25 @@ impl Client {
     }
 
     pub fn status(&self, id: &str) -> std::io::Result<JobInfo> {
-        match self.roundtrip(&Request::Status { id: id.into() })? {
-            Response::Job { info } => Ok(info),
+        self.status_with_attach_token(id, None)
+    }
+
+    /// Resolve a terminal attach EOF even if normal finished-record pruning
+    /// removed the job before this status round trip.
+    pub fn status_after_attach(&self, id: &str, token: u64) -> std::io::Result<JobInfo> {
+        self.status_with_attach_token(id, Some(token))
+    }
+
+    fn status_with_attach_token(
+        &self,
+        id: &str,
+        attach_token: Option<u64>,
+    ) -> std::io::Result<JobInfo> {
+        match self.roundtrip(&Request::Status {
+            id: id.into(),
+            attach_token,
+        })? {
+            Response::Job { info } => validate_job_info(info),
             Response::Err { message } => Err(std::io::Error::other(message)),
             other => Err(std::io::Error::other(format!(
                 "unexpected broker reply: {other:?}"
@@ -187,7 +234,7 @@ impl Client {
         rows: u16,
         cols: u16,
         replay: u64,
-    ) -> std::io::Result<(UnixStream, JobInfo)> {
+    ) -> std::io::Result<(UnixStream, JobInfo, u64)> {
         let stream = self.connect()?;
         stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
         stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
@@ -221,15 +268,59 @@ impl Client {
         }
         let header: Response = serde_json::from_slice(&line).map_err(std::io::Error::other)?;
         match header {
-            Response::Attached { info } => {
+            Response::Attached { info, token } => {
+                let info = validate_job_info(info)?;
+                if !info.running {
+                    return Err(invalid_job_state(&info, "attached job is not running"));
+                }
                 stream.set_read_timeout(None)?;
                 stream.set_write_timeout(None)?;
-                Ok((stream, info))
+                Ok((stream, info, token))
             }
             Response::Err { message } => Err(std::io::Error::other(message)),
             other => Err(std::io::Error::other(format!(
                 "unexpected broker reply: {other:?}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::JobKind;
+
+    fn invalid_info(running: bool, exit_code: Option<i32>) -> JobInfo {
+        JobInfo {
+            id: "k1".into(),
+            kind: JobKind::Job,
+            title: "invalid state".into(),
+            cwd: "/".into(),
+            pid: 42,
+            started_at: 1,
+            running,
+            exit_code,
+            attached: false,
+            log: "/tmp/k1.log".into(),
+        }
+    }
+
+    #[test]
+    fn status_rejects_a_finished_job_without_an_exit_code() {
+        let error = validate_job_info(invalid_info(false, None)).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("missing exit code"), "{error}");
+    }
+
+    #[test]
+    fn list_rejects_a_running_job_with_an_exit_code() {
+        let error = validate_job_list(vec![invalid_info(true, Some(0))]).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("running job has an exit code"),
+            "{error}"
+        );
     }
 }

@@ -1,4 +1,10 @@
-# Config schema draft
+# Future config schema (design draft)
+
+> **Not implemented in agsh 0.2.** This document describes a possible future
+> general/project policy schema. agsh does not load `config.toml`, policy TOML,
+> or project-local token configuration today. The active runtime contract is
+> [`docs/CONFIGURATION.md`](../docs/CONFIGURATION.md): user `token.toml`, an
+> interactive `agshrc`, environment variables, and explicit builtins/flags.
 
 ## User config
 
@@ -35,12 +41,11 @@ project_config_requires_trust = true
 agent_default_policy = "agent.workspace"
 ```
 
-## Token config
+## Proposed project token config
 
 Path:
 
 ```text
-~/.config/agsh/token.toml
 ./.agsh/token.toml
 ```
 
@@ -48,10 +53,11 @@ See `docs/TOKEN_ECONOMY.md`.
 
 ## Project trust
 
-Project-local startup files must require explicit trust:
+Any future project-local configuration must require explicit trust. Proposed
+syntax (not an available 0.2 command) was:
 
 ```sh
-agsh trust project
+agsh trust project  # proposed only
 ```
 
 Trust records should include:

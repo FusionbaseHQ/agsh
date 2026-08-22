@@ -36,10 +36,15 @@ private and broker control sockets verify peer UID, but same-UID processes are
 inside this trust boundary. Journal appends are best effort and not transactional;
 `resume` must not be used to preserve or re-establish a security policy.
 
-Broker control frames, connection count, tail responses, and per-job log
-generations are bounded. The total number of running/retained jobs, accumulated
-old job logs, and daemon-log bytes are not globally bounded yet; see
-[`SESSIONS.md`](SESSIONS.md) for current limits and cleanup requirements.
+Broker control frames, connection count, tail responses, running jobs, retained
+finished records, and per-job log generations are bounded. Pruning and explicit
+removal attempt to delete the corresponding logs; pruning still removes excess
+records if an unlink fails, and a generation lock protects the bounded startup
+sweep of prior-generation logs. Token-scoped post-attach exit statuses are also
+bounded. The daemon log is checked and reopened from the serialized accept loop,
+with one bounded diagnostic of possible overshoot, and retained broker state has
+no time-based expiry. See
+[`SESSIONS.md`](SESSIONS.md) for exact limits.
 
 ### Risk analysis and command-name confinement
 

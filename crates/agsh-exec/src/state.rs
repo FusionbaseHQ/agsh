@@ -2194,6 +2194,10 @@ impl ShellState {
         self.streaming_stdout.is_none()
     }
 
+    pub(crate) fn streaming_stdin_is_some(&self) -> bool {
+        self.streaming_stdin.is_some()
+    }
+
     /// A clone of the downstream pipe writer when this scope streams stdout to a
     /// pipeline consumer, so a leaf external can write straight to the pipe
     /// (backpressure + SIGPIPE on early close) instead of being captured. `None`
@@ -3660,21 +3664,7 @@ fn job_exit_status(status: std::process::ExitStatus) -> i32 {
 }
 
 fn cached_executable_exists(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    agsh_compat::is_executable_file(path)
 }
 
 fn is_positional_name(name: &str) -> bool {

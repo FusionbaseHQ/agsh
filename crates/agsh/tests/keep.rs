@@ -11,6 +11,57 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agsh_broker::{Client, JobKind, SpawnSpec};
 
+fn isolated_agsh(base: &std::path::Path) -> Command {
+    let home = base.join("home");
+    std::fs::create_dir_all(&home).expect("create isolated HOME");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agsh"));
+    command
+        .current_dir(base)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", base.join("xdg-config"))
+        .env("XDG_DATA_HOME", base.join("xdg-data"))
+        .env("XDG_STATE_HOME", base.join("xdg-state"))
+        .env("AGSH_HISTORY_FILE", base.join("history.jsonl"))
+        .env("AGSH_TRUST_FILE", base.join("trust.jsonl"))
+        .env("AGSH_SESSION_DIR", base.join("sessions"))
+        .env("AGSH_TRACE_DIR", base.join("traces"))
+        .env("AGSH_NORC", "1")
+        .env_remove("AGSH_BROKER_SOCKET")
+        .env_remove("AGSH_CONFINE")
+        .env_remove("AGSH_CONFINE_AGENTS")
+        .env_remove("AGSH_CONFINE_ALLOW_AGENTS")
+        .env_remove("AGSH_CONFINE_RUNTIME")
+        .env_remove("AGSH_ICONS")
+        .env_remove("AGSH_INTERCEPT")
+        .env_remove("AGSH_INTERCEPT_ACTIVE")
+        .env_remove("AGSH_INTERCEPT_MODE")
+        .env_remove("AGSH_KEEP_ID")
+        .env_remove("AGSH_KEPT")
+        .env_remove("AGSH_OUTPUT_MODE")
+        .env_remove("AGSH_RC")
+        .env_remove("AGSH_RESUME_BANNER")
+        .env_remove("AGSH_SELF")
+        .env_remove("AGSH_SESSION")
+        .env_remove("AGSH_THEME_FILE")
+        .env_remove("AGSH_TOKEN_CONFIG")
+        .env_remove("AGSH_TRACE_DIR_CAP")
+        .env_remove("BASH_ENV")
+        .env_remove("DYLD_INSERT_LIBRARIES")
+        .env_remove("ENV")
+        .env_remove("LD_PRELOAD")
+        .env_remove("NO_COLOR")
+        .env_remove("ZDOTDIR");
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(agsh_output::is_sensitive_env_name)
+        {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 fn broker_runtime_available() -> bool {
     let stamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -43,7 +94,7 @@ impl Daemon {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        let child = isolated_agsh(&dir)
             .arg("--broker-daemon")
             .env("AGSH_BROKER_DIR", &dir)
             .stdin(Stdio::null())
@@ -99,6 +150,27 @@ impl Drop for Daemon {
     }
 }
 
+/// Cleanup for daemon processes launched through `--broker-launch`, where the
+/// launcher intentionally exits and therefore cannot be reaped by this test.
+struct DetachedDaemonGuard {
+    dir: PathBuf,
+    client: Client,
+}
+
+impl DetachedDaemonGuard {
+    fn new(dir: PathBuf) -> Self {
+        let client = Client::at(dir.join("agshd.sock"));
+        Self { dir, client }
+    }
+}
+
+impl Drop for DetachedDaemonGuard {
+    fn drop(&mut self) {
+        let _ = self.client.shutdown();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 #[test]
 fn broker_spawns_lists_logs_and_tracks_exit() {
     if !broker_runtime_available() {
@@ -122,9 +194,90 @@ fn broker_spawns_lists_logs_and_tracks_exit() {
     // Listed among jobs; removable once finished.
     let jobs = daemon.client.list().expect("list");
     assert!(jobs.iter().any(|j| j.id == info.id));
+    let log = std::path::PathBuf::from(&info.log);
+    let old_log = log.with_extension("log.old");
+    assert!(log.exists(), "current job log must exist before removal");
+    std::fs::write(&old_log, b"rotated generation").unwrap();
     daemon.client.remove(&info.id).expect("remove");
     let jobs = daemon.client.list().expect("list");
     assert!(!jobs.iter().any(|j| j.id == info.id));
+    assert!(!log.exists(), "keep rm must delete the current job log");
+    assert!(!old_log.exists(), "keep rm must delete the rotated job log");
+}
+
+#[test]
+fn pruning_finished_records_deletes_their_log_generations() {
+    if !broker_runtime_available() {
+        return;
+    }
+    let daemon = Daemon::start("prune-logs");
+    let first = daemon.spawn_sh("exit 0");
+    assert_eq!(daemon.wait_exit(&first.id), 0);
+    let first_log = std::path::PathBuf::from(&first.log);
+    let first_old_log = first_log.with_extension("log.old");
+    std::fs::write(&first_old_log, b"rotated generation").unwrap();
+
+    // The broker retains 20 finished records. Fill that allowance plus the
+    // first record; completion prunes the oldest record immediately.
+    for _ in 0..20 {
+        let info = daemon.spawn_sh("exit 0");
+        assert_eq!(daemon.wait_exit(&info.id), 0);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while daemon.client.status(&first.id).is_ok() {
+        assert!(Instant::now() < deadline, "oldest record was not pruned");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!first_log.exists(), "pruning must delete the current log");
+    assert!(
+        !first_old_log.exists(),
+        "pruning must delete the rotated log"
+    );
+}
+
+#[test]
+fn attached_exit_status_survives_finished_record_pruning() {
+    if !broker_runtime_available() {
+        return;
+    }
+    use std::io::{Read, Write};
+
+    let daemon = Daemon::start("attach-prune");
+    let target = daemon.spawn_sh("read line; exit 37");
+    let (mut stream, _, token) = daemon
+        .client
+        .attach_stream(&target.id, 24, 80, 4096)
+        .expect("attach target");
+
+    // Fill the finished-record allowance while the older attached target is
+    // still running. Once it exits, it is immediately the oldest prune victim.
+    for _ in 0..21 {
+        let info = daemon.spawn_sh("exit 0");
+        assert_eq!(daemon.wait_exit(&info.id), 0);
+    }
+
+    stream.write_all(b"go\n").expect("release target");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).expect("terminal EOF");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while daemon.client.status(&target.id).is_ok() {
+        assert!(Instant::now() < deadline, "attached record was not pruned");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let terminal = daemon
+        .client
+        .status_after_attach(&target.id, token)
+        .expect("authoritative attached exit status");
+    assert_eq!(terminal.exit_code, Some(37));
+    assert!(daemon
+        .client
+        .status_after_attach(&target.id, token)
+        .is_err());
 }
 
 #[test]
@@ -242,7 +395,7 @@ fn attach_streams_output_and_forwards_input() {
         std::thread::sleep(Duration::from_millis(25));
     }
 
-    let (stream, attached) = daemon
+    let (stream, attached, _) = daemon
         .client
         .attach_stream(&info.id, 24, 80, 64 * 1024)
         .expect("attach");
@@ -304,16 +457,17 @@ fn autostart_launches_a_daemon_on_demand() {
     let dir = std::env::temp_dir().join(format!("agshb_auto_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let cleanup = DetachedDaemonGuard::new(dir.clone());
 
     // `--broker-launch` under an isolated broker dir: run it as agsh would.
-    let status = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let status = isolated_agsh(&dir)
         .arg("--broker-launch")
         .env("AGSH_BROKER_DIR", &dir)
         .status()
         .expect("run broker-launch");
     assert!(status.success(), "launcher must exit 0");
 
-    let client = Client::at(dir.join("agshd.sock"));
+    let client = cleanup.client.clone();
     let deadline = Instant::now() + Duration::from_secs(5);
     while client.ping().is_err() {
         assert!(
@@ -324,7 +478,7 @@ fn autostart_launches_a_daemon_on_demand() {
     }
     // A second launch must not spawn a second daemon (bind fails; original
     // still answers).
-    let status = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let status = isolated_agsh(&dir)
         .arg("--broker-launch")
         .env("AGSH_BROKER_DIR", &dir)
         .status()
@@ -334,7 +488,6 @@ fn autostart_launches_a_daemon_on_demand() {
     client.ping().expect("original daemon still answers");
 
     client.shutdown().expect("shutdown");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The Phase-2 property, end to end through the builtin: a `keep`-spawned job
@@ -348,12 +501,13 @@ fn keep_builtin_job_survives_the_spawning_shell() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let agsh = |cmd: &str| {
-        Command::new(env!("CARGO_BIN_EXE_agsh"))
+        isolated_agsh(&dir)
             .args(["-c", cmd])
             .env("AGSH_BROKER_DIR", &dir)
             .output()
             .expect("run agsh")
     };
+    let cleanup = DetachedDaemonGuard::new(dir.clone());
 
     // Shell #1 spawns a kept job and EXITS (non-TTY ⇒ spawn detached).
     let out = agsh("keep -- sh -c 'echo builtin-probe; sleep 30'");
@@ -389,7 +543,7 @@ fn keep_builtin_job_survives_the_spawning_shell() {
     // Kill it, confirm the exit is tracked, and clean up.
     let out = agsh(&format!("keep kill {id} KILL"));
     assert_eq!(out.status.code(), Some(0));
-    let client = Client::at(dir.join("agshd.sock"));
+    let client = cleanup.client.clone();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let info = client.status(&id).expect("status");
@@ -402,7 +556,6 @@ fn keep_builtin_job_survives_the_spawning_shell() {
     }
     let out = agsh("keep stop");
     assert_eq!(out.status.code(), Some(0));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Last attach wins: a second client taking over hangs up the first WITHOUT
@@ -417,7 +570,7 @@ fn attach_takeover_hangs_up_the_previous_client_only() {
     let daemon = Daemon::start("steal");
     let info = daemon.spawn_sh("echo takeover-ready; exec cat");
 
-    let (first, _) = daemon
+    let (first, _, _) = daemon
         .client
         .attach_stream(&info.id, 24, 80, 4096)
         .expect("first attach");
@@ -426,7 +579,7 @@ fn attach_takeover_hangs_up_the_previous_client_only() {
         .set_read_timeout(Some(Duration::from_millis(100)))
         .expect("timeout");
 
-    let (_second, attached) = daemon
+    let (_second, attached, _) = daemon
         .client
         .attach_stream(&info.id, 24, 80, 4096)
         .expect("second attach");

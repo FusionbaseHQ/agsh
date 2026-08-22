@@ -7,12 +7,17 @@
 # with the `mode` builtin (`mode:output compact`, `mode:output off`, `mode` shows all).
 # Modes: raw | clean | compact | semantic | lossless-ref | silent | rich
 # default = "compact"
+# Compatibility fallback used when `default` is absent.
 human_default = "raw"
-agent_default = "semantic"
-ci_default = "raw"
+# Reserved for the planned authenticated agent server and CI profiles; parsed
+# for forward compatibility but they do not select a mode in agsh 0.2.
+# agent_default = "semantic"
+# ci_default = "raw"
 
 [storage]
 store_raw = true
+# Reserved in 0.2: parsed for forward compatibility, but age-based deletion is
+# not enforced. Active retention is bounded by file count and total bytes.
 raw_retention = "14d"
 # Combined persisted stdout + stderr per command. b/kb/mb/gb use binary units;
 # values above the hard 1 GiB ceiling are clamped.

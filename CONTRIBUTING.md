@@ -42,5 +42,5 @@ python3 tests/interactive/run.py                  # PTY editor/completion/render
 
 ## Licensing of contributions
 
-`agsh` is licensed under the **GNU AGPL-3.0** (see [`LICENSE`](LICENSE)). By
+`agsh` is licensed under **GNU AGPL-3.0-only** (see [`LICENSE`](LICENSE)). By
 submitting a contribution, you agree that it is licensed under the same terms.

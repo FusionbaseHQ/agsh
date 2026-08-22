@@ -1,16 +1,23 @@
 # Configuration
 
-`agsh` reads its configuration from `~/.config/agsh/`. Everything has a sensible
-default; nothing is required. Example files live in [`configs/agsh/`](../configs/agsh).
+In 0.2, `agsh` has two active file-based configuration surfaces: output/session
+settings in `token.toml`, and interactive shell commands in `agshrc`. Everything
+has a sensible default; neither file is required. Examples and future design
+references live in [`configs/agsh/`](../configs/agsh).
 
 ## Files
 
-| File                        | Purpose                                             |
-| --------------------------- | --------------------------------------------------- |
-| `~/.config/agsh/token.toml` | output modes and token-economy defaults             |
-| `~/.config/agsh/config.toml`| general shell settings                              |
-| `~/.config/agsh/policies/`  | `confine`/allowlist policy files                    |
-| `~/.config/agsh/agshrc`     | **startup rc** — sourced at interactive startup (aliases, functions, prompt, `export`s, `mode:…`) |
+| File | 0.2 status | Purpose |
+| --- | --- | --- |
+| `~/.config/agsh/token.toml` | Active | output, trace-storage, session-banner, normalization, redaction, and compactor settings |
+| `~/.config/agsh/agshrc` | Active | interactive startup commands: aliases, functions, hooks, exports, and `mode:…` |
+| `~/.config/agsh/config.toml` | Design reference only | proposed general shell settings; **not loaded** |
+| `~/.config/agsh/policies/` | Design reference only | proposed policy files; **not loaded** |
+
+The last two example paths are intentionally checked in for design discussion,
+not as accepted runtime input. Built-in `confine` presets and explicit command
+flags are the current enforcement interface. Unknown files under the config
+directory have no effect.
 
 ### Startup rc file
 
@@ -33,7 +40,7 @@ Only **interactive** sessions source it — `agsh -c …`, scripts, and piped in
 not, so scripted behavior is never affected. Skip it with `--norc` (or
 `AGSH_NORC=1`). A syntax error in the rc is reported but never blocks startup.
 
-Copy an example to get started:
+Copy the active token configuration example to get started:
 
 ```sh
 mkdir -p ~/.config/agsh
@@ -57,7 +64,7 @@ Every command can be rendered in a mode. Priority, highest first:
 default = "compact"   # applies to interactive sessions only
 ```
 
-The config / `mode` default applies to **interactive** sessions only.
+The token config / `mode` default applies to **interactive** sessions only.
 Non-interactive `agsh -c` and scripts stay `raw` unless `--output` or
 `AGSH_OUTPUT_MODE` explicitly selects an observation mode, so automation is not
 silently transformed by interactive configuration.
@@ -215,15 +222,20 @@ startup:
 | one session-journal record / file / decoded event count | 1 MiB / 64 MiB / 16,384 |
 | broker JSON control line / active connections / control I/O | 4 MiB / 64 / 5 seconds |
 | broker tail response / per-job log generations | 16 MiB / two approximately 8 MiB files |
+| broker running jobs / retained finished records | 64 / 20 |
+| prior-generation broker logs retained at startup | 20 job IDs and 128 MiB |
+| daemon log rotation | 1 MiB, checked on accept / one old generation |
+| active captured streams / detached capture-drain helpers per shell | 64 shared admissions / at most 64 processes |
 
 External commands, pipes, and redirections still stream raw bytes without
 passing through these buffers. The in-memory capture limit applies only where
 shell semantics require the complete output as a value; exceeding it is an
 explicit execution error instead of an unbounded allocation.
 
-Broker limits are per request or per job. There is currently no global cap on
-running jobs, accumulated old job logs, or the daemon log; see
-[`SESSIONS.md`](SESSIONS.md) for the same-UID trust and cleanup boundary.
+Broker running/retained-job limits are daemon-wide. Job-log cleanup is tied to
+record pruning/removal and a generation-locked startup sweep. Retention has no
+time-based expiry; see [`SESSIONS.md`](SESSIONS.md) for daemon-log overshoot and
+the same-UID trust boundary.
 
 ## Environment variables
 

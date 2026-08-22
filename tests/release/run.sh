@@ -7,6 +7,13 @@ ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/agsh-release-test.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
+for manifest in "$ROOT"/crates/*/Cargo.toml; do
+    grep -F -x -q 'rust-version.workspace = true' "$manifest" || {
+        printf 'release tests: %s does not inherit workspace rust-version\n' "$manifest" >&2
+        exit 1
+    }
+done
+
 for tag in v0.2.0-rc.1 v0.2.0+build.1; do
     if (cd "$ROOT" && scripts/validate-release.sh "$tag") \
         >"$TMP/out" 2>"$TMP/err"

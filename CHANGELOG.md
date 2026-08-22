@@ -4,14 +4,15 @@ All notable changes to `agsh` are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-`0.2.0` is the first public release. The `0.1.0` section records a private
-development milestone that preceded it.
+`0.2.0` is the first supported public pre-1.0 preview. The historical `v0.1.0`
+tag records an unsupported development preview; it was not a production-ready
+release.
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-08-04
+## [0.2.0] - 2026-08-22
 
-The first public release combines the session-resilience and developer-workflow
+The first supported public preview combines the session-resilience and developer-workflow
 features prepared during private development with the production-hardening and
 release-integrity work required to ship them.
 
@@ -36,8 +37,9 @@ release-integrity work required to ship them.
   private state and trace paths without following symlinks, and remove inherited
   secret-bearing variables from confined child environments.
 - Bound agent/broker protocol frames, command capture, process substitution,
-  history records, trace files, and aggregate trace retention. Per-job broker
-  logs rotate, but aggregate broker-log/job retention remains a documented gap.
+  history records, trace files, aggregate trace retention, live capture-drain
+  helpers, running kept jobs, retained broker job logs, and daemon-log
+  generations.
 - Treat truncated, unavailable, or disabled raw storage as incomplete:
   exact-trace APIs refuse partial data and semantic observations distinguish a
   capped trace, a persistence failure, and a configured opt-out.
@@ -49,6 +51,22 @@ release-integrity work required to ship them.
   requested mode when provisioning fails instead of running with partial policy.
 
 ### Hardening fixes
+- Resolve PATH executables using effective-ID access checks, continue past an
+  inaccessible earlier candidate, revalidate cached paths after permission
+  changes, and consistently return 126 for existing non-executable commands.
+- Move output wrappers and `agview` into structured executor dispatch so they
+  compose inside lists, functions, `eval`, and sourced scripts while pipes and
+  redirects retain exact raw bytes; align `agview`/`pty`/`agpty` introspection.
+- Treat broker attach/list/status transport failures and inconsistent finished
+  state as errors instead of success; cap concurrent kept jobs, prune orphaned
+  logs at startup, delete logs with records, and continuously rotate daemon
+  diagnostics.
+- Make the shipped rc template executable shell syntax, label inactive general
+  config/policy files as design references, and isolate every binary integration
+  launch from the maintainer's real HOME/XDG/history/trust/session state.
+- Reserve one of 64 capture-drain admissions before each captured stream starts
+  and transfer it to an acknowledged helper, so saturation fails explicitly
+  during setup instead of waiting forever after the direct child exits.
 - Correct quoting and expansion across here-documents, parameter operators,
   nested `$@`/`$*`, temporary assignments, exported/read-only variables, and
   associative-array keys; add focused golden and differential regressions.
@@ -107,7 +125,8 @@ release-integrity work required to ship them.
   prepare the installer itself for checksummed, attested publication.
 - Add lockfile-fresh third-party license notices, rtk Apache-2.0 attribution,
   weekly Cargo/Actions Dependabot updates, and explicit non-publishable Cargo
-  package metadata for the GitHub-release-only workspace.
+  package metadata, including the workspace minimum Rust version, for the
+  GitHub-release-only workspace.
 - Prepare checksummed, attested AGPL Corresponding Source with the exact tagged
   project tree and locked vendored Rust dependencies; rebuild it with kernel-
   denied network access, require immutable stable release tags, and revalidate

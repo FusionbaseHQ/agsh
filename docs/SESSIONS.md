@@ -179,12 +179,28 @@ contract, never an accident.
 Broker clients are same-UID peers, not separately authenticated principals.
 Control traffic is capped at 64 concurrent connections and 4 MiB per JSON line,
 with 5-second control I/O deadlines; one tail response is capped at 16 MiB.
-Logs and job environments are unredacted and may contain secrets. Each job log
-rotates locally, but old jobs' logs, the daemon log, and the number of running
-jobs have no aggregate count/byte/age ceiling. `keep rm` removes the job record,
-not its log files, so long-lived installations need external cleanup until
-global retention is implemented. Logging is best effort and is not fsynced for
-every write.
+Logs and job environments are unredacted and may contain secrets. Running jobs
+have a hard daemon-wide ceiling of 64. Each job log rotates at approximately
+8 MiB with one old generation; only the newest 20 finished records remain, and
+pruning or a successful `keep rm` deletes both log generations. Pruning keeps
+the record count bounded even if an unlink fails, reports the cleanup error in
+the daemon log or request response, and leaves the startup orphan sweep a later
+cleanup attempt. A daemon generation holds a private advisory lock, so startup
+cleanup remains safe even if a live daemon's socket pathname was manually
+removed. After acquiring that lock, startup retains at most the newest 20 orphan
+job IDs and 128 MiB from the
+prior generation; exact-name symlink entries are unlinked without following
+them and an unexpected non-regular log fails startup. The daemon log rotates at
+1 MiB with one old generation; the serialized accept loop is its runtime
+rotation/reopen checkpoint, so one bounded diagnostic may overshoot the
+threshold before the next connection. Recognized job-output storage is thus
+bounded by the 20-ID / 128 MiB startup window plus at most 64 running and 20
+finished jobs, each with two approximately 8 MiB generations. There is no
+time-based expiry. Logging and cleanup are best effort and are not fsynced for
+every write. A job-log
+write/rotation failure disables further disk logging for that job rather than
+discarding the byte ceiling; PTY draining and bounded in-memory scrollback keep
+running.
 
 ## Boundaries (what this does not do)
 
@@ -200,7 +216,16 @@ have a 250 ms deadline: if a client freezes or stops consuming output, the
 broker drops that attachment and continues draining the PTY into its bounded
 scrollback and rotating log. The process keeps running and can be reattached;
 a persistently slow client may therefore be detached rather than allowed to
-stall the job.
+stall the job. Client input blocked by a full PTY also has a 250 ms deadline;
+the attachment is dropped and the error is recorded in the daemon log instead
+of holding the controller lock forever. Once the direct child has been reaped,
+new attaches, input, resize, and signal requests fail deterministically rather
+than targeting a potentially reused PID or process group.
+
+Attach EOF is resolved with a token-scoped terminal-status response. This status
+survives immediate pruning of the ordinary finished record; up to 64 unclaimed
+attach statuses are retained, after which the oldest expires and its client gets
+an explicit status error instead of a guessed exit code.
 
 The broker currently represents `cwd` as a JSON string. A requested UTF-8 cwd
 must exist and be an openable directory or spawning fails explicitly; it never

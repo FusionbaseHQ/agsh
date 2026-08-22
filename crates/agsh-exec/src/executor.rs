@@ -9,15 +9,15 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agsh_compat::{CommandResolution, Resolver};
 use agsh_core::{
-    lexer::lex, parse_line, Assignment, CommandGraph, CommandInvocation, CommandListItem,
-    ListOperator, Pipeline, QuoteKind, RedirectionMode, RedirectionTarget, ShellError,
-    ShellErrorKind, Value, WordSegment, INLINE_HEREDOC_PREFIX,
+    lexer::lex, parse_line, Assignment, CommandGraph, CommandId, CommandInvocation,
+    CommandListItem, ListOperator, Pipeline, QuoteKind, RedirectionMode, RedirectionTarget,
+    ShellError, ShellErrorKind, Value, WordSegment, INLINE_HEREDOC_PREFIX,
 };
 use agsh_output::{
     finalize_trace_status, render_observation_with_raw_ref, CompactionContext, ObservationStreams,
@@ -37,13 +37,36 @@ const MAX_IN_MEMORY_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_AGGREGATE_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_READ_LINE_BYTES: usize = 1024 * 1024;
 const MAX_PTY_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
-const BACKGROUND_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
+// Applied independently to each blocking snapshot write and acknowledgement
+// read. Ten seconds proved too tight when multiple full test suites launched
+// child shells concurrently; either operation still fails closed after 30
+// seconds without progress and reaps the child.
+const BACKGROUND_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
 const POST_CHILD_CAPTURE_DRAIN_BYTES: usize = 16 * 1024 * 1024;
 const POST_CHILD_CAPTURE_DRAIN_TIME: Duration = Duration::from_millis(100);
 const CAPTURE_DRAIN_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+/// Shared by capture readers and the acknowledged workers they hand off to, so
+/// capacity cannot disappear only after a direct child has already exited.
+const MAX_CAPTURE_DRAIN_WORKERS: usize = 64;
+const NOT_EXECUTABLE_ERROR_CODE: &str = "agsh::execution::not_executable";
 pub const CAPTURE_DRAIN_READY: u8 = 0xa7;
 
 static CAPTURE_DRAIN_HELPER: OnceLock<PathBuf> = OnceLock::new();
+static ACTIVE_CAPTURE_DRAIN_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+std::thread_local! {
+    static POST_CHILD_THREAD_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static LAST_POST_CHILD_PID: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+    static FORCE_CAPTURE_ADMISSION_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static SHELL_STAGE_THREAD_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static LAST_SHELL_PIPELINE_CHILD_PIDS: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// Register the trusted executable used to detach a reader for descriptors
 /// retained by descendants after their direct parent exits.
@@ -58,11 +81,38 @@ enum CaptureDrainHandoff {
     Ambiguous,
 }
 
-fn capture_drain_reaper() -> Option<&'static mpsc::Sender<Child>> {
-    static REAPER: OnceLock<Option<mpsc::Sender<Child>>> = OnceLock::new();
+struct CaptureDrainAdmission {
+    active: &'static AtomicUsize,
+}
+
+impl Drop for CaptureDrainAdmission {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_capture_drain_slot(
+    active: &'static AtomicUsize,
+    limit: usize,
+) -> Option<CaptureDrainAdmission> {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < limit).then_some(current + 1)
+        })
+        .ok()?;
+    Some(CaptureDrainAdmission { active })
+}
+
+struct ReapedCaptureDrain {
+    child: Child,
+    admission: CaptureDrainAdmission,
+}
+
+fn capture_drain_reaper() -> Option<&'static mpsc::Sender<ReapedCaptureDrain>> {
+    static REAPER: OnceLock<Option<mpsc::Sender<ReapedCaptureDrain>>> = OnceLock::new();
     REAPER
         .get_or_init(|| {
-            let (sender, receiver) = mpsc::channel::<Child>();
+            let (sender, receiver) = mpsc::channel::<ReapedCaptureDrain>();
             std::thread::Builder::new()
                 .name("agsh-capture-drain-reaper".to_string())
                 .spawn(move || {
@@ -76,13 +126,14 @@ fn capture_drain_reaper() -> Option<&'static mpsc::Sender<Child>> {
                         while let Ok(child) = receiver.try_recv() {
                             children.push(child);
                         }
-                        children.retain_mut(|child| match child.try_wait() {
-                            Ok(Some(_)) => false,
-                            Ok(None) => true,
-                            Err(_) => {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                                false
+                        children.retain_mut(|worker| {
+                            match try_wait_child_retry(&mut worker.child) {
+                                Ok(Some(_)) => false,
+                                Ok(None) => true,
+                                Err(_) => {
+                                    terminate_child(&mut worker.child);
+                                    false
+                                }
                             }
                         });
                     }
@@ -93,19 +144,42 @@ fn capture_drain_reaper() -> Option<&'static mpsc::Sender<Child>> {
         .as_ref()
 }
 
+fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+fn try_wait_child_retry(child: &mut Child) -> io::Result<Option<ExitStatus>> {
+    retry_interrupted(|| child.try_wait())
+}
+
+fn wait_child_retry(child: &mut Child) -> io::Result<ExitStatus> {
+    retry_interrupted(|| child.wait())
+}
+
+fn terminate_child(child: &mut Child) {
+    let _ = retry_interrupted(|| child.kill());
+    let _ = wait_child_retry(child);
+}
+
 fn terminate_capture_drain_worker(child: &mut Child) {
     if let Some(pgid) = rustix::process::Pid::from_raw(child.id() as i32) {
         let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    terminate_child(child);
 }
 
 fn launch_capture_drain_worker(
     helper: &Path,
     reader: OwnedFd,
     timeout: Duration,
+    admission: &mut Option<CaptureDrainAdmission>,
 ) -> CaptureDrainHandoff {
+    debug_assert!(admission.is_some());
     let Ok((mut acknowledgement, acknowledge_writer)) = io::pipe() else {
         return CaptureDrainHandoff::Unavailable;
     };
@@ -137,8 +211,17 @@ fn launch_capture_drain_worker(
                     terminate_capture_drain_worker(&mut worker);
                     return CaptureDrainHandoff::Ambiguous;
                 };
-                if let Err(mpsc::SendError(mut worker)) = reaper.send(worker) {
+                let Some(worker_admission) = admission.take() else {
                     terminate_capture_drain_worker(&mut worker);
+                    return CaptureDrainHandoff::Ambiguous;
+                };
+                let worker = ReapedCaptureDrain {
+                    child: worker,
+                    admission: worker_admission,
+                };
+                if let Err(mpsc::SendError(mut worker)) = reaper.send(worker) {
+                    terminate_capture_drain_worker(&mut worker.child);
+                    *admission = Some(worker.admission);
                     return CaptureDrainHandoff::Ambiguous;
                 }
                 return CaptureDrainHandoff::Transferred;
@@ -148,19 +231,21 @@ fn launch_capture_drain_worker(
                 return CaptureDrainHandoff::Ambiguous;
             }
             Ok(_) => unreachable!(),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => match worker.try_wait() {
-                Ok(Some(_)) | Err(_) => {
-                    terminate_capture_drain_worker(&mut worker);
-                    return CaptureDrainHandoff::Ambiguous;
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                match try_wait_child_retry(&mut worker) {
+                    Ok(Some(_)) | Err(_) => {
+                        terminate_capture_drain_worker(&mut worker);
+                        return CaptureDrainHandoff::Ambiguous;
+                    }
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(None) => {
+                        terminate_capture_drain_worker(&mut worker);
+                        return CaptureDrainHandoff::Ambiguous;
+                    }
                 }
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Ok(None) => {
-                    terminate_capture_drain_worker(&mut worker);
-                    return CaptureDrainHandoff::Ambiguous;
-                }
-            },
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => {
                 terminate_capture_drain_worker(&mut worker);
@@ -196,6 +281,17 @@ pub struct CommandOutcome {
     exact_stderr: Option<Vec<ExactTraceSegment>>,
     stdout_preview_complete: bool,
     stderr_preview_complete: bool,
+    /// An invocation-level output wrapper already chose the presentation mode.
+    /// Enclosing graphs must not apply their session/default mode a second time.
+    explicit_output_mode: bool,
+    explicit_presentation_mode: Option<OutputMode>,
+    /// Display bytes are kept separate from raw command stdout/stderr so
+    /// compaction can never become pipeline, redirect, or library data.
+    presented: Option<Box<PresentedStreams>>,
+    /// This outcome's CLI presentation was already selected (and may already
+    /// have been emitted). Enclosing graphs must not observe or print it again.
+    presentation_handled: bool,
+    observation_plan: Option<Box<ObservationPlan>>,
     /// Emission order across the two logical streams. Byte ranges refer to the
     /// current `stdout`/`stderr` buffers and let an enclosing compound redirection
     /// merge them without collapsing all stdout ahead of all stderr.
@@ -229,6 +325,12 @@ struct InheritedCaptureRouting {
     stderr: CaptureDestination,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WrapperPolicy {
+    mode: OutputMode,
+    capture_outputs: bool,
+}
+
 impl InheritedCaptureRouting {
     const DEFAULT: Self = Self {
         stdout: CaptureDestination::Stdout,
@@ -245,6 +347,8 @@ std::thread_local! {
     static INHERITED_CAPTURE_ROUTING: std::cell::RefCell<InheritedCaptureRouting> =
         const { std::cell::RefCell::new(InheritedCaptureRouting::DEFAULT) };
     static STREAM_RAW_TO_PARENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ACTIVE_WRAPPER_POLICY: std::cell::Cell<Option<WrapperPolicy>> =
+        const { std::cell::Cell::new(None) };
     static CANCELLABLE_SHELL_STAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -288,6 +392,31 @@ fn with_stream_raw_to_parent<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
     let previous = STREAM_RAW_TO_PARENT.with(|current| current.replace(enabled));
     let _guard = StreamRawToParentGuard(previous);
     run()
+}
+
+struct WrapperPolicyGuard(Option<WrapperPolicy>);
+
+impl Drop for WrapperPolicyGuard {
+    fn drop(&mut self) {
+        ACTIVE_WRAPPER_POLICY.with(|current| current.set(self.0));
+    }
+}
+
+fn active_wrapper_policy() -> Option<WrapperPolicy> {
+    ACTIVE_WRAPPER_POLICY.with(std::cell::Cell::get)
+}
+
+fn with_wrapper_policy<T>(policy: WrapperPolicy, run: impl FnOnce() -> T) -> T {
+    let previous = ACTIVE_WRAPPER_POLICY.with(|current| current.replace(Some(policy)));
+    let _guard = WrapperPolicyGuard(previous);
+    run()
+}
+
+fn with_inherited_wrapper_policy<T>(policy: Option<WrapperPolicy>, run: impl FnOnce() -> T) -> T {
+    match policy {
+        Some(policy) => with_wrapper_policy(policy, run),
+        None => run(),
+    }
 }
 
 struct CancellableShellStageGuard(bool);
@@ -385,6 +514,21 @@ struct OutputSpan {
     len: usize,
 }
 
+#[derive(Debug)]
+struct PresentedStreams {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    output_order: Option<Vec<OutputSpan>>,
+}
+
+#[derive(Debug)]
+struct ObservationPlan {
+    command_id: CommandId,
+    source: String,
+    argv: Vec<String>,
+    mode: OutputMode,
+}
+
 impl CommandOutcome {
     pub fn captured(exit_code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
         let output_order = Some(initial_output_order(stdout.len(), stderr.len()));
@@ -397,6 +541,11 @@ impl CommandOutcome {
             exact_stderr: None,
             stdout_preview_complete: true,
             stderr_preview_complete: true,
+            explicit_output_mode: false,
+            explicit_presentation_mode: None,
+            presented: None,
+            presentation_handled: false,
+            observation_plan: None,
             output_order,
         }
     }
@@ -418,6 +567,11 @@ impl CommandOutcome {
             exact_stderr: exact_stderr.map(|file| vec![ExactTraceSegment::File(file)]),
             stdout_preview_complete: true,
             stderr_preview_complete: true,
+            explicit_output_mode: false,
+            explicit_presentation_mode: None,
+            presented: None,
+            presentation_handled: false,
+            observation_plan: None,
             output_order,
         }
     }
@@ -440,6 +594,11 @@ impl CommandOutcome {
             exact_stderr: stderr.exact.map(|file| vec![ExactTraceSegment::File(file)]),
             stdout_preview_complete: stdout.preview_complete,
             stderr_preview_complete: stderr.preview_complete,
+            explicit_output_mode: false,
+            explicit_presentation_mode: None,
+            presented: None,
+            presentation_handled: false,
+            observation_plan: None,
             output_order,
         }
     }
@@ -494,8 +653,199 @@ impl CommandOutcome {
     }
 
     fn append_streams(&mut self, other: &mut Self) -> Result<(), ShellError> {
+        let has_pending_plan = self.observation_plan.is_some() || other.observation_plan.is_some();
+        if !has_pending_plan {
+            let self_has_presentation = self.has_presentation_semantics();
+            let other_has_presentation = other.has_presentation_semantics();
+            if other_has_presentation && !self_has_presentation && self.has_raw_output() {
+                self.select_raw_presentation()?;
+            }
+            if self_has_presentation && !other_has_presentation && other.has_raw_output() {
+                other.select_raw_presentation()?;
+            }
+        }
+        self.select_observation_presentation()?;
+        other.select_observation_presentation()?;
+        let pending_presentation = (self.presented.is_some() && !self.presentation_handled)
+            || (other.presented.is_some() && !other.presentation_handled);
+        let projected_resident = self
+            .resident_stream_bytes()
+            .checked_add(other.resident_stream_bytes())
+            .ok_or_else(|| ShellError::execution("captured compound output length overflow"))?;
+        if projected_resident > MAX_AGGREGATE_CAPTURE_BYTES {
+            return Err(ShellError::execution(format!(
+                "captured and presented compound output exceeds the \
+                 {MAX_AGGREGATE_CAPTURE_BYTES}-byte aggregate memory limit"
+            )));
+        }
+        self.explicit_output_mode |= other.explicit_output_mode;
+        if self.explicit_presentation_mode.is_none() {
+            self.explicit_presentation_mode = other.explicit_presentation_mode;
+        }
+        if self.observation_plan.is_none() {
+            self.observation_plan = other.observation_plan.take();
+        }
+        self.presentation_handled =
+            !pending_presentation && (self.presentation_handled || other.presentation_handled);
+        self.append_presented_streams(other, MAX_AGGREGATE_CAPTURE_BYTES)?;
         self.append_streams_with_limit(other, true, true, MAX_AGGREGATE_CAPTURE_BYTES)?;
         Ok(())
+    }
+
+    fn realize_observation_plan(&mut self, state: &ShellState) -> Result<(), ShellError> {
+        let Some(plan) = self.observation_plan.take() else {
+            return Ok(());
+        };
+        record_trace_and_attach_observation_for(
+            &plan.command_id,
+            &plan.source,
+            &plan.argv,
+            state,
+            plan.mode,
+            self,
+        )
+    }
+
+    /// Select an observation for presentation without ever replacing the raw
+    /// stdout/stderr returned to library callers or routed through Unix planes.
+    fn select_observation_presentation(&mut self) -> Result<(), ShellError> {
+        let Some(observation) = self.observation.take() else {
+            return Ok(());
+        };
+        self.append_presented(
+            PresentedStreams::stdout(observation.display.into_bytes()),
+            MAX_AGGREGATE_CAPTURE_BYTES,
+        )?;
+        Ok(())
+    }
+
+    fn select_raw_presentation(&mut self) -> Result<(), ShellError> {
+        if self.presented.is_none() {
+            let projected = self
+                .resident_stream_bytes()
+                .checked_add(self.stdout.len())
+                .and_then(|bytes| bytes.checked_add(self.stderr.len()))
+                .ok_or_else(|| ShellError::execution("presented output length overflow"))?;
+            if projected > MAX_AGGREGATE_CAPTURE_BYTES {
+                return Err(ShellError::execution(format!(
+                    "captured and presented output exceeds the \
+                     {MAX_AGGREGATE_CAPTURE_BYTES}-byte aggregate memory limit"
+                )));
+            }
+            self.presented = Some(Box::new(PresentedStreams {
+                stdout: self.stdout.clone(),
+                stderr: self.stderr.clone(),
+                output_order: self.output_order.clone(),
+            }));
+        }
+        Ok(())
+    }
+
+    fn select_empty_presentation(&mut self) {
+        self.presented
+            .get_or_insert_with(|| Box::new(PresentedStreams::empty()));
+    }
+
+    /// Emit only the private CLI presentation plane. Raw outcome bytes and
+    /// exact-trace metadata remain untouched.
+    fn emit_live_presentation(&mut self) -> Result<(), ShellError> {
+        self.select_observation_presentation()?;
+        if self.presented.is_none() {
+            self.select_raw_presentation()?;
+        }
+        let presented = self.presented.as_mut().expect("selected presentation");
+        let order = presented.validated_output_order();
+        let mut stdout = io::stdout().lock();
+        let mut stderr = io::stderr().lock();
+
+        if let Some(order) = order {
+            for span in order {
+                let bytes = match span.stream {
+                    OutputStream::Stdout => &presented.stdout[span.start..span.start + span.len],
+                    OutputStream::Stderr => &presented.stderr[span.start..span.start + span.len],
+                };
+                match span.stream {
+                    OutputStream::Stdout => {
+                        pipe_ok(stdout.write_all(bytes))?;
+                        pipe_ok(stdout.flush())?;
+                    }
+                    OutputStream::Stderr => {
+                        pipe_ok(stderr.write_all(bytes))?;
+                        pipe_ok(stderr.flush())?;
+                    }
+                }
+            }
+        } else {
+            pipe_ok(stdout.write_all(&presented.stdout))?;
+            pipe_ok(stdout.flush())?;
+            pipe_ok(stderr.write_all(&presented.stderr))?;
+            pipe_ok(stderr.flush())?;
+        }
+        pipe_ok(stdout.flush())?;
+        pipe_ok(stderr.flush())?;
+
+        presented.stdout.clear();
+        presented.stderr.clear();
+        presented.output_order = Some(Vec::new());
+        self.presentation_handled = true;
+        Ok(())
+    }
+
+    fn append_presented_streams(
+        &mut self,
+        other: &mut Self,
+        limit: usize,
+    ) -> Result<(), ShellError> {
+        let Some(source) = other.presented.take() else {
+            return Ok(());
+        };
+        self.append_presented(*source, limit)
+    }
+
+    fn append_presented(
+        &mut self,
+        source: PresentedStreams,
+        limit: usize,
+    ) -> Result<(), ShellError> {
+        let source_bytes = source
+            .stdout
+            .len()
+            .checked_add(source.stderr.len())
+            .ok_or_else(|| ShellError::execution("presented output length overflow"))?;
+        let projected = self
+            .resident_stream_bytes()
+            .checked_add(source_bytes)
+            .ok_or_else(|| ShellError::execution("presented output length overflow"))?;
+        if projected > limit {
+            return Err(ShellError::execution(format!(
+                "captured and presented output exceeds the {limit}-byte aggregate memory limit"
+            )));
+        }
+        let destination = self
+            .presented
+            .get_or_insert_with(|| Box::new(PresentedStreams::empty()));
+        destination.append(source, limit)
+    }
+
+    fn has_raw_output(&self) -> bool {
+        !self.stdout.is_empty() || !self.stderr.is_empty()
+    }
+
+    fn has_presentation_semantics(&self) -> bool {
+        self.explicit_output_mode
+            || self.explicit_presentation_mode.is_some()
+            || self.observation.is_some()
+            || self.presented.is_some()
+            || self.presentation_handled
+    }
+
+    fn resident_stream_bytes(&self) -> usize {
+        self.stdout
+            .len()
+            .saturating_add(self.stderr.len())
+            .saturating_add(self.presented.as_ref().map_or(0, |presented| {
+                presented.stdout.len() + presented.stderr.len()
+            }))
     }
 
     fn append_stderr(&mut self, other: &mut Self) -> Result<(), ShellError> {
@@ -590,6 +940,83 @@ impl CommandOutcome {
                 .is_some_and(|end| end <= stream_len)
         });
         valid.then(|| spans.clone())
+    }
+}
+
+impl PresentedStreams {
+    fn empty() -> Self {
+        Self {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            output_order: Some(Vec::new()),
+        }
+    }
+
+    fn stdout(stdout: Vec<u8>) -> Self {
+        Self {
+            output_order: Some(initial_output_order(stdout.len(), 0)),
+            stdout,
+            stderr: Vec::new(),
+        }
+    }
+
+    fn append(&mut self, mut other: Self, limit: usize) -> Result<(), ShellError> {
+        let projected_bytes = self
+            .stdout
+            .len()
+            .checked_add(self.stderr.len())
+            .and_then(|bytes| bytes.checked_add(other.stdout.len()))
+            .and_then(|bytes| bytes.checked_add(other.stderr.len()))
+            .ok_or_else(|| ShellError::execution("presented output length overflow"))?;
+        if projected_bytes > limit {
+            return Err(ShellError::execution(format!(
+                "presented compound output exceeds the {limit}-byte aggregate memory limit"
+            )));
+        }
+
+        let combined_order = match (
+            self.validated_output_order(),
+            other.validated_output_order(),
+        ) {
+            (Some(mut destination), Some(source)) => {
+                let stdout_offset = self.stdout.len();
+                let stderr_offset = self.stderr.len();
+                for mut span in source {
+                    match span.stream {
+                        OutputStream::Stdout => span.start += stdout_offset,
+                        OutputStream::Stderr => span.start += stderr_offset,
+                    }
+                    push_output_span(&mut destination, span);
+                    if destination.len() > MAX_OUTPUT_SPANS {
+                        return Err(ShellError::execution(format!(
+                            "presented compound output exceeds the {MAX_OUTPUT_SPANS}-span ordering limit"
+                        )));
+                    }
+                }
+                Some(destination)
+            }
+            _ => None,
+        };
+        self.stdout.append(&mut other.stdout);
+        self.stderr.append(&mut other.stderr);
+        self.output_order = combined_order;
+        Ok(())
+    }
+
+    fn validated_output_order(&self) -> Option<Vec<OutputSpan>> {
+        let spans = self.output_order.as_ref()?;
+        spans
+            .iter()
+            .all(|span| {
+                let stream_len = match span.stream {
+                    OutputStream::Stdout => self.stdout.len(),
+                    OutputStream::Stderr => self.stderr.len(),
+                };
+                span.start
+                    .checked_add(span.len)
+                    .is_some_and(|end| end <= stream_len)
+            })
+            .then(|| spans.clone())
     }
 }
 
@@ -928,6 +1355,8 @@ enum RunningStreamingStage {
 struct RunningShellStage {
     thread: std::thread::JoinHandle<Result<CommandOutcome, ShellError>>,
     interrupt: Arc<AtomicBool>,
+    #[cfg(test)]
+    inherited_wrapper_policy: mpsc::Receiver<Option<WrapperPolicy>>,
 }
 
 enum ExternalStageStdin {
@@ -1182,6 +1611,16 @@ impl Executor {
         } else {
             self.run_graph_inner(graph, state, options)
         };
+        let result = result.and_then(|mut outcome| {
+            present_completed_graph_if_live(
+                graph,
+                state,
+                options,
+                self.flush_stdout,
+                &mut outcome,
+            )?;
+            Ok(outcome)
+        });
         state.leave_exec();
         cleanup_new_proc_sub_temps(state, inherited_proc_sub_temps);
         let outcome = result?;
@@ -1220,9 +1659,12 @@ impl Executor {
         // an infinite producer. Multi-command lists already emit per command in
         // run_command_list. No-op when not streaming. (P0-8)
         emit_streaming_stdout(state, &mut outcome)?;
+        let presentation_mode = effective_presentation_mode(state, options);
         if options.output_mode.should_capture()
             && state.is_top_level_execution()
             && outcome.observation.is_none()
+            && !outcome.explicit_output_mode
+            && !live_presentation_enabled(self.flush_stdout, state, presentation_mode)
         {
             record_trace_and_attach_observation(graph, state, options, &mut outcome)?;
         }
@@ -1294,12 +1736,16 @@ fn fire_signal_traps(
     state: &mut ShellState,
     options: &ExecutionOptions,
     outcome: &mut CommandOutcome,
+    flush_stdout: bool,
 ) -> Result<(), ShellError> {
+    let triggering_status = state.last_status();
     let mut fired = false;
     for signal in state.take_pending_signal_traps() {
         if let Some(action) = state.trap_action(&signal) {
             fired = true;
-            let mut trap_outcome = run_command_source(&action, state, options)?;
+            let mut trap_outcome = with_stream_raw_to_parent(flush_stdout, || {
+                run_command_source(&action, state, options)
+            })?;
             outcome.append_streams(&mut trap_outcome)?;
         }
     }
@@ -1307,6 +1753,9 @@ fn fire_signal_traps(
     // execution continues after the handler (POSIX 2.11).
     if fired {
         state.clear_interrupt();
+        // A trap handler runs as its own command graph, but `$?` after the
+        // boundary remains the status of the command that triggered it.
+        state.set_last_status(triggering_status);
     }
     Ok(())
 }
@@ -1319,6 +1768,14 @@ fn run_command_list(
 ) -> Result<CommandOutcome, ShellError> {
     let mut final_outcome = CommandOutcome::captured(0, Vec::new(), Vec::new());
     let mut last_status = 0;
+    let presentation_mode = effective_presentation_mode(state, options);
+    let presentation_display_plane =
+        presentation_mode.should_capture() && observation_display_plane(state);
+    let live_presentation = live_presentation_enabled(flush_stdout, state, presentation_mode);
+    let live_cli_display = cli_presentation_display_enabled(flush_stdout, state);
+    let mut mixed_presentation = false;
+    let mut preceding_sources = Vec::new();
+    let mut preceding_argv = None;
 
     for (index, item) in graph.list.items.iter().enumerate() {
         let should_run = match item.operator {
@@ -1370,20 +1827,134 @@ fn run_command_list(
         if item.pipeline.commands.len() == 1 {
             record_pipestatus(state, &[outcome.exit_code]);
         }
-        fire_signal_traps(state, options, &mut outcome)?;
-        emit_streaming_stdout(state, &mut outcome)?;
-        final_outcome.exit_code = outcome.exit_code;
-        // In raw (non-capturing) mode, flush each command's output immediately so
-        // builtin output interleaves correctly with external commands instead of
-        // being buffered until the end of the list.
-        if flush_stdout && !options.output_mode.should_capture() && state.streaming_stdout_is_none()
+        if live_cli_display
+            && (live_presentation || outcome.explicit_output_mode)
+            && !outcome.presentation_handled
         {
-            pipe_ok(io::stdout().write_all(&outcome.stdout))?;
-            pipe_ok(io::stdout().flush())?;
-            pipe_ok(io::stderr().write_all(&outcome.stderr))?;
+            if outcome.explicit_output_mode {
+                select_explicit_presentation(&mut outcome)?;
+            } else {
+                let source = item_source(graph, item);
+                let argv = item
+                    .pipeline
+                    .commands
+                    .first()
+                    .map(|command| command.argv.clone())
+                    .filter(|argv| !argv.is_empty())
+                    .unwrap_or_else(|| vec![source.clone()]);
+                record_trace_and_attach_observation_for(
+                    &CommandId::new(),
+                    &source,
+                    &argv,
+                    state,
+                    presentation_mode,
+                    &mut outcome,
+                )?;
+                outcome.select_observation_presentation()?;
+            }
+            outcome.emit_live_presentation()?;
+        }
+        if flush_stdout
+            && !options.output_mode.should_capture()
+            && state.streaming_stdout_is_none()
+            && !outcome.presentation_handled
+        {
+            outcome.select_raw_presentation()?;
+            outcome.emit_live_presentation()?;
             outcome.stdout.clear();
             outcome.stderr.clear();
+            outcome.exact_stdout = None;
+            outcome.exact_stderr = None;
+            outcome.output_order = Some(Vec::new());
         }
+        // Presentation precedes traps: a blocking/raw handler must not overtake
+        // the command whose signal boundary triggered it.
+        fire_signal_traps(state, options, &mut outcome, flush_stdout)?;
+        let item_is_explicit = outcome.explicit_output_mode;
+        if !live_presentation
+            && presentation_display_plane
+            && item_is_explicit
+            && !mixed_presentation
+        {
+            // Preserve the established whole-list observation for ordinary
+            // lists. Only split presentation when an invocation-level wrapper
+            // actually chooses a different mode. Commands that ran before the
+            // first wrapper still receive the configured/session mode as one
+            // ordered prefix observation.
+            if !preceding_sources.is_empty() {
+                let source = preceding_sources.join("; ");
+                let argv = preceding_argv
+                    .as_deref()
+                    .unwrap_or_else(|| std::slice::from_ref(&source));
+                record_trace_and_attach_observation_for(
+                    &CommandId::new(),
+                    &source,
+                    argv,
+                    state,
+                    presentation_mode,
+                    &mut final_outcome,
+                )?;
+                final_outcome.select_observation_presentation()?;
+            }
+            mixed_presentation = true;
+        }
+        if !live_presentation
+            && presentation_display_plane
+            && mixed_presentation
+            && outcome.observation.is_none()
+            && !item_is_explicit
+        {
+            let source = item_source(graph, item);
+            let argv = item
+                .pipeline
+                .commands
+                .first()
+                .map(|command| command.argv.clone())
+                .filter(|argv| !argv.is_empty())
+                .unwrap_or_else(|| vec![source.clone()]);
+            record_trace_and_attach_observation_for(
+                &CommandId::new(),
+                &source,
+                &argv,
+                state,
+                presentation_mode,
+                &mut outcome,
+            )?;
+        }
+        if !live_presentation && mixed_presentation && outcome.observation.is_some() {
+            if state.streaming_stdout_is_none() {
+                outcome.select_observation_presentation()?;
+            } else {
+                // A compound/list used as a pipeline stage contributes its raw
+                // data-plane stdout. Presentation never becomes pipe input.
+                outcome.observation = None;
+            }
+        }
+        if !live_presentation
+            && mixed_presentation
+            && item_is_explicit
+            && !outcome.presentation_handled
+        {
+            select_explicit_presentation(&mut outcome)?;
+        }
+        if !live_presentation
+            && presentation_display_plane
+            && !mixed_presentation
+            && !item_is_explicit
+        {
+            let source = item_source(graph, item);
+            if preceding_argv.is_none() {
+                preceding_argv = item
+                    .pipeline
+                    .commands
+                    .first()
+                    .map(|command| command.argv.clone())
+                    .filter(|argv| !argv.is_empty());
+            }
+            preceding_sources.push(source);
+        }
+        emit_streaming_stdout(state, &mut outcome)?;
+        final_outcome.exit_code = outcome.exit_code;
         final_outcome.append_streams(&mut outcome)?;
 
         if state.should_exit()
@@ -1409,10 +1980,13 @@ fn run_command_list(
         if outcome.exit_code != 0 && !failure_is_boolean_operand {
             if let Some(action) = state.trap_action("ERR") {
                 state.set_trap("ERR", None); // prevent recursion in the handler
-                if let Ok(mut handler) = run_command_source(&action, state, options) {
+                if let Ok(mut handler) = with_stream_raw_to_parent(flush_stdout, || {
+                    run_command_source(&action, state, options)
+                }) {
                     if flush_stdout
                         && !options.output_mode.should_capture()
                         && state.streaming_stdout_is_none()
+                        && !handler.presentation_handled
                     {
                         pipe_ok(io::stdout().write_all(&handler.stdout))?;
                         pipe_ok(io::stdout().flush())?;
@@ -1431,7 +2005,17 @@ fn run_command_list(
         }
     }
 
-    if options.output_mode.should_capture() && state.is_top_level_execution() {
+    if mixed_presentation {
+        // The configured/session prefix and every item at or after the first
+        // explicit wrapper have already selected their presentation mode. Do
+        // not compact those displays again when this list bubbles through a
+        // function, control group, eval, source, or the top-level graph.
+        final_outcome.explicit_output_mode = true;
+    } else if options.output_mode.should_capture()
+        && state.is_top_level_execution()
+        && !final_outcome.explicit_output_mode
+        && !final_outcome.presentation_handled
+    {
         record_trace_and_attach_observation(graph, state, options, &mut final_outcome)?;
     }
 
@@ -1444,10 +2028,28 @@ fn record_trace_and_attach_observation(
     options: &ExecutionOptions,
     outcome: &mut CommandOutcome,
 ) -> Result<(), ShellError> {
-    let (exact_stdout, exact_stderr) = outcome.take_exact_streams();
-    let raw = match state.record_trace_captured(
+    record_trace_and_attach_observation_for(
         &graph.id,
         &graph.source,
+        &graph_primary_argv(graph),
+        state,
+        options.output_mode,
+        outcome,
+    )
+}
+
+fn record_trace_and_attach_observation_for(
+    command_id: &CommandId,
+    source: &str,
+    argv: &[String],
+    state: &ShellState,
+    output_mode: OutputMode,
+    outcome: &mut CommandOutcome,
+) -> Result<(), ShellError> {
+    let (exact_stdout, exact_stderr) = outcome.take_exact_streams();
+    let raw = match state.record_trace_captured(
+        command_id,
+        source,
         outcome.exit_code,
         CapturedTraceStreams {
             stdout_preview: &outcome.stdout,
@@ -1461,22 +2063,21 @@ fn record_trace_and_attach_observation(
         Ok(raw) => raw,
         Err(_) => RawStreamRef::unavailable(),
     };
-    let argv = graph_primary_argv(graph);
-    outcome.observation = if options.output_mode == OutputMode::Rich {
+    outcome.observation = if output_mode == OutputMode::Rich {
         rich_observation(
             state,
-            &graph.id,
-            &argv,
+            command_id,
+            argv,
             &outcome.stdout,
             &outcome.stderr,
             &raw,
         )
     } else {
         Some(render_observation_with_raw_ref(
-            &compaction_context(state, &argv),
-            options.output_mode,
-            &graph.id,
-            &argv,
+            &compaction_context(state, argv),
+            output_mode,
+            command_id,
+            argv,
             outcome.exit_code,
             ObservationStreams {
                 stdout: &outcome.stdout,
@@ -1510,6 +2111,20 @@ fn item_source(graph: &CommandGraph, item: &CommandListItem) -> String {
         })
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+fn handoff_background_snapshot(handoff: &mut UnixStream, snapshot: &[u8]) -> io::Result<()> {
+    handoff.write_all(snapshot)?;
+    handoff.shutdown(Shutdown::Write)?;
+    let mut ready = [0u8; 1];
+    handoff.read_exact(&mut ready)?;
+    if ready[0] != BACKGROUND_SNAPSHOT_READY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "background child returned an invalid state acknowledgement",
+        ));
+    }
+    Ok(())
 }
 
 /// Run a command-list item asynchronously: launch it as a child `agsh -c`
@@ -1564,25 +2179,12 @@ fn run_background_item(
 
     let mut child = command.spawn()?;
     drop(command);
-    let handoff_result = (|| -> io::Result<()> {
-        handoff.write_all(&snapshot)?;
-        handoff.shutdown(Shutdown::Write)?;
-        let mut ready = [0u8; 1];
-        handoff.read_exact(&mut ready)?;
-        if ready[0] != BACKGROUND_SNAPSHOT_READY {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "background child returned an invalid state acknowledgement",
-            ));
-        }
-        Ok(())
-    })();
+    let handoff_result = handoff_background_snapshot(&mut handoff, &snapshot);
     if let Err(error) = handoff_result {
         if let Some(pgid) = rustix::process::Pid::from_raw(child.id() as i32) {
             let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_child(&mut child);
         return Err(ShellError::execution(format!(
             "background state handoff failed: {error}"
         )));
@@ -1709,6 +2311,16 @@ fn run_pipeline_item(
             state.set_stream_pipe_closed();
             Ok((CommandOutcome::captured(0, Vec::new(), Vec::new()), false))
         }
+        // An existing command that cannot be executed is distinct from both a
+        // missing command (127) and an ordinary I/O failure (1).
+        Err(error) if error.code() == NOT_EXECUTABLE_ERROR_CODE => Ok((
+            CommandOutcome::captured(
+                126,
+                Vec::new(),
+                format!("agsh: {}\n", error.message).into_bytes(),
+            ),
+            true,
+        )),
         Err(error) if error.kind == ShellErrorKind::Io => Ok((
             CommandOutcome::captured(
                 1,
@@ -1754,6 +2366,7 @@ fn run_pipeline_item(
                 prefix.exit_code = exit_code;
                 outcome = prefix;
             }
+            outcome.realize_observation_plan(state)?;
             Ok(outcome)
         }
         Err(error) => {
@@ -2194,6 +2807,21 @@ fn run_invocation_inner(
     };
 
     match name.as_str() {
+        wrapper
+            if context.lookup_mode == LookupMode::Normal
+                && output_wrapper_mode(wrapper).is_some() =>
+        {
+            let mode = output_wrapper_mode(wrapper).expect("matched output wrapper");
+            let wrapped = strip_wrapper(invocation, wrapper)?;
+            run_output_mode_wrapper(
+                &wrapped,
+                state,
+                mode,
+                stdin_data,
+                capture_outputs,
+                context.allow_process_replacement,
+            )
+        }
         "command" if context.lookup_mode == LookupMode::Normal => {
             let command_options = parse_command_options(invocation)?;
             if command_options.describe || command_options.unsupported_option.is_some() {
@@ -2246,11 +2874,23 @@ fn run_invocation_inner(
                 },
             )
         }
-        "agpty" | "pty"
-            if context.lookup_mode == LookupMode::Normal && invocation.argv.len() > 1 =>
+        "agview"
+            if context.lookup_mode != LookupMode::Normal
+                && context.lookup_mode != LookupMode::ExternalOnly =>
         {
-            let wrapped = strip_wrapper(invocation, name.as_str())?;
-            run_under_pty(&wrapped, state)
+            run_agview_wrapper(
+                invocation,
+                state,
+                stdin_data,
+                capture_outputs,
+                context.allow_process_replacement,
+            )
+        }
+        "agpty" | "pty"
+            if context.lookup_mode != LookupMode::Normal
+                && context.lookup_mode != LookupMode::ExternalOnly =>
+        {
+            run_pty_wrapper(invocation, state, stdin_data)
         }
         _ if context.lookup_mode == LookupMode::Normal => {
             if let Some(function) = state.function(name).cloned() {
@@ -2314,6 +2954,18 @@ fn run_invocation_inner(
                     },
                 );
             }
+            if name == "agview" {
+                return run_agview_wrapper(
+                    invocation,
+                    state,
+                    stdin_data,
+                    capture_outputs,
+                    context.allow_process_replacement,
+                );
+            }
+            if matches!(name.as_str(), "agpty" | "pty") {
+                return run_pty_wrapper(invocation, state, stdin_data);
+            }
             run_resolved_invocation(
                 invocation,
                 state,
@@ -2334,6 +2986,258 @@ fn run_invocation_inner(
             context.allow_process_replacement,
         ),
     }
+}
+
+fn output_wrapper_mode(name: &str) -> Option<OutputMode> {
+    match name {
+        "raw" => Some(OutputMode::Raw),
+        "clean" => Some(OutputMode::Clean),
+        "compact" => Some(OutputMode::Compact),
+        "semantic" => Some(OutputMode::Semantic),
+        "lossless-ref" | "lossless_ref" => Some(OutputMode::LosslessRef),
+        "silent" => Some(OutputMode::Silent),
+        "rich" => Some(OutputMode::Rich),
+        _ => None,
+    }
+}
+
+/// Observations are presentation-plane values. Any inherited pipe/file capture,
+/// exact shell capture, or live downstream stream is an internal Unix data
+/// plane and must receive only the wrapped command's raw bytes.
+fn observation_display_plane(state: &ShellState) -> bool {
+    !state.exact_capture_enabled()
+        && state.streaming_stdout_is_none()
+        && matches!(
+            inherited_capture_routing().stdout,
+            CaptureDestination::Stdout
+        )
+}
+
+fn effective_presentation_mode(state: &ShellState, options: &ExecutionOptions) -> OutputMode {
+    if state.is_top_level_execution() {
+        options.output_mode
+    } else {
+        state.default_output_mode().unwrap_or(options.output_mode)
+    }
+}
+
+fn live_presentation_enabled(flush_stdout: bool, state: &ShellState, mode: OutputMode) -> bool {
+    cli_presentation_display_enabled(flush_stdout, state) && mode.should_capture()
+}
+
+fn cli_presentation_display_enabled(flush_stdout: bool, state: &ShellState) -> bool {
+    flush_stdout && active_wrapper_policy().is_none() && observation_display_plane(state)
+}
+
+fn select_explicit_presentation(outcome: &mut CommandOutcome) -> Result<(), ShellError> {
+    if outcome.observation.is_some() {
+        return outcome.select_observation_presentation();
+    }
+    match outcome.explicit_presentation_mode {
+        Some(OutputMode::Raw | OutputMode::Rich) => outcome.select_raw_presentation(),
+        Some(OutputMode::Silent) => {
+            outcome.select_empty_presentation();
+            Ok(())
+        }
+        Some(_) => {
+            outcome.select_empty_presentation();
+            Ok(())
+        }
+        None => outcome.select_raw_presentation(),
+    }
+}
+
+fn present_completed_graph_if_live(
+    graph: &CommandGraph,
+    state: &ShellState,
+    options: &ExecutionOptions,
+    flush_stdout: bool,
+    outcome: &mut CommandOutcome,
+) -> Result<(), ShellError> {
+    let mode = effective_presentation_mode(state, options);
+    let live_display = cli_presentation_display_enabled(flush_stdout, state);
+    if outcome.presentation_handled || !live_display {
+        return Ok(());
+    }
+
+    if outcome.explicit_output_mode {
+        select_explicit_presentation(outcome)?;
+    } else if mode.should_capture() {
+        record_trace_and_attach_observation_for(
+            &graph.id,
+            &graph.source,
+            &graph_primary_argv(graph),
+            state,
+            mode,
+            outcome,
+        )?;
+        outcome.select_observation_presentation()?;
+    } else {
+        outcome.select_raw_presentation()?;
+    }
+    outcome.emit_live_presentation()
+}
+
+fn run_output_mode_wrapper(
+    invocation: &ExpandedInvocation,
+    state: &mut ShellState,
+    requested_mode: OutputMode,
+    stdin_data: Option<&[u8]>,
+    capture_outputs: bool,
+    allow_process_replacement: bool,
+) -> Result<CommandOutcome, ShellError> {
+    if let Some(policy) = active_wrapper_policy() {
+        return run_invocation_inner(
+            invocation,
+            state,
+            policy.mode,
+            stdin_data,
+            capture_outputs || policy.capture_outputs,
+            InvocationContext {
+                lookup_mode: LookupMode::Normal,
+                alias_depth: 0,
+                allow_process_replacement,
+            },
+        );
+    }
+
+    let output_mode = if rich_mode_requires_raw_passthrough(requested_mode) {
+        OutputMode::Raw
+    } else {
+        requested_mode
+    };
+    if output_mode == OutputMode::LosslessRef && observation_display_plane(state) {
+        state.prepare_required_trace_storage().map_err(|error| {
+            ShellError::execution(format!("lossless trace storage is unavailable: {error}"))
+        })?;
+    }
+
+    let live_raw_presentation = output_mode == OutputMode::Raw
+        && stream_raw_to_parent()
+        && observation_display_plane(state);
+    let effective_capture = if live_raw_presentation {
+        false
+    } else {
+        capture_outputs || output_mode.should_capture()
+    };
+    let mut outcome = with_wrapper_policy(
+        WrapperPolicy {
+            mode: output_mode,
+            capture_outputs: effective_capture,
+        },
+        || {
+            run_invocation_inner(
+                invocation,
+                state,
+                output_mode,
+                stdin_data,
+                effective_capture,
+                InvocationContext {
+                    lookup_mode: LookupMode::Normal,
+                    alias_depth: 0,
+                    allow_process_replacement,
+                },
+            )
+        },
+    )?;
+
+    if !observation_display_plane(state) {
+        outcome.observation = None;
+        outcome.observation_plan = None;
+        outcome.presented = None;
+        outcome.presentation_handled = false;
+        outcome.explicit_output_mode = false;
+        outcome.explicit_presentation_mode = None;
+        return Ok(outcome);
+    }
+
+    outcome.explicit_output_mode = true;
+    outcome.explicit_presentation_mode = Some(output_mode);
+
+    // Raw is a data-plane override. It deliberately discards an inner wrapper's
+    // observation while leaving its exact stdout/stderr and exit status intact.
+    if output_mode == OutputMode::Raw {
+        outcome.observation = None;
+        outcome.observation_plan = None;
+        return Ok(outcome);
+    }
+
+    // The outermost explicit wrapper wins when wrappers are composed.
+    outcome.observation = None;
+    outcome.observation_plan = Some(Box::new(ObservationPlan {
+        command_id: CommandId::new(),
+        source: expanded_invocation_source(invocation),
+        argv: invocation.argv.clone(),
+        mode: output_mode,
+    }));
+    Ok(outcome)
+}
+
+fn run_agview_wrapper(
+    invocation: &ExpandedInvocation,
+    state: &mut ShellState,
+    stdin_data: Option<&[u8]>,
+    capture_outputs: bool,
+    allow_process_replacement: bool,
+) -> Result<CommandOutcome, ShellError> {
+    let mut wrapped = invocation.clone();
+    wrapped.argv.splice(0..1, ["cat".into(), "--".into()]);
+    run_output_mode_wrapper(
+        &wrapped,
+        state,
+        OutputMode::Rich,
+        stdin_data,
+        capture_outputs,
+        allow_process_replacement,
+    )
+}
+
+fn run_pty_wrapper(
+    invocation: &ExpandedInvocation,
+    state: &mut ShellState,
+    stdin_data: Option<&[u8]>,
+) -> Result<CommandOutcome, ShellError> {
+    let wrapper = invocation.argv.first().map(String::as_str).unwrap_or("pty");
+    let wrapped = strip_wrapper(invocation, wrapper)?;
+    if stdin_data.is_some()
+        || state.streaming_stdin_is_some()
+        || wrapped
+            .redirections
+            .iter()
+            .any(|redirection| redirection.fd == 0)
+    {
+        let mut outcome = CommandOutcome::captured(
+            2,
+            Vec::new(),
+            b"agsh: pty: PTY stdin from pipelines or redirections is not supported\n".to_vec(),
+        );
+        apply_builtin_redirections(&mut outcome, &wrapped.redirections, state)?;
+        return Ok(outcome);
+    }
+    let mut outcome = run_under_pty(&wrapped, state)?;
+    apply_builtin_redirections(&mut outcome, &wrapped.redirections, state)?;
+    Ok(outcome)
+}
+
+fn expanded_invocation_source(invocation: &ExpandedInvocation) -> String {
+    let mut parts = invocation
+        .assignments
+        .iter()
+        .map(|assignment| {
+            format!(
+                "{}={}",
+                assignment.name,
+                shell_escape_unquoted(&assignment.value)
+            )
+        })
+        .collect::<Vec<_>>();
+    parts.extend(
+        invocation
+            .argv
+            .iter()
+            .map(|argument| shell_escape_unquoted(argument)),
+    );
+    parts.join(" ")
 }
 
 fn parse_function_definition(
@@ -3330,7 +4234,8 @@ fn run_select_invocation_inner(
     let live_prompt = !capture_outputs
         && !has_redirections
         && inherited_capture_routing().is_default()
-        && io::stdin().is_terminal();
+        && (io::stdin().is_terminal()
+            || (stream_raw_to_parent() && observation_display_plane(state)));
 
     emit_select_stderr(
         &mut final_outcome,
@@ -3600,9 +4505,7 @@ fn run_subshell_invocation(
     // `cd` mutates the process working directory; restore it so the subshell's
     // directory changes stay isolated from the parent.
     let _ = std::env::set_current_dir(state.cwd());
-    let mut outcome = result?;
-    outcome.observation = None;
-    Ok(outcome)
+    result
 }
 
 /// Run a brace group: execute the inner list in the current shell state.
@@ -3625,13 +4528,11 @@ fn run_brace_group_invocation(
     };
     let redirections = expand_redirections(&invocation.redirections, state)?;
     let (routing, redirected_stdin) = prepare_compound_redirections(&redirections, state)?;
-    let mut outcome =
-        run_with_effective_shell_stdin(state, stdin_data, redirected_stdin, |state| {
-            with_inherited_capture_routing(routing, || {
-                run_command_source(inner_source, state, &nested_options)
-            })
-        })?;
-    outcome.observation = None;
+    let outcome = run_with_effective_shell_stdin(state, stdin_data, redirected_stdin, |state| {
+        with_inherited_capture_routing(routing, || {
+            run_command_source(inner_source, state, &nested_options)
+        })
+    })?;
     Ok(outcome)
 }
 
@@ -3645,9 +4546,7 @@ fn run_command_source(
     }
     let graph = parse_line(source)?;
     let mut executor = Executor::new().with_stdout_flush(stream_raw_to_parent());
-    let mut outcome = executor.run_graph(&graph, state, options)?;
-    outcome.observation = None;
-    Ok(outcome)
+    executor.run_graph(&graph, state, options)
 }
 
 fn run_function_invocation(
@@ -3695,7 +4594,7 @@ fn run_function_invocation(
             with_inherited_capture_routing(routing, || {
                 let graph = parse_line(&function.body)?;
                 let mut executor = Executor::new().with_stdout_flush(stream_raw_to_parent());
-                let mut outcome = executor.run_graph(
+                let outcome = executor.run_graph(
                     &graph,
                     state,
                     &ExecutionOptions {
@@ -3707,7 +4606,6 @@ fn run_function_invocation(
                         allow_process_replacement,
                     },
                 )?;
-                outcome.observation = None;
                 Ok(outcome)
             })
         })
@@ -3843,6 +4741,16 @@ fn command_not_found_outcome(name: &str, state: &ShellState) -> CommandOutcome {
     CommandOutcome::captured(127, Vec::new(), message.into_bytes())
 }
 
+/// An existing command candidate that cannot be executed: exit 126 and keep the
+/// diagnostic on the command's stderr routing, matching POSIX shell behavior.
+fn command_not_executable_outcome(path: &Path) -> CommandOutcome {
+    CommandOutcome::captured(
+        126,
+        Vec::new(),
+        format!("agsh: {}: permission denied\n", path.display()).into_bytes(),
+    )
+}
+
 /// `builtin <name>` where name is not a shell builtin: exit 1, like bash.
 fn builtin_not_found_outcome(name: &str) -> CommandOutcome {
     CommandOutcome::captured(
@@ -3918,16 +4826,30 @@ fn run_resolved_invocation(
             )
         }
         LookupMode::ExternalOnly => {
-            let Some(path) = resolve_external_path(invocation, state, name) else {
-                let mut outcome = finish_synthetic_invocation_outcome(
-                    command_not_found_outcome(name, state),
-                    invocation,
-                    state,
-                )?;
-                let exit_code = outcome.exit_code;
-                pre_invocation.append_streams(&mut outcome)?;
-                pre_invocation.exit_code = exit_code;
-                return Ok(pre_invocation);
+            let path = match resolve_external_command(invocation, state, name) {
+                CommandResolution::External(path) => path,
+                CommandResolution::NotExecutable(path) => {
+                    let mut outcome = finish_synthetic_invocation_outcome(
+                        command_not_executable_outcome(&path),
+                        invocation,
+                        state,
+                    )?;
+                    let exit_code = outcome.exit_code;
+                    pre_invocation.append_streams(&mut outcome)?;
+                    pre_invocation.exit_code = exit_code;
+                    return Ok(pre_invocation);
+                }
+                _ => {
+                    let mut outcome = finish_synthetic_invocation_outcome(
+                        command_not_found_outcome(name, state),
+                        invocation,
+                        state,
+                    )?;
+                    let exit_code = outcome.exit_code;
+                    pre_invocation.append_streams(&mut outcome)?;
+                    pre_invocation.exit_code = exit_code;
+                    return Ok(pre_invocation);
+                }
             };
             run_external(
                 invocation,
@@ -3951,21 +4873,35 @@ fn run_resolved_invocation(
             )
         }
         LookupMode::Normal | LookupMode::BypassAliases | LookupMode::DefaultPath => {
-            let path = if lookup_mode == LookupMode::DefaultPath {
-                resolve_external_path_with(invocation, state, name, DEFAULT_COMMAND_PATH)
+            let resolution = if lookup_mode == LookupMode::DefaultPath {
+                resolve_external_command_with(invocation, state, name, DEFAULT_COMMAND_PATH)
             } else {
-                resolve_external_path(invocation, state, name)
+                resolve_external_command(invocation, state, name)
             };
-            let Some(path) = path else {
-                let mut outcome = finish_synthetic_invocation_outcome(
-                    command_not_found_outcome(name, state),
-                    invocation,
-                    state,
-                )?;
-                let exit_code = outcome.exit_code;
-                pre_invocation.append_streams(&mut outcome)?;
-                pre_invocation.exit_code = exit_code;
-                return Ok(pre_invocation);
+            let path = match resolution {
+                CommandResolution::External(path) => path,
+                CommandResolution::NotExecutable(path) => {
+                    let mut outcome = finish_synthetic_invocation_outcome(
+                        command_not_executable_outcome(&path),
+                        invocation,
+                        state,
+                    )?;
+                    let exit_code = outcome.exit_code;
+                    pre_invocation.append_streams(&mut outcome)?;
+                    pre_invocation.exit_code = exit_code;
+                    return Ok(pre_invocation);
+                }
+                _ => {
+                    let mut outcome = finish_synthetic_invocation_outcome(
+                        command_not_found_outcome(name, state),
+                        invocation,
+                        state,
+                    )?;
+                    let exit_code = outcome.exit_code;
+                    pre_invocation.append_streams(&mut outcome)?;
+                    pre_invocation.exit_code = exit_code;
+                    return Ok(pre_invocation);
+                }
             };
             run_external(
                 invocation,
@@ -5066,12 +6002,22 @@ fn run_exec_invocation(
             ));
         }
     }
-    let Some(path) = resolve_external_path(&exec_invocation, state, name) else {
-        return Ok(CommandOutcome::captured(
-            127,
-            Vec::new(),
-            format!("exec: {name}: command not found\n").into_bytes(),
-        ));
+    let path = match resolve_external_command(&exec_invocation, state, name) {
+        CommandResolution::External(path) => path,
+        CommandResolution::NotExecutable(path) => {
+            return Ok(CommandOutcome::captured(
+                126,
+                Vec::new(),
+                format!("exec: {}: permission denied\n", path.display()).into_bytes(),
+            ));
+        }
+        _ => {
+            return Ok(CommandOutcome::captured(
+                127,
+                Vec::new(),
+                format!("exec: {name}: command not found\n").into_bytes(),
+            ));
+        }
     };
 
     exec_external(&exec_invocation, state, path.as_path())
@@ -5114,10 +6060,17 @@ fn exec_external(
     )?;
 
     let error = command.exec();
-    Err(ShellError::execution(format!(
-        "exec: {}: {error}",
-        invocation.argv[0]
-    )))
+    let failure = external_launch_error(command_path, &error);
+    let exit_code = if failure.kind == ShellErrorKind::NotFound {
+        127
+    } else {
+        126
+    };
+    Ok(CommandOutcome::captured(
+        exit_code,
+        Vec::new(),
+        format!("exec: {}\n", failure.message).into_bytes(),
+    ))
 }
 
 #[cfg(not(unix))]
@@ -5982,22 +6935,33 @@ fn resolve_external_path(
     state: &mut ShellState,
     name: &str,
 ) -> Option<PathBuf> {
-    let path_value = lookup_path_value(invocation, state);
-    resolve_external_path_with(invocation, state, name, &path_value)
+    match resolve_external_command(invocation, state, name) {
+        CommandResolution::External(path) => Some(path),
+        _ => None,
+    }
 }
 
-fn resolve_external_path_with(
+fn resolve_external_command(
+    invocation: &ExpandedInvocation,
+    state: &mut ShellState,
+    name: &str,
+) -> CommandResolution {
+    let path_value = lookup_path_value(invocation, state);
+    resolve_external_command_with(invocation, state, name, &path_value)
+}
+
+fn resolve_external_command_with(
     invocation: &ExpandedInvocation,
     state: &mut ShellState,
     name: &str,
     path_value: &str,
-) -> Option<PathBuf> {
+) -> CommandResolution {
     // Confinement backstop: a denied external command must not resolve to a path,
     // even via routes that skip preflight (e.g. `exec`). The friendly deny
     // message comes from preflight_resolved_invocation; this is the hard net.
     if let Some(policy) = state.confine_policy() {
         if !policy.allows(name) {
-            return None;
+            return CommandResolution::NotFound(name.to_string());
         }
     }
 
@@ -6008,20 +6972,59 @@ fn resolve_external_path_with(
 
     if !uses_temporary_path && !name.contains('/') {
         if let Some(path) = state.cached_path_lookup(path_value, name) {
-            return Some(path);
+            return CommandResolution::External(path);
         }
     }
 
     let resolver = Resolver::default();
-    let path = match resolver.resolve_external_only(name, Some(path_value)) {
-        Some(CommandResolution::External(path)) => path,
-        _ => return None,
-    };
+    let resolution = resolver
+        .resolve_external_only(name, Some(path_value))
+        .unwrap_or_else(|| CommandResolution::NotFound(name.to_string()));
 
     if !uses_temporary_path && !name.contains('/') {
-        state.cache_path_lookup(path_value, name, path.clone());
+        if let CommandResolution::External(path) = &resolution {
+            state.cache_path_lookup(path_value, name, path.clone());
+        }
     }
-    Some(path)
+    resolution
+}
+
+fn command_not_executable_error(path: &Path) -> ShellError {
+    ShellError::execution(format!("{}: permission denied", path.display()))
+        .with_code(NOT_EXECUTABLE_ERROR_CODE)
+}
+
+fn resolved_command_disappeared(path: &Path) -> bool {
+    matches!(
+        std::fs::metadata(path),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            )
+    )
+}
+
+fn external_launch_error(path: &Path, error: &io::Error) -> ShellError {
+    // ENOENT is ambiguous after successful resolution: the command itself may
+    // have disappeared, or an existing script's shebang interpreter may be
+    // missing. Recheck the resolved path so only the former is "not found".
+    if error.kind() == io::ErrorKind::NotFound && resolved_command_disappeared(path) {
+        ShellError::not_found(format!("{}: {error}", path.display()))
+    } else {
+        // ENOEXEC, EACCES, bad architecture, resource failures, and comparable
+        // spawn-time failures all mean the command was found but could not be
+        // launched. Platforms whose process API performs the traditional
+        // shebang-less `/bin/sh` fallback return a Child before reaching here.
+        ShellError::execution(format!("{}: {error}", path.display()))
+            .with_code(NOT_EXECUTABLE_ERROR_CODE)
+    }
+}
+
+fn spawn_external_command(command: &mut Command, path: &Path) -> Result<Child, ShellError> {
+    command
+        .spawn()
+        .map_err(|error| external_launch_error(path, &error))
 }
 
 fn lookup_path_value(invocation: &ExpandedInvocation, state: &ShellState) -> String {
@@ -6199,6 +7202,10 @@ fn preflight_invocation(
     };
 
     match name.as_str() {
+        wrapper if lookup_mode == LookupMode::Normal && output_wrapper_mode(wrapper).is_some() => {
+            let wrapped = strip_wrapper(invocation, wrapper)?;
+            preflight_invocation(&wrapped, state, LookupMode::Normal, alias_depth)
+        }
         "command" if lookup_mode == LookupMode::Normal => {
             let command_options = parse_command_options(invocation)?;
             if command_options.describe || command_options.unsupported_option.is_some() {
@@ -6224,6 +7231,19 @@ fn preflight_invocation(
             let wrapped = strip_wrapper(invocation, "builtin")?;
             preflight_invocation(&wrapped, state, LookupMode::BuiltinOnly, alias_depth)
         }
+        "agview"
+            if lookup_mode != LookupMode::Normal && lookup_mode != LookupMode::ExternalOnly =>
+        {
+            let mut wrapped = invocation.clone();
+            wrapped.argv.splice(0..1, ["cat".into(), "--".into()]);
+            preflight_invocation(&wrapped, state, LookupMode::Normal, alias_depth)
+        }
+        "agpty" | "pty"
+            if lookup_mode != LookupMode::Normal && lookup_mode != LookupMode::ExternalOnly =>
+        {
+            let wrapped = strip_wrapper(invocation, name)?;
+            preflight_invocation(&wrapped, state, LookupMode::ExternalOnly, alias_depth)
+        }
         _ if lookup_mode == LookupMode::Normal => {
             if state.function(name).is_some() {
                 return Ok(());
@@ -6244,6 +7264,20 @@ fn preflight_invocation(
                     )));
                 }
                 return preflight_invocation(&expanded, state, lookup_mode, alias_depth + 1);
+            }
+            if name == "agview" {
+                let mut wrapped = invocation.clone();
+                wrapped.argv.splice(0..1, ["cat".into(), "--".into()]);
+                return preflight_invocation(&wrapped, state, LookupMode::Normal, alias_depth);
+            }
+            if matches!(name.as_str(), "agpty" | "pty") {
+                let wrapped = strip_wrapper(invocation, name)?;
+                return preflight_invocation(
+                    &wrapped,
+                    state,
+                    LookupMode::ExternalOnly,
+                    alias_depth,
+                );
             }
             preflight_resolved_invocation(invocation, state, lookup_mode)
         }
@@ -6283,29 +7317,27 @@ fn preflight_resolved_invocation(
                 Err(ShellError::not_found(format!("{name}: builtin not found")))
             }
         }
-        LookupMode::ExternalOnly => {
-            if resolve_external_path(invocation, state, name).is_some() {
-                Ok(())
-            } else {
-                Err(ShellError::not_found(format!(
-                    "{name}: external command not found"
-                )))
-            }
-        }
+        LookupMode::ExternalOnly => match resolve_external_command(invocation, state, name) {
+            CommandResolution::External(_) => Ok(()),
+            CommandResolution::NotExecutable(path) => Err(command_not_executable_error(&path)),
+            _ => Err(ShellError::not_found(format!(
+                "{name}: external command not found"
+            ))),
+        },
         LookupMode::Normal | LookupMode::BypassAliases | LookupMode::DefaultPath => {
             if is_builtin(name) {
                 return Ok(());
             }
 
-            let path = if lookup_mode == LookupMode::DefaultPath {
-                resolve_external_path_with(invocation, state, name, DEFAULT_COMMAND_PATH)
+            let resolution = if lookup_mode == LookupMode::DefaultPath {
+                resolve_external_command_with(invocation, state, name, DEFAULT_COMMAND_PATH)
             } else {
-                resolve_external_path(invocation, state, name)
+                resolve_external_command(invocation, state, name)
             };
-            if path.is_some() {
-                Ok(())
-            } else {
-                Err(ShellError::not_found(format!("{name}: command not found")))
+            match resolution {
+                CommandResolution::External(_) => Ok(()),
+                CommandResolution::NotExecutable(path) => Err(command_not_executable_error(&path)),
+                _ => Err(ShellError::not_found(format!("{name}: command not found"))),
             }
         }
     }
@@ -6628,6 +7660,56 @@ fn rich_term_width() -> usize {
         .unwrap_or(100)
 }
 
+/// Own a spawned PTY child until an authoritative `wait`/`try_wait` result
+/// proves that it has been reaped. Every earlier return kills and waits for it.
+struct PtyChildGuard {
+    child: Option<Child>,
+}
+
+impl PtyChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        let status = self
+            .child
+            .as_mut()
+            .expect("PTY child guard was already disarmed")
+            .try_wait()?;
+        if status.is_some() {
+            self.child = None;
+        }
+        Ok(status)
+    }
+
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        let status = self
+            .child
+            .as_mut()
+            .expect("PTY child guard was already disarmed")
+            .wait()?;
+        self.child = None;
+        Ok(status)
+    }
+}
+
+impl Drop for PtyChildGuard {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        let _ = child.kill();
+        loop {
+            match child.wait() {
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 /// PTY broker: run an external command connected to a pseudo-terminal so it
 /// sees a TTY on its stdio (e.g. for tools that change behavior under `isatty`).
 /// The controller side is drained into the captured output.
@@ -6639,8 +7721,12 @@ fn run_under_pty(
     use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
 
     let name = invocation.argv[0].as_str();
-    let Some(path) = resolve_external_path(invocation, state, name) else {
-        return Ok(command_not_found_outcome(name, state));
+    let path = match resolve_external_command(invocation, state, name) {
+        CommandResolution::External(path) => path,
+        CommandResolution::NotExecutable(path) => {
+            return Ok(command_not_executable_outcome(&path));
+        }
+        _ => return Ok(command_not_found_outcome(name, state)),
     };
 
     fn pty_err(label: &str, e: rustix::io::Errno) -> ShellError {
@@ -6661,6 +7747,9 @@ fn run_under_pty(
         Mode::empty(),
     )
     .map_err(|e| pty_err("open pts", e))?;
+    // This setup does not depend on the child. Complete it before spawning so
+    // failure cannot create a process that then needs cleanup.
+    rustix::io::ioctl_fionbio(&controller, true).map_err(|e| pty_err("nonblock", e))?;
 
     let mut command = Command::new(&path);
     command.args(&invocation.argv[1..]);
@@ -6673,10 +7762,9 @@ fn run_under_pty(
     command.stdout(Stdio::from(peripheral.try_clone()?));
     command.stderr(Stdio::from(peripheral));
 
-    let mut child = command.spawn()?;
+    let mut child = PtyChildGuard::new(spawn_external_command(&mut command, &path)?);
     // Drain the controller. Linux EOFs (EIO) the master when the peripheral
     // closes, but macOS may block, so read non-blocking and poll the child.
-    rustix::io::ioctl_fionbio(&controller, true).map_err(|e| pty_err("nonblock", e))?;
     let mut reader = std::fs::File::from(controller);
     let mut output = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -6688,8 +7776,6 @@ fn run_under_pty(
                 if let Err(error) =
                     append_bounded_pty_output(&mut output, &chunk[..n], MAX_PTY_CAPTURE_BYTES)
                 {
-                    let _ = child.kill();
-                    let _ = child.wait();
                     return Err(error.into());
                 }
             }
@@ -6710,8 +7796,6 @@ fn run_under_pty(
                             &chunk[..n],
                             MAX_PTY_CAPTURE_BYTES,
                         ) {
-                            let _ = child.kill();
-                            let _ = child.wait();
                             return Err(error.into());
                         }
                     }
@@ -6919,6 +8003,7 @@ struct DirectChildCaptureReader {
     direct_child_exited: Arc<AtomicBool>,
     incomplete: Option<TraceSpoolIncompleteMarker>,
     preview_incomplete: Arc<AtomicBool>,
+    drain_admission: Option<CaptureDrainAdmission>,
     post_exit_started: Option<Instant>,
     post_exit_bytes: usize,
     handoff_result: Option<CaptureDrainHandoff>,
@@ -6931,6 +8016,41 @@ impl DirectChildCaptureReader {
         incomplete: Option<TraceSpoolIncompleteMarker>,
         preview_incomplete: Arc<AtomicBool>,
     ) -> io::Result<Self> {
+        #[cfg(test)]
+        if FORCE_CAPTURE_ADMISSION_FAILURE.with(std::cell::Cell::get) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "injected capture-drain capacity exhausted",
+            ));
+        }
+        Self::new_with_admission(
+            inner,
+            direct_child_exited,
+            incomplete,
+            preview_incomplete,
+            &ACTIVE_CAPTURE_DRAIN_WORKERS,
+            MAX_CAPTURE_DRAIN_WORKERS,
+        )
+    }
+
+    fn new_with_admission(
+        inner: Box<dyn CaptureReader>,
+        direct_child_exited: Arc<AtomicBool>,
+        incomplete: Option<TraceSpoolIncompleteMarker>,
+        preview_incomplete: Arc<AtomicBool>,
+        active: &'static AtomicUsize,
+        limit: usize,
+    ) -> io::Result<Self> {
+        let drain_admission = try_acquire_capture_drain_slot(active, limit).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "capture-drain capacity exhausted ({limit} active readers/workers); \
+                     refusing capture rather than waiting indefinitely or closing a live \
+                     descendant pipe"
+                ),
+            )
+        })?;
         let flags = rustix::fs::fcntl_getfl(&inner)
             .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
         rustix::fs::fcntl_setfl(&inner, flags | rustix::fs::OFlags::NONBLOCK)
@@ -6940,10 +8060,30 @@ impl DirectChildCaptureReader {
             direct_child_exited,
             incomplete,
             preview_incomplete,
+            drain_admission: Some(drain_admission),
             post_exit_started: None,
             post_exit_bytes: 0,
             handoff_result: None,
         })
+    }
+
+    #[cfg(test)]
+    fn new_with_admission_for_test(
+        inner: Box<dyn CaptureReader>,
+        direct_child_exited: Arc<AtomicBool>,
+        incomplete: Option<TraceSpoolIncompleteMarker>,
+        preview_incomplete: Arc<AtomicBool>,
+        active: &'static AtomicUsize,
+        limit: usize,
+    ) -> io::Result<Self> {
+        Self::new_with_admission(
+            inner,
+            direct_child_exited,
+            incomplete,
+            preview_incomplete,
+            active,
+            limit,
+        )
     }
 
     fn mark_incomplete(&self) {
@@ -6965,7 +8105,12 @@ impl DirectChildCaptureReader {
             self.handoff_result = Some(CaptureDrainHandoff::Unavailable);
             return CaptureDrainHandoff::Unavailable;
         };
-        let result = launch_capture_drain_worker(helper, reader, CAPTURE_DRAIN_ACK_TIMEOUT);
+        let result = launch_capture_drain_worker(
+            helper,
+            reader,
+            CAPTURE_DRAIN_ACK_TIMEOUT,
+            &mut self.drain_admission,
+        );
         self.handoff_result = Some(result);
         if result == CaptureDrainHandoff::Ambiguous {
             self.mark_incomplete();
@@ -7031,6 +8176,15 @@ where
         incomplete,
         Arc::clone(&preview_incomplete),
     )?;
+    spawn_capture_reader_thread(reader, spool, bounded_capture, preview_incomplete)
+}
+
+fn spawn_capture_reader_thread(
+    reader: DirectChildCaptureReader,
+    spool: Option<TraceSpoolWriter>,
+    bounded_capture: bool,
+    preview_incomplete: Arc<AtomicBool>,
+) -> io::Result<CaptureJoinHandle> {
     std::thread::Builder::new().spawn(move || {
         let mut capture = read_capture_stream_for_observation(reader, spool, bounded_capture)?;
         if preview_incomplete.load(Ordering::Acquire) {
@@ -7038,6 +8192,89 @@ where
         }
         Ok(capture)
     })
+}
+
+fn spawn_post_child_thread<T, F>(
+    name: &'static str,
+    run: F,
+) -> io::Result<std::thread::JoinHandle<T>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    #[cfg(test)]
+    {
+        let injected_failure = POST_CHILD_THREAD_FAILURE_AFTER.with(|remaining| {
+            let Some(count) = remaining.get() else {
+                return false;
+            };
+            if count == 0 {
+                remaining.set(None);
+                true
+            } else {
+                remaining.set(Some(count - 1));
+                false
+            }
+        });
+        if injected_failure {
+            return Err(io::Error::other(format!(
+                "injected {name} thread start failure"
+            )));
+        }
+    }
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(run)
+}
+
+#[cfg(test)]
+fn record_post_child_pid(child: &Child) {
+    LAST_POST_CHILD_PID.with(|pid| pid.set(Some(child.id())));
+}
+
+#[cfg(not(test))]
+fn record_post_child_pid(_child: &Child) {}
+
+fn abort_external_capture_start(
+    child: &mut Child,
+    direct_child_exited: &Arc<AtomicBool>,
+    stdin_writer: Option<std::thread::JoinHandle<io::Result<()>>>,
+    capture_readers: Vec<CaptureJoinHandle>,
+) {
+    signal_cancellable_child_group(child, rustix::process::Signal::KILL);
+    terminate_child(child);
+    direct_child_exited.store(true, Ordering::Release);
+    for reader in capture_readers {
+        let _ = reader.join();
+    }
+    if let Some(writer) = stdin_writer {
+        let _ = writer.join();
+    }
+}
+
+#[cfg(test)]
+fn spawn_exit_aware_capture_reader_with_admission_for_test<R>(
+    reader: R,
+    spool: Option<TraceSpoolWriter>,
+    bounded_capture: bool,
+    direct_stages_exited: Arc<AtomicBool>,
+    active: &'static AtomicUsize,
+    limit: usize,
+) -> io::Result<CaptureJoinHandle>
+where
+    R: CaptureReader + 'static,
+{
+    let incomplete = spool.as_ref().map(TraceSpoolWriter::incomplete_marker);
+    let preview_incomplete = Arc::new(AtomicBool::new(false));
+    let reader = DirectChildCaptureReader::new_with_admission_for_test(
+        Box::new(reader),
+        direct_stages_exited,
+        incomplete,
+        Arc::clone(&preview_incomplete),
+        active,
+        limit,
+    )?;
+    spawn_capture_reader_thread(reader, spool, bounded_capture, preview_incomplete)
 }
 
 fn read_exact_capture(reader: &mut impl Read, limit: usize) -> io::Result<Vec<u8>> {
@@ -7056,7 +8293,7 @@ fn read_exact_capture(reader: &mut impl Read, limit: usize) -> io::Result<Vec<u8
 
 fn wait_child_interruptibly(child: &mut Child, state: &ShellState) -> io::Result<ExitStatus> {
     loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = try_wait_child_retry(child)? {
             if state.interrupted() {
                 signal_cancellable_child_group(child, rustix::process::Signal::KILL);
             }
@@ -7068,7 +8305,7 @@ fn wait_child_interruptibly(child: &mut Child, state: &ShellState) -> io::Result
             signal_cancellable_child_group(child, rustix::process::Signal::INT);
             let deadline = Instant::now() + INTERRUPTED_CHILD_STATUS_GRACE;
             while Instant::now() < deadline {
-                if let Some(status) = child.try_wait()? {
+                if let Some(status) = try_wait_child_retry(child)? {
                     // A non-interactive shell may exit on SIGINT while a
                     // background descendant in the same group ignores it.
                     signal_cancellable_child_group(child, rustix::process::Signal::KILL);
@@ -7082,8 +8319,8 @@ fn wait_child_interruptibly(child: &mut Child, state: &ShellState) -> io::Result
             // cannot survive the direct child; ordinary foreground commands keep
             // their existing process-group behavior.
             signal_cancellable_child_group(child, rustix::process::Signal::KILL);
-            let _ = child.kill();
-            return child.wait();
+            let _ = retry_interrupted(|| child.kill());
+            return wait_child_retry(child);
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -7228,19 +8465,9 @@ fn run_external(
                 let stderr_incomplete = stderr_spool
                     .as_ref()
                     .map(TraceSpoolWriter::incomplete_marker);
-                let mut child = command.spawn()?;
-                let stdin_writer = match (stdin_is_piped, stdin_data, child.stdin.take()) {
-                    (true, Some(input), Some(mut stdin)) => {
-                        let buf = input.to_vec();
-                        Some(std::thread::spawn(move || -> io::Result<()> {
-                            match stdin.write_all(&buf) {
-                                Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(e),
-                                _ => Ok(()),
-                            }
-                        }))
-                    }
-                    _ => None,
-                };
+                let spawn_path = command_path.unwrap_or_else(|| Path::new(&invocation.argv[0]));
+                let mut child = spawn_external_command(&mut command, spawn_path)?;
+                record_post_child_pid(&child);
                 // stdout streams to the pipe. Make stderr exit-aware so a
                 // background descendant retaining fd2 cannot keep the direct
                 // pipeline stage alive after its child has exited.
@@ -7255,26 +8482,71 @@ fn run_external(
                     ) {
                         Ok(reader) => Some(reader),
                         Err(error) => {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            abort_external_capture_start(
+                                &mut child,
+                                &direct_child_exited,
+                                None,
+                                Vec::new(),
+                            );
                             return Err(error.into());
                         }
                     },
                     None => None,
                 };
-                let stderr_handle = stderr_reader.map(|reader| {
-                    std::thread::spawn(move || -> io::Result<CapturedStream> {
-                        let mut capture = read_capture_stream_for_observation(
-                            reader,
-                            stderr_spool,
-                            bounded_observation,
-                        )?;
-                        if stderr_preview_incomplete.load(Ordering::Acquire) {
-                            capture.preview_complete = false;
+                let stdin_writer = match (stdin_is_piped, stdin_data, child.stdin.take()) {
+                    (true, Some(input), Some(mut stdin)) => {
+                        let buf = input.to_vec();
+                        match spawn_post_child_thread(
+                            "agsh-external-stdin",
+                            move || -> io::Result<()> {
+                                match stdin.write_all(&buf) {
+                                    Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(e),
+                                    _ => Ok(()),
+                                }
+                            },
+                        ) {
+                            Ok(writer) => Some(writer),
+                            Err(error) => {
+                                abort_external_capture_start(
+                                    &mut child,
+                                    &direct_child_exited,
+                                    None,
+                                    Vec::new(),
+                                );
+                                return Err(error.into());
+                            }
                         }
-                        Ok(capture)
-                    })
-                });
+                    }
+                    _ => None,
+                };
+                let stderr_handle = match stderr_reader {
+                    Some(reader) => match spawn_post_child_thread(
+                        "agsh-external-stderr",
+                        move || -> io::Result<CapturedStream> {
+                            let mut capture = read_capture_stream_for_observation(
+                                reader,
+                                stderr_spool,
+                                bounded_observation,
+                            )?;
+                            if stderr_preview_incomplete.load(Ordering::Acquire) {
+                                capture.preview_complete = false;
+                            }
+                            Ok(capture)
+                        },
+                    ) {
+                        Ok(reader) => Some(reader),
+                        Err(error) => {
+                            abort_external_capture_start(
+                                &mut child,
+                                &direct_child_exited,
+                                stdin_writer,
+                                Vec::new(),
+                            );
+                            return Err(error.into());
+                        }
+                    },
+                    None => None,
+                };
                 let status_result =
                     wait_child_interruptibly(&mut child, state).map_err(ShellError::from);
                 direct_child_exited.store(true, Ordering::Release);
@@ -7320,8 +8592,11 @@ fn run_external(
         let stderr_incomplete = stderr_spool
             .as_ref()
             .map(TraceSpoolWriter::incomplete_marker);
-        let mut child = command.spawn()?;
+        let spawn_path = command_path.unwrap_or_else(|| Path::new(&invocation.argv[0]));
+        let mut child = spawn_external_command(&mut command, spawn_path)?;
+        record_post_child_pid(&child);
         drop(command);
+        let direct_child_exited = Arc::new(AtomicBool::new(false));
         // Feed stdin from a separate thread so `wait_with_output` can drain the
         // child's stdout/stderr concurrently. Writing all of stdin first would
         // deadlock once a child that echoes its input fills the stdout pipe
@@ -7330,13 +8605,23 @@ fn run_external(
         let stdin_writer = match (stdin_is_piped, stdin_data, child.stdin.take()) {
             (true, Some(input), Some(mut stdin)) => {
                 let buf = input.to_vec();
-                Some(std::thread::spawn(move || -> io::Result<()> {
+                match spawn_post_child_thread("agsh-external-stdin", move || -> io::Result<()> {
                     match stdin.write_all(&buf) {
                         Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(e),
                         _ => Ok(()),
                     }
-                    // `stdin` drops here, sending EOF.
-                }))
+                }) {
+                    Ok(writer) => Some(writer),
+                    Err(error) => {
+                        abort_external_capture_start(
+                            &mut child,
+                            &direct_child_exited,
+                            None,
+                            Vec::new(),
+                        );
+                        return Err(error.into());
+                    }
+                }
             }
             _ => None,
         };
@@ -7362,7 +8647,6 @@ fn run_external(
                 .take()
                 .map(|reader| Box::new(reader) as Box<dyn CaptureReader>),
         };
-        let direct_child_exited = Arc::new(AtomicBool::new(false));
         let stdout_preview_incomplete = Arc::new(AtomicBool::new(false));
         let stderr_preview_incomplete = Arc::new(AtomicBool::new(false));
         let stdout_reader = match stdout_pipe {
@@ -7375,8 +8659,12 @@ fn run_external(
                 ) {
                     Ok(reader) => Some(reader),
                     Err(error) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        abort_external_capture_start(
+                            &mut child,
+                            &direct_child_exited,
+                            stdin_writer,
+                            Vec::new(),
+                        );
                         return Err(error.into());
                     }
                 }
@@ -7393,34 +8681,74 @@ fn run_external(
                 ) {
                     Ok(reader) => Some(reader),
                     Err(error) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        abort_external_capture_start(
+                            &mut child,
+                            &direct_child_exited,
+                            stdin_writer,
+                            Vec::new(),
+                        );
                         return Err(error.into());
                     }
                 }
             }
             None => None,
         };
-        let stdout_handle = stdout_reader.map(|reader| {
-            std::thread::spawn(move || -> io::Result<CapturedStream> {
-                let mut capture =
-                    read_capture_stream_for_observation(reader, stdout_spool, bounded_observation)?;
-                if stdout_preview_incomplete.load(Ordering::Acquire) {
-                    capture.preview_complete = false;
+        let stdout_handle = match stdout_reader {
+            Some(reader) => match spawn_post_child_thread(
+                "agsh-external-stdout",
+                move || -> io::Result<CapturedStream> {
+                    let mut capture = read_capture_stream_for_observation(
+                        reader,
+                        stdout_spool,
+                        bounded_observation,
+                    )?;
+                    if stdout_preview_incomplete.load(Ordering::Acquire) {
+                        capture.preview_complete = false;
+                    }
+                    Ok(capture)
+                },
+            ) {
+                Ok(reader) => Some(reader),
+                Err(error) => {
+                    abort_external_capture_start(
+                        &mut child,
+                        &direct_child_exited,
+                        stdin_writer,
+                        Vec::new(),
+                    );
+                    return Err(error.into());
                 }
-                Ok(capture)
-            })
-        });
-        let stderr_handle = stderr_reader.map(|reader| {
-            std::thread::spawn(move || -> io::Result<CapturedStream> {
-                let mut capture =
-                    read_capture_stream_for_observation(reader, stderr_spool, bounded_observation)?;
-                if stderr_preview_incomplete.load(Ordering::Acquire) {
-                    capture.preview_complete = false;
+            },
+            None => None,
+        };
+        let stderr_handle = match stderr_reader {
+            Some(reader) => match spawn_post_child_thread(
+                "agsh-external-stderr",
+                move || -> io::Result<CapturedStream> {
+                    let mut capture = read_capture_stream_for_observation(
+                        reader,
+                        stderr_spool,
+                        bounded_observation,
+                    )?;
+                    if stderr_preview_incomplete.load(Ordering::Acquire) {
+                        capture.preview_complete = false;
+                    }
+                    Ok(capture)
+                },
+            ) {
+                Ok(reader) => Some(reader),
+                Err(error) => {
+                    abort_external_capture_start(
+                        &mut child,
+                        &direct_child_exited,
+                        stdin_writer,
+                        stdout_handle.into_iter().collect(),
+                    );
+                    return Err(error.into());
                 }
-                Ok(capture)
-            })
-        });
+            },
+            None => None,
+        };
 
         let status_result = wait_child_interruptibly(&mut child, state).map_err(ShellError::from);
         direct_child_exited.store(true, Ordering::Release);
@@ -7466,7 +8794,8 @@ fn run_external(
         }
         Ok(outcome)
     } else {
-        let mut child = command.spawn()?;
+        let spawn_path = command_path.unwrap_or_else(|| Path::new(&invocation.argv[0]));
+        let mut child = spawn_external_command(&mut command, spawn_path)?;
         if stdin_is_piped {
             if let (Some(input), Some(mut stdin)) = (stdin_data, child.stdin.take()) {
                 // stdout/stderr are inherited here (no deadlock), but a child can
@@ -8164,6 +9493,10 @@ fn command_invocation_accepts_streaming_stdin(
         return true;
     }
 
+    if output_wrapper_mode(name).is_some() || matches!(name.as_str(), "agview" | "agpty" | "pty") {
+        return true;
+    }
+
     if name == "builtin" {
         return invocation
             .argv
@@ -8505,7 +9838,7 @@ fn spawn_resolved_external_stage(
         inherit_stdout,
         inherit_stderr,
     )?;
-    let child = command.spawn()?;
+    let child = spawn_external_command(&mut command, &resolved.path)?;
     Ok((child, output_readers))
 }
 
@@ -8536,7 +9869,7 @@ fn spawn_resolved_external_stage_with_targets(
     )?;
     debug_assert!(readers.stdout.is_none());
     debug_assert!(readers.stderr.is_none());
-    command.spawn().map_err(ShellError::from)
+    spawn_external_command(&mut command, &resolved.path)
 }
 
 struct MaterializedExternalPipelineRouting {
@@ -9031,16 +10364,25 @@ fn run_live_streaming_mixed_shell_stage_pipeline(
                 running_stages.push(RunningStreamingStage::External(child));
             }
             ResolvedStreamingStage::Shell(shell_stage) => {
-                running_stages.push(RunningStreamingStage::Shell(
-                    spawn_shell_pipeline_stage_with_routing(
-                        shell_stage.clone(),
-                        state.clone(),
-                        stage_stdin,
-                        stage_routing,
-                        options.output_mode,
-                        options.allow_process_replacement,
-                    ),
-                ));
+                let shell = match spawn_shell_pipeline_stage_with_routing(
+                    shell_stage.clone(),
+                    state.clone(),
+                    stage_stdin,
+                    stage_routing.clone(),
+                    options.output_mode,
+                    options.allow_process_replacement,
+                ) {
+                    Ok(shell) => shell,
+                    Err(error) => {
+                        terminate_running_streaming_stages(&mut running_stages, state);
+                        drop(stage_routing);
+                        drop(previous_stdout);
+                        drop(base_routing);
+                        let _ = materialized.finish(1);
+                        return Err(error);
+                    }
+                };
+                running_stages.push(RunningStreamingStage::Shell(shell));
             }
         }
     }
@@ -9209,14 +10551,29 @@ fn run_streaming_mixed_shell_stage_pipeline(
                     previous_pipe_closed = false;
                 }
 
-                running_stages.push(RunningStreamingStage::Shell(spawn_shell_pipeline_stage(
+                let shell = match spawn_shell_pipeline_stage(
                     shell_stage.clone(),
                     state.clone(),
                     stage_stdin,
                     stdout_writer,
                     options.output_mode,
                     options.allow_process_replacement,
-                )));
+                ) {
+                    Ok(shell) => shell,
+                    Err(error) => {
+                        terminate_running_streaming_stages(&mut running_stages, state);
+                        exit_guard.signal();
+                        drop(previous_stdout);
+                        if let Some(handle) = final_stdout_handle.take() {
+                            let _ = handle.join();
+                        }
+                        for handle in stderr_handles.drain(..) {
+                            let _ = handle.join();
+                        }
+                        return Err(error);
+                    }
+                };
+                running_stages.push(RunningStreamingStage::Shell(shell));
             }
         }
     }
@@ -9301,15 +10658,13 @@ fn terminate_running_streaming_stages(
 
     for stage in stages.iter_mut() {
         if let RunningStreamingStage::External(child) = stage {
-            let _ = child.kill();
+            terminate_child(child);
         }
     }
 
     for stage in stages.drain(..) {
         match stage {
-            RunningStreamingStage::External(mut child) => {
-                let _ = child.wait();
-            }
+            RunningStreamingStage::External(_) => {}
             RunningStreamingStage::Shell(shell) => {
                 let _ = shell.thread.join();
             }
@@ -9417,19 +10772,51 @@ fn run_streaming_external_shell_stage_pipeline(
             return Err(error);
         }
     };
-    let shell_threads = stage_specs
-        .into_iter()
-        .map(|(shell_stage, stage_stdin, shell_stdout_writer)| {
-            spawn_shell_pipeline_stage(
-                shell_stage,
-                state.clone(),
-                stage_stdin,
-                shell_stdout_writer,
-                options.output_mode,
-                options.allow_process_replacement,
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut shell_threads = Vec::with_capacity(stage_specs.len());
+    let mut stage_specs = stage_specs.into_iter();
+    while let Some((shell_stage, stage_stdin, shell_stdout_writer)) = stage_specs.next() {
+        match spawn_shell_pipeline_stage(
+            shell_stage,
+            state.clone(),
+            stage_stdin,
+            shell_stdout_writer,
+            options.output_mode,
+            options.allow_process_replacement,
+        ) {
+            Ok(shell) => shell_threads.push(shell),
+            Err(error) => {
+                drop(stage_specs);
+                let mut running_stages = shell_threads
+                    .drain(..)
+                    .map(RunningStreamingStage::Shell)
+                    .chain(
+                        prefix
+                            .children
+                            .drain(..)
+                            .map(RunningStreamingStage::External),
+                    )
+                    .chain(
+                        suffix
+                            .children
+                            .drain(..)
+                            .map(RunningStreamingStage::External),
+                    )
+                    .collect::<Vec<_>>();
+                terminate_running_streaming_stages(&mut running_stages, state);
+                exit_guard.signal();
+                for handle in prefix.stderr_handles.drain(..) {
+                    let _ = handle.join();
+                }
+                for handle in suffix.stderr_handles.drain(..) {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = suffix.final_stdout_handle.take() {
+                    let _ = handle.join();
+                }
+                return Err(error);
+            }
+        }
+    }
 
     let mut shell_outcomes = Vec::with_capacity(shell_threads.len());
     for thread in shell_threads {
@@ -9498,39 +10885,51 @@ fn spawn_shell_pipeline_stage(
     shell_stdout_writer: io::PipeWriter,
     output_mode: OutputMode,
     allow_process_replacement: bool,
-) -> RunningShellStage {
+) -> Result<RunningShellStage, ShellError> {
     let routing = inherited_capture_routing();
+    let wrapper_policy = active_wrapper_policy();
+    #[cfg(test)]
+    let (wrapper_policy_sender, wrapper_policy_receiver) = mpsc::channel();
     let interrupt = stage_state.interrupt_flag();
-    let thread = std::thread::spawn(move || {
-        with_cancellable_shell_stage(|| {
-            with_stream_raw_to_parent(!output_mode.should_capture(), || {
-                with_inherited_capture_routing(routing, || {
-                    let run_stage = |state: &mut ShellState| {
-                        run_with_streaming_stdout(state, shell_stdout_writer, |state| {
-                            let mut outcome = run_pipeline_command_invocation(
-                                &shell_stage,
-                                state,
-                                output_mode,
-                                None,
-                                true,
-                                true,
-                                allow_process_replacement,
-                            )?;
-                            emit_streaming_stdout(state, &mut outcome)?;
-                            Ok(outcome)
-                        })
-                    };
+    let thread = spawn_shell_stage_thread(move || {
+        with_inherited_wrapper_policy(wrapper_policy, || {
+            #[cfg(test)]
+            let _ = wrapper_policy_sender.send(active_wrapper_policy());
+            with_cancellable_shell_stage(|| {
+                with_stream_raw_to_parent(!output_mode.should_capture(), || {
+                    with_inherited_capture_routing(routing, || {
+                        let run_stage = |state: &mut ShellState| {
+                            run_with_streaming_stdout(state, shell_stdout_writer, |state| {
+                                let mut outcome = run_pipeline_command_invocation(
+                                    &shell_stage,
+                                    state,
+                                    output_mode,
+                                    None,
+                                    true,
+                                    true,
+                                    allow_process_replacement,
+                                )?;
+                                emit_streaming_stdout(state, &mut outcome)?;
+                                Ok(outcome)
+                            })
+                        };
 
-                    if let Some(stdin) = shell_stdin {
-                        run_with_streaming_stdin(&mut stage_state, stdin, run_stage)
-                    } else {
-                        run_with_buffered_stdin(&mut stage_state, Some(&[]), run_stage)
-                    }
+                        if let Some(stdin) = shell_stdin {
+                            run_with_streaming_stdin(&mut stage_state, stdin, run_stage)
+                        } else {
+                            run_with_buffered_stdin(&mut stage_state, Some(&[]), run_stage)
+                        }
+                    })
                 })
             })
         })
-    });
-    RunningShellStage { thread, interrupt }
+    })?;
+    Ok(RunningShellStage {
+        thread,
+        interrupt,
+        #[cfg(test)]
+        inherited_wrapper_policy: wrapper_policy_receiver,
+    })
 }
 
 fn spawn_shell_pipeline_stage_with_routing(
@@ -9540,40 +10939,91 @@ fn spawn_shell_pipeline_stage_with_routing(
     routing: InheritedCaptureRouting,
     output_mode: OutputMode,
     allow_process_replacement: bool,
-) -> RunningShellStage {
+) -> Result<RunningShellStage, ShellError> {
+    let wrapper_policy = active_wrapper_policy();
+    #[cfg(test)]
+    let (wrapper_policy_sender, wrapper_policy_receiver) = mpsc::channel();
     let interrupt = stage_state.interrupt_flag();
-    let thread = std::thread::spawn(move || {
-        with_cancellable_shell_stage(|| {
-            with_stream_raw_to_parent(!output_mode.should_capture(), || {
-                with_inherited_capture_routing(routing, || {
-                    let run_stage = |state: &mut ShellState| {
-                        let mut outcome = run_pipeline_command_invocation(
-                            &shell_stage,
-                            state,
-                            output_mode,
-                            None,
-                            true,
-                            true,
-                            allow_process_replacement,
-                        )?;
-                        // Diagnostics synthesized above an invocation still need the
-                        // stage fd table even when the invocation itself already wrote
-                        // its streams live.
-                        apply_builtin_redirections(&mut outcome, &[], state)?;
-                        Ok(outcome)
-                    };
+    let thread = spawn_shell_stage_thread(move || {
+        with_inherited_wrapper_policy(wrapper_policy, || {
+            #[cfg(test)]
+            let _ = wrapper_policy_sender.send(active_wrapper_policy());
+            with_cancellable_shell_stage(|| {
+                with_stream_raw_to_parent(!output_mode.should_capture(), || {
+                    with_inherited_capture_routing(routing, || {
+                        let run_stage = |state: &mut ShellState| {
+                            let mut outcome = run_pipeline_command_invocation(
+                                &shell_stage,
+                                state,
+                                output_mode,
+                                None,
+                                true,
+                                true,
+                                allow_process_replacement,
+                            )?;
+                            // Diagnostics synthesized above an invocation still need the
+                            // stage fd table even when the invocation itself already wrote
+                            // its streams live.
+                            apply_builtin_redirections(&mut outcome, &[], state)?;
+                            Ok(outcome)
+                        };
 
-                    if let Some(stdin) = shell_stdin {
-                        run_with_streaming_stdin(&mut stage_state, stdin, run_stage)
-                    } else {
-                        run_with_buffered_stdin(&mut stage_state, Some(&[]), run_stage)
-                    }
+                        if let Some(stdin) = shell_stdin {
+                            run_with_streaming_stdin(&mut stage_state, stdin, run_stage)
+                        } else {
+                            run_with_buffered_stdin(&mut stage_state, Some(&[]), run_stage)
+                        }
+                    })
                 })
             })
         })
-    });
-    RunningShellStage { thread, interrupt }
+    })?;
+    Ok(RunningShellStage {
+        thread,
+        interrupt,
+        #[cfg(test)]
+        inherited_wrapper_policy: wrapper_policy_receiver,
+    })
 }
+
+fn spawn_shell_stage_thread<F>(
+    run: F,
+) -> io::Result<std::thread::JoinHandle<Result<CommandOutcome, ShellError>>>
+where
+    F: FnOnce() -> Result<CommandOutcome, ShellError> + Send + 'static,
+{
+    #[cfg(test)]
+    {
+        let injected_failure = SHELL_STAGE_THREAD_FAILURE_AFTER.with(|remaining| {
+            let Some(count) = remaining.get() else {
+                return false;
+            };
+            if count == 0 {
+                remaining.set(None);
+                true
+            } else {
+                remaining.set(Some(count - 1));
+                false
+            }
+        });
+        if injected_failure {
+            return Err(io::Error::other(
+                "injected pipeline shell-stage thread start failure",
+            ));
+        }
+    }
+    std::thread::Builder::new()
+        .name("agsh-pipeline-shell-stage".to_string())
+        .spawn(run)
+}
+
+#[cfg(test)]
+fn record_shell_pipeline_child(child: &Child) {
+    LAST_SHELL_PIPELINE_CHILD_PIDS.with(|pids| pids.borrow_mut().push(child.id()));
+}
+
+#[cfg(not(test))]
+fn record_shell_pipeline_child(_child: &Child) {}
 
 fn spawn_external_prefix_for_shell_stage(
     commands: &[ResolvedExternalInvocation],
@@ -9611,6 +11061,7 @@ fn spawn_external_prefix_for_shell_stage(
                     return Err(error);
                 }
             };
+        record_shell_pipeline_child(&child);
         children.push(child);
 
         if let Some(stderr) = output_readers.stderr {
@@ -9692,6 +11143,7 @@ fn spawn_external_suffix_from_shell_stage(
                     return Err(error);
                 }
             };
+        record_shell_pipeline_child(&child);
         children.push(child);
 
         if let Some(stderr) = output_readers.stderr {
@@ -10367,8 +11819,7 @@ fn join_capture_reader(
 
 fn terminate_children(children: &mut [Child]) {
     for child in children {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_child(child);
     }
 }
 
@@ -15162,14 +16613,65 @@ pub fn print_captured_if_needed(
     outcome: &CommandOutcome,
     _options: &ExecutionOptions,
 ) -> Result<(), ShellError> {
-    if let Some(observation) = &outcome.observation {
+    if let Some(presented) = &outcome.presented {
+        let mut stdout = io::stdout().lock();
+        let mut stderr = io::stderr().lock();
+        if let Some(order) = presented.validated_output_order() {
+            for span in order {
+                let bytes = match span.stream {
+                    OutputStream::Stdout => &presented.stdout[span.start..span.start + span.len],
+                    OutputStream::Stderr => &presented.stderr[span.start..span.start + span.len],
+                };
+                match span.stream {
+                    OutputStream::Stdout => {
+                        pipe_ok(stdout.write_all(bytes))?;
+                        pipe_ok(stdout.flush())?;
+                    }
+                    OutputStream::Stderr => {
+                        pipe_ok(stderr.write_all(bytes))?;
+                        pipe_ok(stderr.flush())?;
+                    }
+                }
+            }
+        } else {
+            pipe_ok(stdout.write_all(&presented.stdout))?;
+            pipe_ok(stdout.flush())?;
+            pipe_ok(stderr.write_all(&presented.stderr))?;
+            pipe_ok(stderr.flush())?;
+        }
+    } else if outcome.presentation_handled {
+        return Ok(());
+    } else if let Some(observation) = &outcome.observation {
         if !observation.display.is_empty() {
             print!("{}", observation.display);
             pipe_ok(std::io::stdout().flush())?;
         }
     } else {
-        pipe_ok(std::io::stdout().write_all(&outcome.stdout))?;
-        pipe_ok(std::io::stderr().write_all(&outcome.stderr))?;
+        let mut stdout = io::stdout().lock();
+        let mut stderr = io::stderr().lock();
+        if let Some(order) = outcome.validated_output_order() {
+            for span in order {
+                let bytes = match span.stream {
+                    OutputStream::Stdout => &outcome.stdout[span.start..span.start + span.len],
+                    OutputStream::Stderr => &outcome.stderr[span.start..span.start + span.len],
+                };
+                match span.stream {
+                    OutputStream::Stdout => {
+                        pipe_ok(stdout.write_all(bytes))?;
+                        pipe_ok(stdout.flush())?;
+                    }
+                    OutputStream::Stderr => {
+                        pipe_ok(stderr.write_all(bytes))?;
+                        pipe_ok(stderr.flush())?;
+                    }
+                }
+            }
+        } else {
+            pipe_ok(stdout.write_all(&outcome.stdout))?;
+            pipe_ok(stdout.flush())?;
+            pipe_ok(stderr.write_all(&outcome.stderr))?;
+            pipe_ok(stderr.flush())?;
+        }
     }
     Ok(())
 }
@@ -15182,10 +16684,108 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    struct ExternalCaptureInjectionGuard;
+
+    impl Drop for ExternalCaptureInjectionGuard {
+        fn drop(&mut self) {
+            POST_CHILD_THREAD_FAILURE_AFTER.with(|remaining| remaining.set(None));
+            LAST_POST_CHILD_PID.with(|pid| pid.set(None));
+            FORCE_CAPTURE_ADMISSION_FAILURE.with(|forced| forced.set(false));
+        }
+    }
+
+    struct ShellStageInjectionGuard;
+
+    impl Drop for ShellStageInjectionGuard {
+        fn drop(&mut self) {
+            SHELL_STAGE_THREAD_FAILURE_AFTER.with(|remaining| remaining.set(None));
+            LAST_SHELL_PIPELINE_CHILD_PIDS.with(|pids| pids.borrow_mut().clear());
+        }
+    }
+
+    fn with_shell_stage_thread_failure<T>(
+        failure_after: usize,
+        run: impl FnOnce() -> T,
+    ) -> (T, Vec<u32>) {
+        let _guard = ShellStageInjectionGuard;
+        SHELL_STAGE_THREAD_FAILURE_AFTER.with(|remaining| {
+            assert!(remaining.replace(Some(failure_after)).is_none());
+        });
+        LAST_SHELL_PIPELINE_CHILD_PIDS.with(|pids| pids.borrow_mut().clear());
+        let result = run();
+        let pids = LAST_SHELL_PIPELINE_CHILD_PIDS.with(|pids| pids.borrow().clone());
+        (result, pids)
+    }
+
+    fn with_external_capture_injection<T>(
+        thread_failure_after: Option<usize>,
+        force_admission_failure: bool,
+        run: impl FnOnce() -> T,
+    ) -> (T, Option<u32>) {
+        let _guard = ExternalCaptureInjectionGuard;
+        POST_CHILD_THREAD_FAILURE_AFTER.with(|remaining| {
+            assert!(remaining.replace(thread_failure_after).is_none());
+        });
+        LAST_POST_CHILD_PID.with(|pid| pid.set(None));
+        FORCE_CAPTURE_ADMISSION_FAILURE.with(|forced| {
+            assert!(!forced.replace(force_admission_failure));
+        });
+        let result = run();
+        let pid = LAST_POST_CHILD_PID.with(std::cell::Cell::get);
+        (result, pid)
+    }
+
     fn private_test_directory(label: &str) -> PathBuf {
         let path = unique_temp_dir(label);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+
+    #[test]
+    fn background_snapshot_handoff_accepts_a_delayed_child_acknowledgement() {
+        let (mut parent, mut child) = UnixStream::pair().unwrap();
+        parent
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        parent
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let child_thread = std::thread::spawn(move || {
+            let mut snapshot = Vec::new();
+            child.read_to_end(&mut snapshot).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            child.write_all(&[BACKGROUND_SNAPSHOT_READY]).unwrap();
+            snapshot
+        });
+
+        handoff_background_snapshot(&mut parent, b"state").unwrap();
+
+        assert_eq!(child_thread.join().unwrap(), b"state");
+        assert!(
+            BACKGROUND_SNAPSHOT_TIMEOUT >= Duration::from_secs(30),
+            "background startup needs headroom under parallel CI load"
+        );
+    }
+
+    #[test]
+    fn background_snapshot_handoff_rejects_a_missing_acknowledgement() {
+        let (mut parent, _child) = UnixStream::pair().unwrap();
+        parent
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        parent
+            .set_write_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+
+        let error = handoff_background_snapshot(&mut parent, b"state").unwrap_err();
+
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ),
+            "unexpected missing-ack error: {error:?}"
+        );
     }
 
     #[test]
@@ -15481,6 +17081,48 @@ mod tests {
         assert_eq!(output, b"12345");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pty_child_guard_kills_and_reaps_after_post_spawn_error() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("spawn PTY cleanup probe");
+        let pid = rustix::process::Pid::from_raw(child.id() as i32).expect("valid child pid");
+
+        let injected: io::Result<()> = {
+            let _child = PtyChildGuard::new(child);
+            Err(io::Error::other("injected post-spawn PTY failure"))
+        };
+
+        assert_eq!(injected.unwrap_err().kind(), io::ErrorKind::Other);
+        assert_eq!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH),
+            "post-spawn PTY failure left child {pid} alive or unreaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_child_guard_preserves_authoritative_wait_status() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .expect("spawn PTY status probe");
+        let pid = rustix::process::Pid::from_raw(child.id() as i32).expect("valid child pid");
+        let mut child = PtyChildGuard::new(child);
+
+        let status = child.wait().expect("wait for PTY status probe");
+
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH),
+            "authoritatively waited PTY child {pid} was not reaped"
+        );
+    }
+
     #[test]
     fn pending_substitution_stderr_has_an_aggregate_limit() {
         let mut state = ShellState::from_current_process();
@@ -15514,9 +17156,11 @@ mod tests {
         started_receive
             .recv_timeout(Duration::from_secs(1))
             .expect("shell stage started");
+        let (_policy_sender, policy_receiver) = mpsc::channel();
         let mut stages = vec![RunningStreamingStage::Shell(RunningShellStage {
             thread,
             interrupt: Arc::clone(&interrupt),
+            inherited_wrapper_policy: policy_receiver,
         })];
 
         terminate_running_streaming_stages(&mut stages, &state);
@@ -15527,6 +17171,41 @@ mod tests {
         assert!(stopped_at > 0);
         std::thread::sleep(Duration::from_millis(10));
         assert_eq!(counter.load(Ordering::Relaxed), stopped_at);
+    }
+
+    #[test]
+    fn shell_pipeline_worker_inherits_the_outer_wrapper_policy() {
+        let graph = parse_line("{ true; }").unwrap();
+        let shell_stage = graph.list.items[0].pipeline.commands[0].clone();
+        let state = ShellState::from_current_process();
+        let (stdout_reader, stdout_writer) = io::pipe().unwrap();
+        let expected = WrapperPolicy {
+            mode: OutputMode::Raw,
+            capture_outputs: false,
+        };
+
+        let shell = with_wrapper_policy(expected, || {
+            spawn_shell_pipeline_stage(
+                shell_stage,
+                state,
+                None,
+                stdout_writer,
+                OutputMode::Semantic,
+                false,
+            )
+            .unwrap()
+        });
+        let RunningShellStage {
+            thread,
+            inherited_wrapper_policy,
+            ..
+        } = shell;
+        let outcome = thread.join().unwrap().unwrap();
+        let observed = inherited_wrapper_policy.recv().unwrap();
+        drop(stdout_reader);
+
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(observed, Some(expected));
     }
 
     #[cfg(unix)]
@@ -15550,7 +17229,8 @@ mod tests {
             stdout_writer,
             OutputMode::Raw,
             false,
-        );
+        )
+        .unwrap();
         let interrupt = Arc::clone(&shell.interrupt);
         let deadline = Instant::now() + Duration::from_secs(2);
         while !marker.exists() {
@@ -15596,7 +17276,8 @@ mod tests {
             stdout_writer,
             OutputMode::Raw,
             false,
-        );
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         let descendant = loop {
             if let Ok(pid) = std::fs::read_to_string(&marker) {
@@ -15821,6 +17502,8 @@ mod tests {
     fn ambiguous_drain_ack_is_killed_before_fallback_reader_resumes() {
         use std::os::fd::AsFd;
 
+        static TEST_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        TEST_ACTIVE.store(0, Ordering::Release);
         let root = unique_temp_dir("capture-drain-ambiguous-ack");
         let cwd_file = root.join("worker.cwd");
         let timeout_helper = root.join("timeout-helper");
@@ -15837,17 +17520,373 @@ mod tests {
         ] {
             let (mut fallback_reader, mut retained_writer) = io::pipe().unwrap();
             let worker_reader = fallback_reader.as_fd().try_clone_to_owned().unwrap();
-            let result = launch_capture_drain_worker(helper, worker_reader, timeout);
+            let mut admission = try_acquire_capture_drain_slot(&TEST_ACTIVE, 1);
+            let result =
+                launch_capture_drain_worker(helper, worker_reader, timeout, &mut admission);
             assert_eq!(result, CaptureDrainHandoff::Ambiguous);
+            assert!(
+                admission.is_some(),
+                "failed handoff must retain local drain admission"
+            );
 
             retained_writer.write_all(b"still-owned-locally").unwrap();
             drop(retained_writer);
             let mut captured = Vec::new();
             fallback_reader.read_to_end(&mut captured).unwrap();
             assert_eq!(captured, b"still-owned-locally");
+            drop(admission);
         }
+        assert_eq!(TEST_ACTIVE.load(Ordering::Acquire), 0);
         assert_eq!(std::fs::read_to_string(&cwd_file).unwrap().trim(), "/");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capture_drain_worker_admission_is_bounded_and_released() {
+        static TEST_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        TEST_ACTIVE.store(0, Ordering::Release);
+
+        let mut admissions = (0..MAX_CAPTURE_DRAIN_WORKERS)
+            .map(|_| {
+                try_acquire_capture_drain_slot(&TEST_ACTIVE, MAX_CAPTURE_DRAIN_WORKERS)
+                    .expect("slot below the ceiling")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            TEST_ACTIVE.load(Ordering::Acquire),
+            MAX_CAPTURE_DRAIN_WORKERS
+        );
+        assert!(
+            try_acquire_capture_drain_slot(&TEST_ACTIVE, MAX_CAPTURE_DRAIN_WORKERS).is_none(),
+            "the session-wide helper ceiling must reject another process"
+        );
+
+        admissions.pop();
+        let replacement = try_acquire_capture_drain_slot(&TEST_ACTIVE, MAX_CAPTURE_DRAIN_WORKERS)
+            .expect("reaped workers release their slot");
+        drop(replacement);
+        drop(admissions);
+        assert_eq!(TEST_ACTIVE.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acknowledged_drain_worker_owns_admission_until_it_is_reaped() {
+        use std::os::fd::AsFd;
+
+        static TEST_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        TEST_ACTIVE.store(0, Ordering::Release);
+        let root = unique_temp_dir("capture-drain-admission-transfer");
+        let helper = root.join("ready-helper");
+        write_executable(&helper, "printf '\\247'; /bin/cat >/dev/null");
+        let (reader, retained_writer) = io::pipe().unwrap();
+        let worker_reader = reader.as_fd().try_clone_to_owned().unwrap();
+        let mut admission = try_acquire_capture_drain_slot(&TEST_ACTIVE, 1);
+
+        let result = launch_capture_drain_worker(
+            &helper,
+            worker_reader,
+            CAPTURE_DRAIN_ACK_TIMEOUT,
+            &mut admission,
+        );
+
+        assert_eq!(result, CaptureDrainHandoff::Transferred);
+        assert!(admission.is_none(), "acknowledged worker did not take slot");
+        assert_eq!(TEST_ACTIVE.load(Ordering::Acquire), 1);
+        drop(reader);
+        drop(retained_writer);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while TEST_ACTIVE.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            TEST_ACTIVE.load(Ordering::Acquire),
+            0,
+            "reaped worker did not release its admission"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saturated_capture_drain_capacity_fails_during_reader_setup() {
+        static TEST_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        TEST_ACTIVE.store(0, Ordering::Release);
+        let root = unique_temp_dir("capture-drain-saturation");
+        let trace_dir = root.join("traces");
+        let mut state = ShellState::from_current_process();
+        state.export_var("AGSH_TRACE_DIR", trace_dir.display().to_string());
+        let spool = state.create_trace_spool("out").unwrap();
+        let admissions = (0..MAX_CAPTURE_DRAIN_WORKERS)
+            .map(|_| {
+                try_acquire_capture_drain_slot(&TEST_ACTIVE, MAX_CAPTURE_DRAIN_WORKERS)
+                    .expect("slot below the ceiling")
+            })
+            .collect::<Vec<_>>();
+        let (reader, _retained_writer) = io::pipe().unwrap();
+        let started = Instant::now();
+
+        let result = spawn_exit_aware_capture_reader_with_admission_for_test(
+            reader,
+            Some(spool),
+            true,
+            Arc::new(AtomicBool::new(false)),
+            &TEST_ACTIVE,
+            MAX_CAPTURE_DRAIN_WORKERS,
+        );
+
+        let error = match result {
+            Ok(_) => panic!("a 65th active capture reader bypassed the drain ceiling"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            error
+                .to_string()
+                .contains("capture-drain capacity exhausted"),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "saturated capture setup waited instead of failing explicitly"
+        );
+        assert_eq!(
+            TEST_ACTIVE.load(Ordering::Acquire),
+            MAX_CAPTURE_DRAIN_WORKERS
+        );
+        assert!(
+            std::fs::read_dir(&trace_dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with(".capture-")),
+            "capacity failure retained a temporary trace as if capture completed"
+        );
+
+        drop(admissions);
+        assert_eq!(TEST_ACTIVE.load(Ordering::Acquire), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retry_interrupted_retries_until_child_operation_completes() {
+        let mut attempts = 0;
+        let value = retry_interrupted(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "injected EINTR"))
+            } else {
+                Ok(17)
+            }
+        })
+        .unwrap();
+
+        assert_eq!(value, 17);
+        assert_eq!(attempts, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_child_thread_start_failures_kill_reap_join_and_clean_spools() {
+        for failure_after in 0..=2 {
+            let root = unique_temp_dir(&format!("post-child-thread-{failure_after}"));
+            let trace_dir = root.join("traces");
+            let mut state = ShellState::from_current_process();
+            state.export_var("AGSH_TRACE_DIR", trace_dir.display().to_string());
+            let graph = parse_line("sh -c 'while :; do :; done' <<< capture-input").unwrap();
+
+            let (outcome, pid) =
+                with_external_capture_injection(Some(failure_after), false, || {
+                    Executor::new()
+                        .run_graph(
+                            &graph,
+                            &mut state,
+                            &ExecutionOptions {
+                                output_mode: OutputMode::Semantic,
+                                allow_process_replacement: false,
+                            },
+                        )
+                        .unwrap()
+                });
+
+            assert_eq!(outcome.exit_code, 1, "failure_after={failure_after}");
+            assert!(
+                String::from_utf8_lossy(&outcome.stderr).contains("injected agsh-external-"),
+                "failure_after={failure_after}, stderr={:?}",
+                outcome.stderr
+            );
+            let pid = rustix::process::Pid::from_raw(pid.expect("record child pid") as i32)
+                .expect("valid child pid");
+            assert_eq!(
+                rustix::process::test_kill_process(pid),
+                Err(rustix::io::Errno::SRCH),
+                "thread-start failure left child {pid} alive or unreaped"
+            );
+            assert!(
+                !trace_dir.exists()
+                    || std::fs::read_dir(&trace_dir)
+                        .unwrap()
+                        .flatten()
+                        .all(|entry| !entry.file_name().to_string_lossy().starts_with(".capture-")),
+                "thread-start failure retained a capture spool"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_stdout_thread_start_failures_kill_reap_join_and_clean_spools() {
+        for failure_after in 0..=1 {
+            let root = unique_temp_dir(&format!("streaming-thread-{failure_after}"));
+            let trace_dir = root.join("traces");
+            let mut state = ShellState::from_current_process();
+            state.export_var("AGSH_TRACE_DIR", trace_dir.display().to_string());
+            let graph = parse_line("sh -c 'while :; do :; done' <<< capture-input").unwrap();
+            let (stdout_reader, stdout_writer) = io::pipe().unwrap();
+
+            let (outcome, pid) =
+                with_external_capture_injection(Some(failure_after), false, || {
+                    run_with_streaming_stdout(&mut state, stdout_writer, |state| {
+                        Executor::new().run_graph(
+                            &graph,
+                            state,
+                            &ExecutionOptions {
+                                output_mode: OutputMode::Semantic,
+                                allow_process_replacement: false,
+                            },
+                        )
+                    })
+                    .unwrap()
+                });
+            drop(stdout_reader);
+
+            assert_eq!(outcome.exit_code, 1, "failure_after={failure_after}");
+            assert!(
+                String::from_utf8_lossy(&outcome.stderr).contains("injected agsh-external-"),
+                "failure_after={failure_after}, stderr={:?}",
+                outcome.stderr
+            );
+            let pid = rustix::process::Pid::from_raw(pid.expect("record child pid") as i32)
+                .expect("valid child pid");
+            assert_eq!(
+                rustix::process::test_kill_process(pid),
+                Err(rustix::io::Errno::SRCH),
+                "streaming thread-start failure left child {pid} alive or unreaped"
+            );
+            assert!(
+                !trace_dir.exists()
+                    || std::fs::read_dir(&trace_dir)
+                        .unwrap()
+                        .flatten()
+                        .all(|entry| !entry.file_name().to_string_lossy().starts_with(".capture-")),
+                "streaming thread-start failure retained a capture spool"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_pipeline_thread_start_failure_reaps_prefix_and_suffix_children() {
+        for failure_after in 0..=1 {
+            let root = unique_temp_dir(&format!("shell-stage-thread-start-{failure_after}"));
+            let trace_dir = root.join("traces");
+            let mut state = ShellState::from_current_process();
+            state.export_var("AGSH_TRACE_DIR", trace_dir.display().to_string());
+            let graph =
+                parse_line("sh -c 'sleep 30' | { cat; } | { cat; } | sh -c 'sleep 30'").unwrap();
+
+            let (outcome, pids) = with_shell_stage_thread_failure(failure_after, || {
+                Executor::new()
+                    .run_graph(
+                        &graph,
+                        &mut state,
+                        &ExecutionOptions {
+                            output_mode: OutputMode::Semantic,
+                            allow_process_replacement: false,
+                        },
+                    )
+                    .unwrap()
+            });
+
+            assert_eq!(
+                outcome.exit_code, 1,
+                "failure_after={failure_after}, stderr={:?}",
+                outcome.stderr
+            );
+            assert!(
+                String::from_utf8_lossy(&outcome.stderr)
+                    .contains("injected pipeline shell-stage thread start failure"),
+                "failure_after={failure_after}, stderr={:?}",
+                outcome.stderr
+            );
+            assert_eq!(pids.len(), 2, "specialized prefix/suffix path was not used");
+            for child_pid in pids {
+                let pid =
+                    rustix::process::Pid::from_raw(child_pid as i32).expect("valid child pid");
+                assert_eq!(
+                    rustix::process::test_kill_process(pid),
+                    Err(rustix::io::Errno::SRCH),
+                    "shell-stage thread failure left child {pid} alive or unreaped"
+                );
+            }
+            assert!(
+                !trace_dir.exists()
+                    || std::fs::read_dir(&trace_dir)
+                        .unwrap()
+                        .flatten()
+                        .all(|entry| !entry.file_name().to_string_lossy().starts_with(".capture-")),
+                "shell-stage thread failure retained a capture spool"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn end_to_end_capture_admission_failure_kills_and_reaps_child() {
+        let root = unique_temp_dir("capture-admission-cleanup");
+        let trace_dir = root.join("traces");
+        let mut state = ShellState::from_current_process();
+        state.export_var("AGSH_TRACE_DIR", trace_dir.display().to_string());
+        let graph = parse_line("sh -c 'while :; do :; done'").unwrap();
+
+        let (outcome, pid) = with_external_capture_injection(None, true, || {
+            Executor::new()
+                .run_graph(
+                    &graph,
+                    &mut state,
+                    &ExecutionOptions {
+                        output_mode: OutputMode::Semantic,
+                        allow_process_replacement: false,
+                    },
+                )
+                .unwrap()
+        });
+
+        assert_eq!(outcome.exit_code, 1);
+        assert!(
+            String::from_utf8_lossy(&outcome.stderr)
+                .contains("injected capture-drain capacity exhausted"),
+            "stderr={:?}",
+            outcome.stderr
+        );
+        let pid = rustix::process::Pid::from_raw(pid.expect("record child pid") as i32)
+            .expect("valid child pid");
+        assert_eq!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH),
+            "capture admission failure left child {pid} alive or unreaped"
+        );
+        assert!(
+            !trace_dir.exists()
+                || std::fs::read_dir(&trace_dir)
+                    .unwrap()
+                    .flatten()
+                    .all(|entry| !entry.file_name().to_string_lossy().starts_with(".capture-")),
+            "capture admission failure retained a capture spool"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -16161,6 +18200,45 @@ mod tests {
     }
 
     #[test]
+    fn library_executor_keeps_mixed_wrapper_output_in_the_returned_outcome() {
+        let mut state = ShellState::from_current_process();
+        let graph =
+            parse_line("printf PRE; raw sh -c 'printf RAW_OUT; printf RAW_ERR >&2'; printf POST")
+                .unwrap();
+
+        let outcome = Executor::new()
+            .run_graph(
+                &graph,
+                &mut state,
+                &ExecutionOptions {
+                    output_mode: OutputMode::Clean,
+                    allow_process_replacement: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.stdout, b"PRERAW_OUTPOST");
+        assert_eq!(outcome.stderr, b"RAW_ERR");
+        assert!(outcome.observation.is_none());
+    }
+
+    #[test]
+    fn library_explicit_observation_preserves_public_raw_streams_and_status() {
+        let mut state = ShellState::from_current_process();
+        let graph = parse_line("semantic sh -c 'printf RAW; printf ERR >&2; exit 7'").unwrap();
+
+        let outcome = Executor::new()
+            .run_graph(&graph, &mut state, &ExecutionOptions::default())
+            .unwrap();
+
+        assert_eq!(outcome.exit_code, 7);
+        assert_eq!(outcome.stdout, b"RAW");
+        assert_eq!(outcome.stderr, b"ERR");
+        assert!(outcome.observation.is_some());
+    }
+
+    #[test]
     fn compound_output_aggregation_fails_before_exceeding_memory_limit() {
         let mut aggregate = CommandOutcome::captured(0, b"1234".to_vec(), Vec::new());
         let mut next = CommandOutcome::captured(0, Vec::new(), b"56789".to_vec());
@@ -16174,6 +18252,25 @@ mod tests {
         assert!(aggregate.stderr.is_empty());
         assert!(next.stdout.is_empty());
         assert_eq!(next.stderr, b"56789");
+    }
+
+    #[test]
+    fn raw_and_presented_planes_share_the_aggregate_memory_limit() {
+        let mut aggregate = CommandOutcome::captured(0, vec![b'x'; 34 * 1024 * 1024], Vec::new());
+        let mut explicit = CommandOutcome::captured(0, b"y".to_vec(), Vec::new());
+        explicit.explicit_output_mode = true;
+        explicit.explicit_presentation_mode = Some(OutputMode::Raw);
+
+        let error = aggregate.append_streams(&mut explicit).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("captured and presented output exceeds"),
+            "{error}"
+        );
+        assert_eq!(aggregate.stdout.len(), 34 * 1024 * 1024);
+        assert!(aggregate.presented.is_none());
     }
 
     #[cfg(unix)]
@@ -23660,6 +25757,101 @@ mod tests {
         // A missing command inside a function yields 127, not a hard abort.
         let in_fn = run_capture("f() { missing_inner_zzz; }; f; echo $?");
         assert_eq!(String::from_utf8_lossy(&in_fn.stdout), "127\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_non_executable_command_returns_126_and_continues() {
+        let temp = unique_temp_dir("not-executable-status");
+        let command = temp.join("agsh-not-executable");
+        std::fs::write(&command, "#!/bin/sh\necho should-not-run\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let outcome = run_capture(&format!("{}; printf '%s' $?", command.display()));
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(
+            outcome.stdout,
+            b"126",
+            "stderr={:?}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&outcome.stderr);
+        assert!(
+            stderr.to_ascii_lowercase().contains("permission denied"),
+            "stderr={stderr:?}"
+        );
+        assert!(!stderr.contains("command not found"), "stderr={stderr:?}");
+
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_spawn_failures_distinguish_found_from_disappeared_commands() {
+        let temp = unique_temp_dir("external-spawn-failures");
+        let bad_image = temp.join("bad-image");
+        let missing_interpreter = temp.join("missing-interpreter");
+        let denied = temp.join("denied");
+        let disappeared = temp.join("disappeared");
+        let text_script = temp.join("text-script");
+
+        std::fs::write(&bad_image, b"\0not an executable image\n").unwrap();
+        std::fs::write(
+            &missing_interpreter,
+            b"#!/definitely/missing/agsh-interpreter\n",
+        )
+        .unwrap();
+        std::fs::write(&denied, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&text_script, b"exit 42\n").unwrap();
+        std::fs::set_permissions(&bad_image, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&missing_interpreter, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&text_script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let quiet_command = |path: &Path| {
+            let mut command = Command::new(path);
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command
+        };
+
+        let mut command = quiet_command(&bad_image);
+        match spawn_external_command(&mut command, &bad_image) {
+            Ok(mut child) => assert_eq!(child.wait().unwrap().code(), Some(126)),
+            Err(error) => assert_eq!(
+                error.code(),
+                NOT_EXECUTABLE_ERROR_CODE,
+                "path={} error={error}",
+                bad_image.display()
+            ),
+        }
+
+        for path in [&missing_interpreter, &denied] {
+            let mut command = quiet_command(path);
+            let error = spawn_external_command(&mut command, path)
+                .expect_err("fixture must not launch successfully");
+            assert_eq!(
+                error.code(),
+                NOT_EXECUTABLE_ERROR_CODE,
+                "path={} error={error}",
+                path.display()
+            );
+        }
+
+        let mut command = quiet_command(&disappeared);
+        let error = spawn_external_command(&mut command, &disappeared)
+            .expect_err("a disappeared command must not launch");
+        assert_eq!(error.kind, ShellErrorKind::NotFound, "error={error}");
+
+        let mut command = quiet_command(&text_script);
+        let mut child = spawn_external_command(&mut command, &text_script)
+            .expect("the platform shell fallback must run executable text");
+        assert_eq!(child.wait().unwrap().code(), Some(42));
+
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

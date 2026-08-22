@@ -1,12 +1,14 @@
+use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-fn isolated_agsh(base: &Path, history_file: &Path) -> Command {
+static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn isolate_command_environment(command: &mut Command, base: &Path, history_file: &Path) {
     let home = base.join("home");
     std::fs::create_dir_all(&home).expect("create isolated HOME");
-
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agsh"));
     command
         .current_dir(base)
         .env("HOME", &home)
@@ -15,19 +17,70 @@ fn isolated_agsh(base: &Path, history_file: &Path) -> Command {
         .env("XDG_STATE_HOME", base.join("xdg-state"))
         .env("AGSH_HISTORY_FILE", history_file)
         .env("AGSH_TRUST_FILE", base.join("trust.jsonl"))
+        .env("AGSH_SESSION_DIR", base.join("sessions"))
+        .env("AGSH_BROKER_DIR", base.join("broker"))
+        .env("AGSH_TRACE_DIR", base.join("traces"))
         .env("AGSH_NORC", "1")
+        .env_remove("AGSH_BROKER_SOCKET")
+        .env_remove("AGSH_CONFINE")
+        .env_remove("AGSH_CONFINE_AGENTS")
+        .env_remove("AGSH_CONFINE_ALLOW_AGENTS")
+        .env_remove("AGSH_CONFINE_RUNTIME")
+        .env_remove("AGSH_ICONS")
         .env_remove("AGSH_INTERCEPT")
+        .env_remove("AGSH_INTERCEPT_ACTIVE")
+        .env_remove("AGSH_INTERCEPT_MODE")
+        .env_remove("AGSH_KEEP_ID")
+        .env_remove("AGSH_KEPT")
         .env_remove("AGSH_OUTPUT_MODE")
         .env_remove("AGSH_RC")
-        .env_remove("AGSH_SESSION");
+        .env_remove("AGSH_RESUME_BANNER")
+        .env_remove("AGSH_SELF")
+        .env_remove("AGSH_SESSION")
+        .env_remove("AGSH_THEME_FILE")
+        .env_remove("AGSH_TOKEN_CONFIG")
+        .env_remove("AGSH_TRACE_DIR_CAP")
+        .env_remove("BASH_ENV")
+        .env_remove("DYLD_INSERT_LIBRARIES")
+        .env_remove("ENV")
+        .env_remove("LD_PRELOAD")
+        .env_remove("NO_COLOR")
+        .env_remove("ZDOTDIR");
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(agsh_output::is_sensitive_env_name)
+        {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn isolated_program(program: impl AsRef<OsStr>, base: &Path) -> Command {
+    let mut command = Command::new(program);
+    isolate_command_environment(&mut command, base, &base.join("history.jsonl"));
+    command
+}
+
+fn isolated_agsh(base: &Path, history_file: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agsh"));
+    isolate_command_environment(&mut command, base, history_file);
     command
 }
 
 fn history_test_dir(name: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("agsh_{name}_{}", std::process::id()));
+    let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let base =
+        std::env::temp_dir().join(format!("agsh_{name}_{}_{}", std::process::id(), sequence));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).expect("create history test directory");
     base
+}
+
+fn agsh_command() -> Command {
+    let base = history_test_dir("command");
+    let history = base.join("history.jsonl");
+    isolated_agsh(&base, &history)
 }
 
 fn run_with_piped_stdin(mut command: Command, input: &str) -> std::process::Output {
@@ -66,7 +119,7 @@ fn run_isolated_command(name: &str, source: &str) -> std::process::Output {
 }
 
 fn run_interactive(input: &str) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let mut child = agsh_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -87,7 +140,7 @@ fn run_interactive(input: &str) -> String {
 fn non_utf8_cli_argument_is_rejected_without_panicking() {
     use std::os::unix::ffi::OsStringExt;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .arg(std::ffi::OsString::from_vec(vec![0xff]))
         .output()
         .expect("run agsh with non-UTF-8 argument");
@@ -130,7 +183,7 @@ fn non_utf8_environment_value_is_preserved_for_external_children() {
 
 #[test]
 fn command_mode_assigns_command_name_and_positionals() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args([
             "-c",
             "printf '%s|%s|%s\\n' \"$0\" \"$1\" \"$2\"",
@@ -147,7 +200,7 @@ fn command_mode_assigns_command_name_and_positionals() {
 
 #[test]
 fn command_mode_without_name_uses_agsh_as_zero() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args(["-c", "printf '%s\\n' \"$0\""])
         .output()
         .expect("run command mode without arguments");
@@ -162,7 +215,7 @@ fn script_mode_uses_script_path_as_zero() {
     let script = base.join("script.agsh");
     std::fs::write(&script, "printf '%s|%s\\n' \"$0\" \"$1\"\n").unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .arg(&script)
         .arg("first")
         .output()
@@ -178,7 +231,7 @@ fn script_mode_uses_script_path_as_zero() {
 
 #[test]
 fn unbraced_multi_digit_positional_uses_one_digit() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args([
             "-c",
             "printf '%s|%s\\n' \"$10\" \"${10}\"",
@@ -513,7 +566,7 @@ fn view_pipes_raw_bytes_unchanged() {
     std::fs::create_dir_all(&base).unwrap();
     let md = base.join("doc.md");
     std::fs::write(&md, "# Title\n\nbody\n").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args(["-c", &format!("agview {}", md.display())])
         .output()
         .expect("run agsh");
@@ -532,7 +585,7 @@ fn runs_a_script_file_with_args() {
         "echo \"first $1\"\nfor i in a b; do echo \"loop $i\"; done\nexit 4\n",
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args([script.to_str().unwrap(), "ARG1"])
         .output()
         .expect("run agsh");
@@ -550,7 +603,7 @@ fn script_file_heredoc_after_command() {
     std::fs::create_dir_all(&base).unwrap();
     let script = base.join("h.agsh");
     std::fs::write(&script, "echo before\ncat <<EOF\nbody\nEOF\necho after\n").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .arg(script.to_str().unwrap())
         .output()
         .expect("run agsh");
@@ -563,7 +616,7 @@ fn script_file_heredoc_after_command() {
 
 #[test]
 fn missing_script_file_exits_127() {
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .arg("/nonexistent/agsh-script-xyz.agsh")
         .output()
         .expect("run agsh");
@@ -572,12 +625,12 @@ fn missing_script_file_exits_127() {
 
 #[test]
 fn risk_flags_dangerous_and_clears_safe() {
-    let danger = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let danger = agsh_command()
         .args(["-c", "risk 'rm -rf /'"])
         .output()
         .expect("run agsh");
     assert!(String::from_utf8_lossy(&danger.stdout).contains("fs.recursive_delete"));
-    let safe = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let safe = agsh_command()
         .args(["-c", "risk 'ls -la'"])
         .output()
         .expect("run agsh");
@@ -587,7 +640,7 @@ fn risk_flags_dangerous_and_clears_safe() {
 #[test]
 fn normal_commands_do_not_receive_advisory_risk_stderr() {
     let target = std::env::temp_dir().join(format!("agsh-risk-nonexistent-{}", std::process::id()));
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", &format!("rm -rf -- {}", target.display())])
         .output()
         .expect("run agsh");
@@ -602,7 +655,7 @@ fn normal_commands_do_not_receive_advisory_risk_stderr() {
 
 #[test]
 fn context_json_has_fields() {
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "agcontext --json"])
         .output()
         .expect("run agsh");
@@ -618,7 +671,7 @@ fn peek_reads_line_range_with_numbers() {
     std::fs::create_dir_all(&base).unwrap();
     let f = base.join("nums.txt");
     std::fs::write(&f, "one\ntwo\nthree\nfour\n").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", &format!("peek {} --range 2:3", f.display())])
         .output()
         .expect("run agsh");
@@ -639,7 +692,7 @@ fn patch_applies_diff_from_heredoc() {
         "agpatch {} <<'EOF'\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\nEOF",
         f.display()
     );
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", &script])
         .output()
         .expect("run agsh");
@@ -651,7 +704,7 @@ fn patch_applies_diff_from_heredoc() {
 #[test]
 fn command_not_found_suggests_and_hints() {
     // A typo of a builtin yields a "did you mean" suggestion, exit 127.
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args(["-c", "ech hello"])
         .output()
         .expect("run agsh");
@@ -663,7 +716,7 @@ fn command_not_found_suggests_and_hints() {
     // A known uninstalled tool yields an install hint (static, deterministic).
     let empty_path = std::env::temp_dir().join(format!("agsh_empty_path_{}", std::process::id()));
     std::fs::create_dir_all(&empty_path).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args(["-c", "rg pattern"])
         .env("PATH", &empty_path)
         .output()
@@ -677,19 +730,874 @@ fn command_not_found_suggests_and_hints() {
 #[test]
 fn per_command_output_wrapper_overrides_session_mode() {
     // `raw <cmd>` renders raw output even though the session default is semantic.
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args(["--output", "semantic", "-c", "raw echo plain123"])
         .output()
         .expect("run agsh");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "plain123\n");
 
     // `semantic <cmd>` renders a JSON observation even in a raw session.
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args(["-c", "semantic true"])
         .output()
         .expect("run agsh");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("\"exit_code\": 0"), "stdout: {stdout}");
+}
+
+#[test]
+fn raw_external_wrapper_streams_before_exit_in_observation_sessions() {
+    use std::io::Read as _;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    for mode in ["compact", "semantic"] {
+        let base = history_test_dir(&format!("raw_wrapper_liveness_{mode}"));
+        let history = base.join("history.jsonl");
+        let mut child = isolated_agsh(&base, &history)
+            .args([
+                "--output",
+                mode,
+                "-c",
+                "raw sh -c 'printf RAW_READY; IFS= read -r release'",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn raw wrapper");
+        let mut release = child.stdin.take().expect("raw wrapper release stdin");
+        let mut stdout = child.stdout.take().expect("raw wrapper stdout");
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut marker = [0u8; 9];
+            let result = stdout.read_exact(&mut marker).map(|()| marker);
+            let _ = sender.send(result);
+        });
+
+        let marker = receiver.recv_timeout(Duration::from_secs(5));
+        let was_still_running = child.try_wait().expect("poll raw wrapper").is_none();
+        release.write_all(b"\n").expect("release raw wrapper");
+        drop(release);
+        let status = child.wait().expect("wait raw wrapper");
+        reader.join().expect("join raw wrapper reader");
+
+        assert_eq!(
+            marker.expect("raw marker was buffered until exit").unwrap(),
+            *b"RAW_READY",
+            "mode={mode}"
+        );
+        assert!(
+            was_still_running,
+            "mode={mode}: marker was only observable after child exit"
+        );
+        assert!(status.success(), "mode={mode}: status={status:?}");
+        let _ = std::fs::remove_dir_all(base);
+    }
+}
+
+#[test]
+fn raw_wrapper_flushes_pending_outer_frames_before_streaming() {
+    use std::io::Read as _;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let base = history_test_dir("raw_wrapper_cross_frame_liveness");
+    let sourced = base.join("blocking.agsh");
+    std::fs::write(&sourced, "raw sh -c 'printf LIVE; IFS= read -r release'\n").unwrap();
+    let blocking = "raw sh -c 'printf LIVE; IFS= read -r release'";
+    let cases = [
+        (
+            "function",
+            format!("printf OUTER; wrapped() {{ {blocking}; }}; wrapped"),
+            b"OUTERLIVE".as_slice(),
+        ),
+        (
+            "if-condition",
+            format!("if printf PRE; then {blocking}; fi"),
+            b"PRELIVE".as_slice(),
+        ),
+        (
+            "eval",
+            format!("printf OUTER; eval \"{blocking}\""),
+            b"OUTERLIVE".as_slice(),
+        ),
+        (
+            "source",
+            format!("printf OUTER; source '{}'", sourced.display()),
+            b"OUTERLIVE".as_slice(),
+        ),
+    ];
+
+    for (name, source, expected) in cases {
+        let case_base = base.join(name);
+        std::fs::create_dir_all(&case_base).unwrap();
+        let history = case_base.join("history.jsonl");
+        let mut child = isolated_agsh(&case_base, &history)
+            .args(["--output", "clean", "-c", &source])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cross-frame raw wrapper");
+        let mut release = child.stdin.take().expect("cross-frame release stdin");
+        let mut stdout = child.stdout.take().expect("cross-frame stdout");
+        let expected_len = expected.len();
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut marker = vec![0u8; expected_len];
+            let result = stdout.read_exact(&mut marker).map(|()| marker);
+            let _ = sender.send(result);
+        });
+
+        let marker = receiver.recv_timeout(Duration::from_secs(5));
+        let was_still_running = child
+            .try_wait()
+            .expect("poll cross-frame raw wrapper")
+            .is_none();
+        release
+            .write_all(b"\n")
+            .expect("release cross-frame raw wrapper");
+        drop(release);
+        let status = child.wait().expect("wait cross-frame raw wrapper");
+        reader.join().expect("join cross-frame stdout reader");
+
+        assert_eq!(
+            marker
+                .unwrap_or_else(|_| panic!("case={name}: output was buffered until exit"))
+                .unwrap(),
+            expected,
+            "case={name}"
+        );
+        assert!(
+            was_still_running,
+            "case={name}: output became visible only after exit"
+        );
+        assert!(status.success(), "case={name}: status={status:?}");
+    }
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn outermost_output_wrapper_owns_nested_presentation() {
+    let base = history_test_dir("outermost_wrapper_policy");
+    let history = base.join("history.jsonl");
+    let raw_source = base.join("inner-raw.agsh");
+    let semantic_source = base.join("inner-semantic.agsh");
+    std::fs::write(&raw_source, "raw printf INNER\n").unwrap();
+    std::fs::write(&semantic_source, "semantic printf INNER\n").unwrap();
+    let semantic_cases = [
+        "semantic raw printf INNER".to_string(),
+        "wrapped() { raw printf INNER; }; semantic wrapped".to_string(),
+        "semantic eval 'raw printf INNER'".to_string(),
+        format!("semantic source '{}'", raw_source.display()),
+        "wrapped() { if true; then raw printf INNER; fi; }; semantic wrapped".to_string(),
+    ];
+    let raw_cases = [
+        "raw semantic printf INNER".to_string(),
+        "wrapped() { semantic printf INNER; }; raw wrapped".to_string(),
+        "raw eval 'semantic printf INNER'".to_string(),
+        format!("raw source '{}'", semantic_source.display()),
+        "wrapped() { if true; then semantic printf INNER; fi; }; raw wrapped".to_string(),
+    ];
+
+    for (index, source) in semantic_cases.iter().enumerate() {
+        let output = isolated_agsh(&base, &history)
+            .args(["-c", source])
+            .output()
+            .expect("run outer semantic wrapper");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "case={index} source={source}"
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.contains("\"exit_code\": 0"),
+            "case={index}: {stdout}"
+        );
+        assert!(stdout.contains("INNER"), "case={index}: {stdout}");
+        assert_ne!(stdout, "INNER", "case={index}: inner raw escaped owner");
+    }
+
+    for (index, source) in raw_cases.iter().enumerate() {
+        let output = isolated_agsh(&base, &history)
+            .args(["-c", source])
+            .output()
+            .expect("run outer raw wrapper");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "case={index} source={source}"
+        );
+        assert_eq!(
+            output.stdout, b"INNER",
+            "case={index}: inner semantic escaped owner: {:?}",
+            output.stdout
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "case={index}: {:?}",
+            output.stderr
+        );
+    }
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn mixed_raw_wrappers_preserve_presentation_chronology() {
+    let raw = "raw sh -c 'printf RAW_OUT; printf RAW_ERR >&2'";
+    let cases = [
+        ("direct", format!("printf PRE; {raw}; printf POST")),
+        (
+            "function",
+            format!("wrapped() {{ printf PRE; {raw}; printf POST; }}; wrapped"),
+        ),
+        ("eval", format!("eval \"printf PRE; {raw}; printf POST\"")),
+        (
+            "if",
+            format!("if true; then printf PRE; {raw}; printf POST; fi"),
+        ),
+        (
+            "for",
+            format!("for item in once; do printf PRE; {raw}; printf POST; done"),
+        ),
+        ("subshell", format!("(printf PRE; {raw}; printf POST)")),
+        ("brace", format!("{{ printf PRE; {raw}; printf POST; }}")),
+    ];
+
+    for (name, source) in cases {
+        let base = history_test_dir(&format!("mixed_raw_order_{name}"));
+        let history = base.join("history.jsonl");
+        let combined_path = base.join("combined.out");
+        let combined = std::fs::File::create(&combined_path).unwrap();
+        let status = isolated_agsh(&base, &history)
+            .args(["--output", "clean", "-c", &source])
+            .stdout(Stdio::from(combined.try_clone().unwrap()))
+            .stderr(Stdio::from(combined))
+            .status()
+            .expect("run ordered mixed presentation");
+
+        assert_eq!(status.code(), Some(0), "case={name} source={source:?}");
+        assert_eq!(
+            std::fs::read(&combined_path).unwrap(),
+            b"PRERAW_OUTRAW_ERRPOST",
+            "case={name} source={source:?}"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+}
+
+#[test]
+fn raw_wrapper_bytes_are_exact_and_do_not_consume_trace_quota() {
+    let base = history_test_dir("raw_wrapper_trace_quota");
+    let history = base.join("history.jsonl");
+    let traces = base.join("traces");
+    let token_config = base.join("token.toml");
+    let input = base.join("raw.bin");
+    let mut bytes = Vec::with_capacity(2048);
+    for index in 0..2048 {
+        bytes.push([0xff, 0x00, 0x80, b'R'][index % 4]);
+    }
+    std::fs::write(&input, &bytes).unwrap();
+    std::fs::write(
+        &token_config,
+        "[storage]\nstore_raw = true\nmax_raw_per_command = \"1kb\"\n",
+    )
+    .unwrap();
+    let source = format!("raw cat '{}'; semantic printf OBSERVED", input.display());
+
+    let output = isolated_agsh(&base, &history)
+        .env("AGSH_TRACE_DIR", &traces)
+        .env("AGSH_TOKEN_CONFIG", &token_config)
+        .args(["--output", "semantic", "-c", &source])
+        .output()
+        .expect("run exact raw wrapper with constrained trace budget");
+
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert!(
+        output.stdout.starts_with(&bytes),
+        "raw prefix was changed or replaced"
+    );
+    let observation = std::str::from_utf8(&output.stdout[bytes.len()..]).unwrap();
+    assert!(
+        observation.contains("OBSERVED"),
+        "observation={observation}"
+    );
+    assert!(
+        observation.contains("\"complete\": true"),
+        "raw wrapper consumed the sibling observation quota: {observation}"
+    );
+    assert!(output.stderr.is_empty(), "stderr={:?}", output.stderr);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn explicit_observation_includes_and_redacts_expansion_diagnostics() {
+    let secret = "OPENAI_API_KEY=sk-expansion-secret-123456";
+    let source = format!("semantic printf %s \"$(sh -c 'printf {secret} >&2; printf VALUE')\"");
+    let output = agsh_command()
+        .args(["--output", "semantic", "-c", &source])
+        .output()
+        .expect("run explicit observation with substitution stderr");
+
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("VALUE"), "stdout={stdout}");
+    assert!(
+        stdout.contains("\"stderr_lines\": 1"),
+        "expansion stderr was omitted from observation counts: {stdout}"
+    );
+    assert!(
+        !stdout.contains(secret),
+        "expansion secret leaked outside observation redaction: {stdout}"
+    );
+    assert!(output.stderr.is_empty(), "stderr={:?}", output.stderr);
+}
+
+#[test]
+fn err_and_signal_traps_present_handlers_before_the_next_item() {
+    let handlers = [
+        ("implicit", "printf TRAP; sh -c 'exit 9'"),
+        ("raw", "raw printf TRAP; sh -c 'exit 9'"),
+        ("semantic", "semantic printf TRAP; sh -c 'exit 9'"),
+    ];
+
+    for mode in ["clean", "semantic"] {
+        for (handler_name, handler) in handlers {
+            for (trigger_name, signal, trigger, expected_status) in [
+                ("err", "ERR", "sh -c 'exit 7'", 7),
+                ("signal", "USR1", "kill -USR1 $$", 0),
+            ] {
+                let source =
+                    format!("trap \"{handler}\" {signal}; {trigger}; printf 'RC=%s:POST' \"$?\"");
+                let output = agsh_command()
+                    .args(["--output", mode, "-c", &source])
+                    .output()
+                    .expect("run trap presentation matrix");
+
+                assert_eq!(
+                    output.status.code(),
+                    Some(0),
+                    "mode={mode} handler={handler_name} trigger={trigger_name} stderr={:?}",
+                    output.stderr
+                );
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let trap_position = stdout
+                    .rfind("TRAP")
+                    .unwrap_or_else(|| panic!("handler output missing: {stdout}"));
+                let post_position = stdout
+                    .rfind("POST")
+                    .unwrap_or_else(|| panic!("following output missing: {stdout}"));
+                assert!(
+                    trap_position < post_position,
+                    "mode={mode} handler={handler_name} trigger={trigger_name}: {stdout}"
+                );
+                assert!(
+                    stdout.contains(&format!("RC={expected_status}:POST")),
+                    "handler changed triggering status: mode={mode} handler={handler_name} \
+                     trigger={trigger_name}: {stdout}"
+                );
+                assert!(
+                    output.stderr.is_empty(),
+                    "mode={mode} handler={handler_name} trigger={trigger_name}: {:?}",
+                    output.stderr
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_err_trap_builtin_output_is_emitted_exactly_once() {
+    let output = agsh_command()
+        .args([
+            "--output",
+            "raw",
+            "-c",
+            "trap 'printf TRAP' ERR; false; printf POST",
+        ])
+        .output()
+        .expect("run raw builtin ERR handler");
+
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert_eq!(output.stdout, b"TRAPPOST");
+    assert!(output.stderr.is_empty(), "stderr={:?}", output.stderr);
+}
+
+#[test]
+fn select_prompt_survives_a_nested_explicit_observation() {
+    let mut command = agsh_command();
+    command.args([
+        "--output",
+        "raw",
+        "-c",
+        "select x in a; do semantic printf BODY; break; done",
+    ]);
+    let output = run_with_piped_stdin(command, "1\n");
+
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("BODY"), "stdout={stdout}");
+    assert_eq!(output.stderr, b"1) a\n#? ");
+}
+
+#[test]
+fn output_wrappers_compose_inside_command_lists() {
+    let base = history_test_dir("nested_output_wrappers");
+    let history = base.join("history.jsonl");
+    let traces = base.join("traces");
+    let output = isolated_agsh(&base, &history)
+        .env("AGSH_TRACE_DIR", &traces)
+        .args([
+            "-c",
+            "printf 'start\\n'; raw printf 'raw-list\\n'; \
+             clean printf '\\033[31mclean-list\\033[0m\\n'; \
+             compact printf 'compact-list\\n'; semantic true; \
+             lossless-ref printf 'lossless-list\\n'; \
+             silent printf 'hidden-list\\n'; printf 'end\\n'",
+        ])
+        .output()
+        .expect("run nested output wrappers");
+
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("start\n"), "{stdout}");
+    assert!(stdout.contains("raw-list\n"), "{stdout}");
+    assert!(stdout.contains("clean-list"), "{stdout}");
+    assert!(!stdout.contains("\u{1b}[31m"), "{stdout:?}");
+    assert!(stdout.contains("compact-list"), "{stdout}");
+    assert!(stdout.contains("\"exit_code\": 0"), "{stdout}");
+    assert!(stdout.contains("lossless-list"), "{stdout}");
+    assert!(stdout.contains("raw_stdout:"), "{stdout}");
+    assert!(!stdout.contains("hidden-list"), "{stdout}");
+    assert!(stdout.ends_with("end\n"), "{stdout}");
+    assert!(output.stderr.is_empty(), "stderr={:?}", output.stderr);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn output_wrappers_reenter_through_functions_eval_and_source() {
+    let base = history_test_dir("reentered_output_wrappers");
+    let history = base.join("history.jsonl");
+    let sourced = base.join("wrapped.agsh");
+    std::fs::write(
+        &sourced,
+        "clean printf '\\033[32msource-marker\\033[0m\\n'\n",
+    )
+    .unwrap();
+    let source = format!(
+        "wrapped() {{ semantic true; }}; wrapped; \
+         eval \"compact printf 'eval-marker\\\\n'\"; source '{}'",
+        sourced.display()
+    );
+    let output = isolated_agsh(&base, &history)
+        .args(["-c", &source])
+        .output()
+        .expect("run wrappers through nested shell sources");
+
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("\"exit_code\": 0"), "{stdout}");
+    assert!(stdout.contains("eval-marker"), "{stdout}");
+    assert!(stdout.contains("source-marker"), "{stdout}");
+    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+    assert!(output.stderr.is_empty(), "stderr={:?}", output.stderr);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn nested_output_wrappers_preserve_wrapped_exit_status() {
+    let base = history_test_dir("nested_wrapper_status");
+    let history = base.join("history.jsonl");
+    let sourced = base.join("false.agsh");
+    std::fs::write(&sourced, "silent false\n").unwrap();
+    let cases = [
+        "true; semantic false".to_string(),
+        "wrapped() { compact false; }; wrapped".to_string(),
+        "eval 'clean false'".to_string(),
+        format!("source '{}'", sourced.display()),
+    ];
+
+    for source in cases {
+        let output = isolated_agsh(&base, &history)
+            .args(["-c", &source])
+            .output()
+            .expect("run nested failing wrapper");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "source={source:?} stdout={:?} stderr={:?}",
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("command not found"),
+            "source={source:?} stderr={:?}",
+            output.stderr
+        );
+    }
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn agview_composes_inside_lists_functions_eval_and_source() {
+    let base = history_test_dir("nested_agview");
+    let history = base.join("history.jsonl");
+    let input = base.join("document.txt");
+    let sourced = base.join("view.agsh");
+    let bytes = b"agview nested bytes\n";
+    std::fs::write(&input, bytes).unwrap();
+    std::fs::write(&sourced, format!("agview '{}'\n", input.display())).unwrap();
+    let source = format!(
+        "true; agview '{}'; view_fn() {{ agview '{}'; }}; view_fn; \
+         eval \"agview '{}'\"; source '{}'",
+        input.display(),
+        input.display(),
+        input.display(),
+        sourced.display()
+    );
+    let output = isolated_agsh(&base, &history)
+        .args(["-c", &source])
+        .output()
+        .expect("run nested agview commands");
+
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert_eq!(output.stdout, bytes.repeat(4));
+    assert!(output.stderr.is_empty(), "stderr={:?}", output.stderr);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn command_wrappers_keep_pipeline_and_redirect_bytes_raw() {
+    let base = history_test_dir("wrapper_raw_routes");
+    let history = base.join("history.jsonl");
+    let input = base.join("input.bin");
+    let compact_copy = base.join("compact.bin");
+    let clean_copy = base.join("clean.bin");
+    let view_copy = base.join("view.bin");
+    let bytes = [0xff, 0x00, 0x80, b'A', b'\n', 0x1b, b'[', b'3', b'1', b'm'];
+    std::fs::write(&input, bytes).unwrap();
+    let source = format!(
+        "true; compact cat '{}' | cat > '{}'; clean cat '{}' > '{}'; \
+         agview '{}' | cat > '{}'",
+        input.display(),
+        compact_copy.display(),
+        input.display(),
+        clean_copy.display(),
+        input.display(),
+        view_copy.display()
+    );
+    let output = isolated_agsh(&base, &history)
+        .args(["-c", &source])
+        .output()
+        .expect("run wrappers with raw routes");
+
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert_eq!(std::fs::read(compact_copy).unwrap(), bytes);
+    assert_eq!(std::fs::read(clean_copy).unwrap(), bytes);
+    assert_eq!(std::fs::read(view_copy).unwrap(), bytes);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn nested_output_wrappers_keep_internal_data_planes_raw() {
+    let base = history_test_dir("nested_wrapper_raw_planes");
+    let history = base.join("history.jsonl");
+    let function_pipe = base.join("function-pipe.bin");
+    let eval_substitution = base.join("eval-substitution.bin");
+    let if_process_substitution = base.join("if-process-substitution.bin");
+    let for_substitution = base.join("for-substitution.bin");
+    let group_process_substitution = base.join("group-process-substitution.bin");
+    let subshell_pipe = base.join("subshell-pipe.bin");
+    let ansi = "\u{1b}[31mgroup-bytes\u{1b}[0m\n";
+    let source = format!(
+        "wrapped() {{ semantic printf 'function-bytes\\n'; }}; \
+         wrapped | cat > '{}'; \
+         value=$(eval \"compact printf 'eval-bytes\\\\n'\"); \
+         printf '%s' \"$value\" > '{}'; \
+         cat <(if true; then semantic printf 'if-bytes\\n'; fi) > '{}'; \
+         value=$(for item in for-bytes; do clean printf '%s\\n' \"$item\"; done); \
+         printf '%s' \"$value\" > '{}'; \
+         cat <({{ clean printf '\\033[31mgroup-bytes\\033[0m\\n'; }}) > '{}'; \
+         (semantic printf 'subshell-bytes\\n') | cat > '{}'",
+        function_pipe.display(),
+        eval_substitution.display(),
+        if_process_substitution.display(),
+        for_substitution.display(),
+        group_process_substitution.display(),
+        subshell_pipe.display(),
+    );
+    let output = isolated_agsh(&base, &history)
+        .args(["-c", &source])
+        .output()
+        .expect("run nested wrappers through internal data planes");
+
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert_eq!(std::fs::read(function_pipe).unwrap(), b"function-bytes\n");
+    assert_eq!(std::fs::read(eval_substitution).unwrap(), b"eval-bytes");
+    assert_eq!(
+        std::fs::read(if_process_substitution).unwrap(),
+        b"if-bytes\n"
+    );
+    assert_eq!(std::fs::read(for_substitution).unwrap(), b"for-bytes");
+    assert_eq!(
+        std::fs::read(group_process_substitution).unwrap(),
+        ansi.as_bytes()
+    );
+    assert_eq!(std::fs::read(subshell_pipe).unwrap(), b"subshell-bytes\n");
+    assert!(output.stdout.is_empty(), "stdout={:?}", output.stdout);
+    assert!(output.stderr.is_empty(), "stderr={:?}", output.stderr);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn observation_session_wrappers_keep_all_internal_data_planes_raw() {
+    let base = history_test_dir("observed_wrapper_raw_planes");
+    let history = base.join("history.jsonl");
+    let input = base.join("input.bin");
+    let pipeline = base.join("pipeline.bin");
+    let redirect = base.join("redirect.bin");
+    let command_substitution = base.join("command-substitution.bin");
+    let process_substitution = base.join("process-substitution.bin");
+    let bytes = [0xff, 0x00, 0x80, b'D', b'A', b'T', b'A', b'\n'];
+    std::fs::write(&input, bytes).unwrap();
+    let source = format!(
+        "raw cat '{}' | cat > '{}'; \
+         compact cat '{}' > '{}'; \
+         value=$(semantic printf 'command-substitution'); \
+         printf '%s' \"$value\" > '{}'; \
+         cat <(clean cat '{}') > '{}'",
+        input.display(),
+        pipeline.display(),
+        input.display(),
+        redirect.display(),
+        command_substitution.display(),
+        input.display(),
+        process_substitution.display(),
+    );
+
+    let output = isolated_agsh(&base, &history)
+        .args(["--output", "semantic", "-c", &source])
+        .output()
+        .expect("run wrappers on internal data planes in an observation session");
+
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert_eq!(std::fs::read(pipeline).unwrap(), bytes);
+    assert_eq!(std::fs::read(redirect).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(command_substitution).unwrap(),
+        b"command-substitution"
+    );
+    assert_eq!(std::fs::read(process_substitution).unwrap(), bytes);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn outer_raw_wrapper_suppresses_lossless_preflight_in_internal_data_planes() {
+    let base = history_test_dir("outer_raw_lossless_data_planes");
+    let history = base.join("history.jsonl");
+    let invalid_trace_dir = base.join("trace-parent-file");
+    std::fs::write(&invalid_trace_dir, b"not a directory").unwrap();
+
+    for (name, source) in [
+        (
+            "command-substitution",
+            "raw printf %s \"$(lossless-ref printf X)\"",
+        ),
+        ("process-substitution", "raw cat <(lossless-ref printf X)"),
+    ] {
+        let output = isolated_agsh(&base, &history)
+            .env("AGSH_TRACE_DIR", invalid_trace_dir.join("unavailable"))
+            .args(["--output", "semantic", "-c", source])
+            .output()
+            .expect("run nested lossless wrapper on a raw data plane");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "case={name} stderr={:?}",
+            output.stderr
+        );
+        assert_eq!(output.stdout, b"X", "case={name}");
+        assert!(output.stderr.is_empty(), "case={name}: {:?}", output.stderr);
+    }
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn outer_wrapper_policy_crosses_shell_pipeline_workers() {
+    let base = history_test_dir("outer_wrapper_pipeline_policy");
+    let history = base.join("history.jsonl");
+    let invalid_trace_dir = base.join("trace-parent-file");
+    let redirected = base.join("routed.out");
+    std::fs::write(&invalid_trace_dir, b"not a directory").unwrap();
+    let function_prefix = "f() { lossless-ref printf X; }; g() { f | cat; };";
+
+    let output = isolated_agsh(&base, &history)
+        .env("AGSH_TRACE_DIR", invalid_trace_dir.join("unavailable"))
+        .args(["--output", "raw", "-c", &format!("{function_prefix} raw g")])
+        .output()
+        .expect("run optimized shell pipeline under outer raw wrapper");
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert_eq!(output.stdout, b"X");
+    assert!(output.stderr.is_empty(), "stderr={:?}", output.stderr);
+
+    let output = isolated_agsh(&base, &history)
+        .env("AGSH_TRACE_DIR", invalid_trace_dir.join("unavailable"))
+        .args([
+            "--output",
+            "raw",
+            "-c",
+            &format!("{function_prefix} raw g > '{}'", redirected.display()),
+        ])
+        .output()
+        .expect("run routed shell pipeline under outer raw wrapper");
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert!(output.stdout.is_empty(), "stdout={:?}", output.stdout);
+    assert_eq!(std::fs::read(&redirected).unwrap(), b"X");
+    assert!(output.stderr.is_empty(), "stderr={:?}", output.stderr);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn explicit_wrapper_does_not_disable_session_mode_for_list_siblings() {
+    let cases = [
+        ("direct", "true; raw printf 'raw-sibling\\n'; true"),
+        (
+            "function",
+            "wrapped() { true; raw printf 'raw-sibling\\n'; true; }; wrapped",
+        ),
+        ("eval", "eval \"true; raw printf 'raw-sibling\\\\n'; true\""),
+        (
+            "if",
+            "if true; then true; raw printf 'raw-sibling\\n'; true; fi",
+        ),
+        (
+            "for",
+            "for item in once; do true; raw printf 'raw-sibling\\n'; true; done",
+        ),
+        ("subshell", "(true; raw printf 'raw-sibling\\n'; true)"),
+        ("brace", "{ true; raw printf 'raw-sibling\\n'; true; }"),
+    ];
+
+    for (name, source) in cases {
+        let output = agsh_command()
+            .args(["--output", "semantic", "-c", source])
+            .output()
+            .expect("run mixed explicit and session output modes");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "case={name} stderr={:?}",
+            output.stderr
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.matches("\"exit_code\": 0").count() >= 2,
+            "case={name} stdout={stdout}"
+        );
+        assert_eq!(
+            stdout.matches("raw-sibling\n").count(),
+            1,
+            "case={name} stdout={stdout}"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "case={name} stderr={:?}",
+            output.stderr
+        );
+    }
+}
+
+#[test]
+fn pty_rejects_pipeline_and_redirected_stdin_before_payload_launch() {
+    let base = history_test_dir("pty_stdin_rejection");
+    let redirected_input = base.join("input.txt");
+    let redirected_marker = base.join("redirected-payload-ran");
+    let pipeline_marker = base.join("pipeline-payload-ran");
+    std::fs::write(&redirected_input, b"redirected input\n").unwrap();
+
+    let redirected_source = format!(
+        "pty sh -c 'touch \"{}\"; cat' < '{}'",
+        redirected_marker.display(),
+        redirected_input.display()
+    );
+    let redirected = agsh_c_timeout(&redirected_source, 5).expect("redirected PTY hung");
+    assert!(
+        !redirected.status.success(),
+        "stdout={:?}",
+        redirected.stdout
+    );
+    assert!(
+        String::from_utf8_lossy(&redirected.stderr).contains("PTY stdin"),
+        "stderr={:?}",
+        redirected.stderr
+    );
+    assert!(
+        !redirected_marker.exists(),
+        "PTY payload ran before rejection"
+    );
+
+    let pipeline_source = format!(
+        "printf 'pipeline input\\n' | agpty sh -c 'touch \"{}\"; cat'",
+        pipeline_marker.display()
+    );
+    let pipeline = agsh_c_timeout(&pipeline_source, 5).expect("pipeline PTY hung");
+    assert!(!pipeline.status.success(), "stdout={:?}", pipeline.stdout);
+    assert!(
+        String::from_utf8_lossy(&pipeline.stderr).contains("PTY stdin"),
+        "stderr={:?}",
+        pipeline.stderr
+    );
+    assert!(
+        !pipeline_marker.exists(),
+        "PTY payload ran before rejection"
+    );
+
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn agview_and_pty_names_are_real_executor_builtins() {
+    let base = history_test_dir("executor_wrapper_builtins");
+    let history = base.join("history.jsonl");
+    let input = base.join("view.txt");
+    let pty_redirect = base.join("pty.out");
+    let pty_pipe = base.join("pty-pipe.out");
+    std::fs::write(&input, b"builtin-view\n").unwrap();
+    let source = format!(
+        "type agview pty agpty; command -v agview pty agpty; \
+         builtin agview '{}'; builtin pty sh -c 'printf pty-redirect' > '{}'; \
+         builtin pty sh -c 'printf pty-pipe' | cat > '{}'; \
+         builtin agpty sh -c 'exit 7'",
+        input.display(),
+        pty_redirect.display(),
+        pty_pipe.display()
+    );
+    let output = isolated_agsh(&base, &history)
+        .args(["-c", &source])
+        .output()
+        .expect("run executor wrapper builtins");
+
+    assert_eq!(output.status.code(), Some(7), "stderr={:?}", output.stderr);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for name in ["agview", "pty", "agpty"] {
+        assert!(
+            stdout.contains(&format!("{name} is an agsh builtin\n")),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("\n{name}\n")) || stdout.starts_with(&format!("{name}\n")),
+            "{stdout}"
+        );
+    }
+    assert!(stdout.contains("builtin-view\n"), "{stdout}");
+    assert_eq!(std::fs::read(pty_redirect).unwrap(), b"pty-redirect");
+    assert_eq!(std::fs::read(pty_pipe).unwrap(), b"pty-pipe");
+    assert!(output.stderr.is_empty(), "stderr={:?}", output.stderr);
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]
@@ -719,7 +1627,7 @@ fn semantic_observation_has_stable_complete_trace_status_and_backing_refs() {
 
 #[test]
 fn clean_mode_strips_ansi_and_redacts_secrets() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args([
             "--output",
             "clean",
@@ -740,7 +1648,7 @@ fn clean_mode_strips_ansi_and_redacts_secrets() {
 #[test]
 fn semantic_mode_redacts_sensitive_environment_values_and_argv() {
     let secret = "supersecretvalue";
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args([
             "--output",
             "semantic",
@@ -768,7 +1676,7 @@ fn semantic_mode_emits_trace_refs_that_resolve() {
 }
 
 fn run_interactive_args(args: &[&str], input: &str) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let mut child = agsh_command()
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -898,8 +1806,14 @@ fn semantic_case_fallthrough_is_not_downgraded_as_async_output() {
         let display = String::from_utf8(output.stdout).unwrap();
         assert!(display.trim_start().starts_with('{'), "{display:?}");
         assert!(display.trim_end().ends_with('}'), "{display:?}");
-        assert_eq!(display.matches("\"command\"").count(), 1, "{display}");
-        assert!(display.contains("firstsecond"), "{display}");
+        assert_eq!(display.matches("\"command\"").count(), 2, "{display}");
+        let first = display
+            .find("\"body\": [\n    \"first\"")
+            .unwrap_or_else(|| panic!("missing first arm observation: {display}"));
+        let second = display
+            .find("\"body\": [\n    \"second\"")
+            .unwrap_or_else(|| panic!("missing second arm observation: {display}"));
+        assert!(first < second, "fallthrough order changed: {display}");
         std::fs::remove_dir_all(base).unwrap();
     }
 }
@@ -1260,10 +2174,29 @@ fn substitution_fd_snapshots_stay_inside_capture_modes() {
                 if mode == "semantic" {
                     let display = String::from_utf8(output.stdout).unwrap();
                     assert!(display.trim_start().starts_with('{'), "display={display:?}");
-                    assert!(
-                        display.contains(&format!("\"body\": [\n    \"{expected_display}\"")),
+                    let expected_bodies: &[&str] = match (kind, order) {
+                        ("command", "dup-only") => &["err", "x=sub"],
+                        ("command", "dup-before-file") => &["err"],
+                        ("process", "dup-only") => &["errsub", "after"],
+                        ("process", "dup-before-file") => &["err"],
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(
+                        display.matches("\"command\"").count(),
+                        expected_bodies.len(),
                         "{mode} {kind} {order}: {display}"
                     );
+                    let mut previous = 0;
+                    for body in expected_bodies {
+                        let needle = format!("\"body\": [\n    \"{body}\"");
+                        let position = display[previous..]
+                            .find(&needle)
+                            .map(|position| previous + position)
+                            .unwrap_or_else(|| {
+                                panic!("{mode} {kind} {order}: missing {body:?}: {display}")
+                            });
+                        previous = position + needle.len();
+                    }
                 } else {
                     assert_eq!(
                         output.stdout,
@@ -1327,7 +2260,11 @@ fn compound_redirection_routes_synthesized_diagnostics() {
         .output()
         .expect("run synthesized diagnostics under compound redirection");
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        output.status.code(),
+        Some(126),
+        "an existing script with an unavailable interpreter is found but cannot be launched"
+    );
     assert!(output.stdout.is_empty(), "stdout={:?}", output.stdout);
     assert!(output.stderr.is_empty(), "stderr={:?}", output.stderr);
     for path in [&brace_path, &function_path] {
@@ -1763,7 +2700,13 @@ fn background_subshell_restores_outer_value_when_leaving_active_project_env() {
         .output()
         .expect("run active project environment background case");
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?}, stderr={:?}",
+        output.stdout,
+        output.stderr
+    );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         "inside=<project>\nchild=<outer>\nparent=<project>\n"
@@ -1855,7 +2798,7 @@ fn malformed_background_stdin_handoff_never_executes_payload() {
 fn pty_broker_gives_child_a_tty() {
     // Even though agsh's own stdout here is a pipe (captured), the child run
     // under `pty` sees a TTY on stdout.
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args(["-c", "pty sh -c 'test -t 1 && echo isatty || echo notty'"])
         .output()
         .expect("run agsh");
@@ -1869,7 +2812,7 @@ fn pty_broker_gives_child_a_tty() {
 
 #[test]
 fn pty_broker_propagates_exit_code() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args(["-c", "pty sh -c 'exit 4'"])
         .output()
         .expect("run agsh");
@@ -1878,7 +2821,7 @@ fn pty_broker_propagates_exit_code() {
 
 #[test]
 fn signal_terminated_command_reports_128_plus_signal() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args(["-c", "sh -c 'kill -INT $$'"])
         .output()
         .expect("run agsh");
@@ -1889,7 +2832,7 @@ fn signal_terminated_command_reports_128_plus_signal() {
 #[test]
 fn sigint_interrupts_loop_without_killing_shell() {
     use std::time::{Duration, Instant};
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let mut child = agsh_command()
         .args(["-c", "while :; do sleep 0.05; done"])
         .spawn()
         .expect("spawn agsh");
@@ -1913,7 +2856,7 @@ fn sigint_interrupts_loop_without_killing_shell() {
 
 #[test]
 fn exec_replaces_agsh_process_for_raw_cli_command() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args(["-c", "exec /bin/sh -c 'printf exec-ok'"])
         .output()
         .expect("run agsh");
@@ -1942,7 +2885,7 @@ fn exec_process_replacement_accepts_input_redirection() {
 
 #[test]
 fn exec_is_disabled_when_cli_output_is_captured() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args([
             "--output",
             "semantic",
@@ -1965,7 +2908,7 @@ fn confine_sticky_session_denies_nonallowlisted() {
     // The in-session `confine` builtin confines the current session: subsequent
     // non-allowlisted commands are denied (no output leaks). Works in an
     // already-open shell, not just at launch.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "confine echo; echo ok; uname"])
         .env_remove("AGSH_CONFINE")
         .output()
@@ -1977,7 +2920,7 @@ fn confine_sticky_session_denies_nonallowlisted() {
 #[test]
 fn confine_inherited_from_env() {
     // A child agsh self-confines from AGSH_CONFINE (how confinement propagates).
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "echo ok; uname"])
         .env("AGSH_CONFINE", "echo")
         .output()
@@ -1989,7 +2932,7 @@ fn confine_inherited_from_env() {
 fn confine_inherited_empty_env_denies_every_external_command() {
     // Presence is significant: an empty serialized allowlist is deny-all, not
     // the same as an absent AGSH_CONFINE variable.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "/bin/echo should-not-run"])
         .env("AGSH_CONFINE", "")
         .output()
@@ -2003,7 +2946,7 @@ fn confine_inherited_empty_env_denies_every_external_command() {
 fn confine_deny_all_propagates_to_background_child() {
     // Intersecting disjoint sticky policies produces deny-all. Background
     // commands run in a child agsh, which must preserve that empty policy.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args([
             "-c",
             "confine true; confine false; /bin/echo should-not-run & wait",
@@ -2026,7 +2969,7 @@ fn confine_propagates_to_child_agsh() {
         dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let out = Command::new(bin)
+    let out = agsh_command()
         .args(["--allow", "echo", "--run", "agsh -c 'echo childok; uname'"])
         .env("PATH", path)
         .env_remove("AGSH_CONFINE")
@@ -2055,7 +2998,7 @@ fn confine_propagates_to_child_agsh() {
 
 #[test]
 fn run_requires_an_explicit_nonempty_capability_list() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let output = agsh_command()
         .args(["--run", "printf UNCONFINED"])
         .output()
         .expect("run agsh");
@@ -2069,7 +3012,7 @@ fn run_requires_an_explicit_nonempty_capability_list() {
 #[test]
 fn confine_cannot_widen_itself() {
     // A confined session cannot grant itself more (narrow-only).
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "confine echo; confine echo,uname; uname"])
         .env_remove("AGSH_CONFINE")
         .output()
@@ -2083,7 +3026,7 @@ fn confine_shims_intercept_agent_bash_tool() {
     // The real-world bypass: an agent runs commands via its own `bash -c '…'`
     // subprocess (not through agsh). With shims installed by `--allow`, that bash
     // is routed back through confined agsh, so a non-allowlisted command is denied.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["--allow", "ls,df", "--run", "bash -c 'uname'"])
         .env_remove("AGSH_CONFINE")
         .output()
@@ -2105,7 +3048,7 @@ fn confine_shims_intercept_agent_bash_tool() {
 #[test]
 fn shims_only_installed_when_confined() {
     // A normal (unconfined) session must NOT touch PATH/SHELL or install shims.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "echo $PATH"])
         .env_remove("AGSH_CONFINE")
         .output()
@@ -2127,7 +3070,7 @@ fn confine_shim_handles_login_and_rc_flags() {
         "bash -lc 'echo OK'",
         "bash -il -c 'echo OK'",
     ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        let out = agsh_command()
             .args(["--allow", "echo", "--run", inv])
             .env_remove("AGSH_CONFINE")
             .output()
@@ -2145,7 +3088,7 @@ fn confine_shim_handles_login_and_rc_flags() {
         }
     }
     // ...and a denied command stays denied even with login/rc flags.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["--allow", "echo", "--run", "bash --norc -l -c 'uname'"])
         .env_remove("AGSH_CONFINE")
         .output()
@@ -2172,7 +3115,7 @@ fn confine_refuses_self_managing_agent() {
         vec!["-c", "confine ls,df -- claude"],
         vec!["--allow", "ls,df", "--run", "claude"],
     ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        let out = agsh_command()
             .args(&args)
             .env_remove("AGSH_CONFINE")
             .output()
@@ -2191,7 +3134,7 @@ fn confine_readonly_scrubs_credential_env() {
     if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
         return;
     }
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args([
             "-c",
             "confine read-only -- sh -c 'echo [$AWS_SECRET_ACCESS_KEY][$SSH_AUTH_SOCK][$GITHUB_TOKEN]'",
@@ -2222,7 +3165,7 @@ fn sandbox_capable_python() -> Option<&'static str> {
         return None;
     }
     for py in ["/usr/bin/python3", "python3"] {
-        let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        let out = agsh_command()
             .args(["-c", &format!("confine ls -- {py} -c 'print(\"ok\")'")])
             .env_remove("AGSH_CONFINE")
             .output();
@@ -2243,7 +3186,7 @@ fn confine_leaf_payload_kernel_enforced() {
         return;
     }
     // ls allowed runs; du denied.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args([
             "-c",
             "confine ls -- bash -c 'ls / >/dev/null && echo ok; du -sh /tmp'",
@@ -2268,7 +3211,7 @@ fn confine_leaf_payload_kernel_enforced() {
         ));
     }
     for payload in payloads {
-        let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        let out = agsh_command()
             .args(["-c", &payload])
             .env_remove("AGSH_CONFINE")
             .output()
@@ -2293,7 +3236,7 @@ fn confine_leaf_payload_quoting_preserved() {
     let Some(py) = sandbox_capable_python() else {
         return;
     };
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", &format!("confine ls -- {py} -c 'print(\"py-ran\")'")])
         .env_remove("AGSH_CONFINE")
         .output()
@@ -2304,7 +3247,7 @@ fn confine_leaf_payload_quoting_preserved() {
 #[test]
 fn confine_force_bypasses_agent_refusal() {
     // --force lets a known agent through (it won't be refused as an agent).
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "confine --force ls -- claude --version 2>&1 || true"])
         .env_remove("AGSH_CONFINE")
         .output()
@@ -2328,7 +3271,7 @@ fn confine_no_command_injection_via_tmpdir() {
     let _ = std::fs::remove_file(&marker);
     let evil_dir = format!("/tmp/sb$(touch {})d", marker.display());
     std::fs::create_dir_all(&evil_dir).unwrap();
-    let _ = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let _ = agsh_command()
         .args(["-c", "confine ls -- /bin/echo hi"])
         .env("TMPDIR", format!("{evil_dir}/"))
         .env_remove("AGSH_CONFINE")
@@ -2351,7 +3294,7 @@ fn confine_refuses_wrapped_agents() {
         "confine ls -- nice -n5 claude",
         "confine ls -- Claude",
     ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        let out = agsh_command()
             .args(["-c", payload])
             .env_remove("AGSH_CONFINE")
             .output()
@@ -2374,7 +3317,7 @@ fn deep_arithmetic_errors_instead_of_crashing() {
         format!("echo $(( {}0 ))", "~".repeat(50000)),
         format!("agmath \"{}1.0{}\"", "(".repeat(50000), ")".repeat(50000)),
     ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        let out = agsh_command()
             .args(["-c", &expr])
             .output()
             .expect("run agsh");
@@ -2390,7 +3333,7 @@ fn deep_arithmetic_errors_instead_of_crashing() {
         );
     }
     // Normal arithmetic still works.
-    let ok = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let ok = agsh_command()
         .args(["-c", "echo $(( (1+2)*3 + 2**4 ))"])
         .output()
         .expect("run agsh");
@@ -2400,7 +3343,7 @@ fn deep_arithmetic_errors_instead_of_crashing() {
 #[test]
 fn large_stdin_capture_does_not_deadlock() {
     // Capturing a command that echoes >128KB of stdin must not deadlock.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "x=$(cat <<< \"$(seq 50000)\"); echo len=${#x}"])
         .output()
         .expect("run agsh");
@@ -2411,7 +3354,7 @@ fn large_stdin_capture_does_not_deadlock() {
 #[test]
 fn pipe_to_early_closing_consumer_is_silent() {
     // `… | head` (consumer exits early) must not print a spurious "Broken pipe".
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "seq 100000 | head -1; echo ok"])
         .output()
         .expect("run agsh");
@@ -2535,7 +3478,7 @@ fn view_of_binary_is_raw_when_not_a_tty() {
         0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0xff, 0xfe,
     ];
     std::fs::write(&path, bytes).unwrap();
-    let via_view = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let via_view = agsh_command()
         .args(["-c", &format!("agview {}", path.display())])
         .output()
         .expect("run agsh");
@@ -2560,7 +3503,7 @@ fn confine_read_only_blocks_write_delete_network_secrets() {
     std::fs::write(&victim, "keep").unwrap();
 
     let run = |payload: &str| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_agsh"))
+        agsh_command()
             .args(["-c", payload])
             .env_remove("AGSH_CONFINE")
             .output()
@@ -2613,7 +3556,7 @@ fn confine_offline_denies_network_but_allows_writes() {
     std::fs::create_dir_all(&dir).unwrap();
     let f = dir.join("w.txt");
     // offline = network off, filesystem unchanged → this write succeeds.
-    let _ = std::process::Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let _ = agsh_command()
         .args([
             "-c",
             &format!("confine offline -- /bin/sh -c 'echo hi > {}'", f.display()),
@@ -2670,7 +3613,7 @@ fn sessions_lists_planted_claude_session_for_cwd() {
     )
     .unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "sessions"])
         .env("HOME", &home)
         .current_dir(&proj)
@@ -2689,14 +3632,14 @@ fn sessions_lists_planted_claude_session_for_cwd() {
 fn observe_forwards_output_and_exit_code() {
     // `--observe CMD` runs CMD as a captured external command, forwarding its
     // output (raw = exact bytes) and exit code.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["--observe", "printf", "a\nb\n"])
         .output()
         .expect("run agsh");
     assert_eq!(out.stdout, b"a\nb\n", "raw --observe must be exact bytes");
     assert!(out.status.success());
 
-    let code = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let code = agsh_command()
         .args(["--observe", "sh", "-c", "exit 7"])
         .status()
         .expect("run agsh")
@@ -2708,7 +3651,7 @@ fn observe_forwards_output_and_exit_code() {
     );
 
     // A leading `--` separator is tolerated.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["--observe", "--", "echo", "sep-ok"])
         .output()
         .expect("run agsh");
@@ -2718,7 +3661,7 @@ fn observe_forwards_output_and_exit_code() {
 #[test]
 fn intercept_is_off_by_default_and_opt_in_routes_shells() {
     // Off by default: no shim dir on PATH.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "echo $PATH"])
         .env_remove("AGSH_INTERCEPT")
         .output()
@@ -2730,7 +3673,7 @@ fn intercept_is_off_by_default_and_opt_in_routes_shells() {
 
     // Opt-in: the shim dir is prepended, and a `bash -c` routes through agsh back
     // to the real shell (output preserved).
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "echo $PATH; bash -c 'echo ROUTED42'"])
         .env("AGSH_INTERCEPT", "compact")
         .output()
@@ -2749,7 +3692,7 @@ fn intercept_is_off_by_default_and_opt_in_routes_shells() {
 #[test]
 fn intercept_native_flavor_interprets_in_agsh() {
     // `<mode>:native` routes a shell `-c` command into agsh's own interpreter.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "bash -c 'echo NATIVE-A | tr a-z A-Z'"])
         .env("AGSH_INTERCEPT", "compact:native")
         .output()
@@ -2795,7 +3738,7 @@ int main(void){char*a[]={"/bin/bash","-c","echo DEEP-TEST-HIT;echo L2;echo L3;ec
         let _ = std::fs::remove_dir_all(&tmp);
         return;
     }
-    let out = Command::new(&bin)
+    let out = isolated_program(&bin, &tmp)
         .env("DYLD_INSERT_LIBRARIES", &lib)
         .env("AGSH_SELF", &exe)
         .env("AGSH_INTERCEPT_MODE", "compact")
@@ -2815,7 +3758,7 @@ int main(void){char*a[]={"/bin/bash","-c","echo DEEP-TEST-HIT;echo L2;echo L3;ec
 #[test]
 fn mode_intercept_runtime_toggle() {
     let run = |script: &str| -> String {
-        let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        let out = agsh_command()
             .args(["-c", script])
             .env_remove("AGSH_INTERCEPT")
             .output()
@@ -2839,9 +3782,8 @@ fn mode_intercept_runtime_toggle() {
 
 #[test]
 fn compact_raw_ref_suppressed_when_shown_and_persisted_when_elided() {
-    let bin = env!("CARGO_BIN_EXE_agsh");
     // Small output is fully shown → no redundant raw pointer.
-    let out = Command::new(bin)
+    let out = agsh_command()
         .args(["--output", "compact", "-c", "echo small-output"])
         .output()
         .expect("run agsh");
@@ -2856,7 +3798,7 @@ fn compact_raw_ref_suppressed_when_shown_and_persisted_when_elided() {
     // the full raw output (resolvable across processes).
     let dir = std::env::temp_dir().join(format!("agsh_trace_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let out = Command::new(bin)
+    let out = agsh_command()
         .args(["--output", "compact", "-c", "seq 1 600"])
         .env("AGSH_TRACE_DIR", &dir)
         .output()
@@ -2884,7 +3826,7 @@ fn agtrace_grep_searches_a_trace_file() {
     let f = dir.join("t.out");
     std::fs::write(&f, "alpha ok\nbeta error 1\ngamma ok\ndelta error 2\n").unwrap();
     // Matches → structured count + numbered lines, exit 0.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", &format!("agtrace grep error {}", f.display())])
         .output()
         .expect("run agsh");
@@ -2896,7 +3838,7 @@ fn agtrace_grep_searches_a_trace_file() {
     );
     assert_eq!(out.status.code(), Some(0));
     // No match → exit 1 (grep-style).
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", &format!("agtrace grep zzz {}", f.display())])
         .output()
         .expect("run agsh");
@@ -2906,7 +3848,7 @@ fn agtrace_grep_searches_a_trace_file() {
 
 #[test]
 fn repeated_command_not_found_advisory_shown_once() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let mut child = agsh_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -2935,9 +3877,8 @@ fn repeated_command_not_found_advisory_shown_once() {
 
 #[test]
 fn intercept_sets_fail_fast_env_for_interactive_tools() {
-    let bin = env!("CARGO_BIN_EXE_agsh");
     let run = |intercept: Option<&str>, git: Option<&str>| -> String {
-        let mut c = Command::new(bin);
+        let mut c = agsh_command();
         c.args(["-c", "echo ${GIT_TERMINAL_PROMPT:-unset}"]);
         match intercept {
             Some(v) => {
@@ -2972,7 +3913,7 @@ fn intercept_sets_fail_fast_env_for_interactive_tools() {
 fn agjob_runs_in_background_and_captures_output() {
     let dir = std::env::temp_dir().join(format!("agsh_agjob_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "agjob sh -c 'echo JOB-ONE; echo JOB-TWO'"])
         .env("AGSH_BROKER_DIR", &dir)
         .output()
@@ -3021,7 +3962,7 @@ fn agjob_runs_in_background_and_captures_output() {
         );
     }
 
-    let stopped = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let stopped = agsh_command()
         .args(["-c", "keep stop"])
         .env("AGSH_BROKER_DIR", &dir)
         .output()
@@ -3037,10 +3978,7 @@ fn agjob_runs_in_background_and_captures_output() {
 // it is the direct "did the process crash?" probe.
 
 fn agsh_dash_c(src: &str) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_agsh"))
-        .args(["-c", src])
-        .output()
-        .expect("run agsh")
+    agsh_command().args(["-c", src]).output().expect("run agsh")
 }
 
 #[test]
@@ -3136,7 +4074,7 @@ fn trace_files_are_private() {
     let base = std::env::temp_dir().join(format!("agsh-trace-perm-{}", std::process::id()));
     let dir = base.join("traces");
     let _ = std::fs::remove_dir_all(&base);
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["--output", "compact", "-c", "echo trace-me"])
         .env("AGSH_TRACE_DIR", &dir)
         .output()
@@ -3238,7 +4176,7 @@ fn capturing_mode_bounds_large_output() {
     // preserve the exit code — not hang or OOM — and agsh's emitted output stays
     // bounded, nowhere near 200 MB. (The head+tail retention is unit-tested in
     // `read_capped`; this is the end-to-end no-OOM/no-hang guard.)
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args([
             "--output",
             "compact",
@@ -3284,7 +4222,7 @@ fn non_tty_rich_mode_streams_raw_output_past_the_render_buffer_limit() {
 /// so a pipeline-backpressure regression fails cleanly instead of hanging CI.
 fn agsh_c_timeout(src: &str, secs: u64) -> Option<std::process::Output> {
     use std::io::Read;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let mut child = agsh_command()
         .args(["-c", src])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3369,7 +4307,7 @@ fn oversized_read_lines_and_printf_fields_fail_without_unbounded_allocation() {
         printf.stderr
     );
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let mut child = agsh_command()
         .args(["-c", "read VALUE"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3424,7 +4362,7 @@ fn substitution_scanning_honors_quotes() {
 fn capturing_mode_preserves_the_child_locale() {
     // Observation must never change command semantics. A localized command may
     // fall back to generic compaction, but it must see the caller's locale.
-    let compact = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let compact = agsh_command()
         .args(["--output", "compact", "-c", "printenv LC_ALL"])
         .env("LC_ALL", "de_DE.UTF-8")
         .output()
@@ -3436,14 +4374,14 @@ fn capturing_mode_preserves_the_child_locale() {
     );
 
     // Raw mode must not alter the child's locale (exact-bytes contract).
-    let raw = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let raw = agsh_command()
         .args(["--output", "raw", "-c", "printenv LC_ALL"])
         .env("LC_ALL", "de_DE.UTF-8")
         .output()
         .expect("run agsh");
     assert_eq!(String::from_utf8_lossy(&raw.stdout), "de_DE.UTF-8\n");
 
-    let assigned = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let assigned = agsh_command()
         .args(["--output", "compact", "-c", "LC_ALL=C printenv LC_ALL"])
         .env("LC_ALL", "de_DE.UTF-8")
         .output()
@@ -3456,7 +4394,7 @@ fn capturing_mode_preserves_temporal_order_after_fd_duplication() {
     for redirection in ["2>&1", "1>&2"] {
         let source =
             format!("sh -c 'printf o1; printf e1 >&2; printf o2; printf e2 >&2' {redirection}");
-        let output = Command::new(env!("CARGO_BIN_EXE_agsh"))
+        let output = agsh_command()
             .args(["--output", "clean", "-c", &source])
             .output()
             .expect("run ordered merged output");
@@ -3528,7 +4466,7 @@ fn resume_restores_a_dead_sessions_state_and_consumes_the_journal() {
     std::fs::write(sessions.join("t1.jsonl"), &journal).unwrap();
 
     // `resume list` sees it, with what was running.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "resume list"])
         .env("AGSH_SESSION_DIR", &sessions)
         .output()
@@ -3538,7 +4476,7 @@ fn resume_restores_a_dead_sessions_state_and_consumes_the_journal() {
     assert!(listing.contains("claude"), "listing: {listing}");
 
     // `resume` replays cwd + env + alias into the live session.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "resume; pwd; echo url=$API_URL; alias gs"])
         .env("AGSH_SESSION_DIR", &sessions)
         .output()
@@ -3560,7 +4498,7 @@ fn resume_restores_a_dead_sessions_state_and_consumes_the_journal() {
     );
 
     // The journal is consumed: a second resume finds nothing.
-    let out = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let out = agsh_command()
         .args(["-c", "resume"])
         .env("AGSH_SESSION_DIR", &sessions)
         .output()
@@ -3576,11 +4514,13 @@ fn compact_pwd_matches_raw_pwd() {
     // A successful tiny output IS its most compact form: `compact pwd` must
     // print exactly what `pwd` prints — no [ok] header, no counts scaffolding,
     // and no workspace shortening of the answer to "." (user report).
-    let raw = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let base = history_test_dir("compact-pwd");
+    let history = base.join("history.jsonl");
+    let raw = isolated_agsh(&base, &history)
         .args(["-c", "pwd"])
         .output()
         .expect("run agsh");
-    let compact = Command::new(env!("CARGO_BIN_EXE_agsh"))
+    let compact = isolated_agsh(&base, &history)
         .args(["--output", "compact", "-c", "pwd"])
         .output()
         .expect("run agsh");
@@ -3589,6 +4529,7 @@ fn compact_pwd_matches_raw_pwd() {
         String::from_utf8_lossy(&raw.stdout),
         "compact pwd must equal raw pwd"
     );
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[cfg(unix)]

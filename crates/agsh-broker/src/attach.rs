@@ -16,8 +16,16 @@ use crate::protocol::JobInfo;
 pub enum AttachOutcome {
     /// The user pressed the detach key; the job keeps running.
     Detached,
-    /// The job exited (or the broker went away) while attached.
-    Ended,
+    /// Another client took over the still-running job's attach slot.
+    TakenOver,
+    /// The broker authoritatively reported the job's exit status.
+    Exited(i32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpOutcome {
+    Detached,
+    StreamEnded,
 }
 
 /// The detach byte: Ctrl-].
@@ -64,7 +72,8 @@ pub fn term_size() -> (u16, u16) {
 /// (polled — no signal handler is installed in the host shell).
 pub fn attach_interactive(client: &Client, id: &str) -> std::io::Result<AttachOutcome> {
     let (rows, cols) = term_size();
-    let (stream, _info): (UnixStream, JobInfo) = client.attach_stream(id, rows, cols, 64 * 1024)?;
+    let (stream, _info, token): (UnixStream, JobInfo, u64) =
+        client.attach_stream(id, rows, cols, 64 * 1024)?;
     let raw = RawTty::new()?;
     let outcome = pump(client, id, &stream, (rows, cols));
     drop(raw);
@@ -72,7 +81,27 @@ pub fn attach_interactive(client: &Client, id: &str) -> std::io::Result<AttachOu
     let mut out = std::io::stdout();
     let _ = out.write_all(b"\r\n");
     let _ = out.flush();
-    outcome
+    match outcome? {
+        PumpOutcome::Detached => Ok(AttachOutcome::Detached),
+        PumpOutcome::StreamEnded => classify_stream_end(client, id, token),
+    }
+}
+
+/// A clean attach-stream EOF is ambiguous: either the job exited or a newer
+/// client took over. Resolve it with an authoritative broker status response;
+/// broker loss and internally inconsistent job state stay errors.
+fn classify_stream_end(client: &Client, id: &str, token: u64) -> std::io::Result<AttachOutcome> {
+    let info = client.status_after_attach(id, token)?;
+    if info.running {
+        Ok(AttachOutcome::TakenOver)
+    } else if let Some(code) = info.exit_code {
+        Ok(AttachOutcome::Exited(code))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("broker returned no exit code for finished job {id}"),
+        ))
+    }
 }
 
 fn pump(
@@ -80,7 +109,7 @@ fn pump(
     id: &str,
     stream: &UnixStream,
     mut last_size: (u16, u16),
-) -> std::io::Result<AttachOutcome> {
+) -> std::io::Result<PumpOutcome> {
     use rustix::event::{poll, PollFd, PollFlags};
 
     let stdin = std::io::stdin();
@@ -113,31 +142,52 @@ fn pump(
             continue;
         }
         let stdin_ready = fds[0].revents().intersects(PollFlags::IN | PollFlags::HUP);
-        let socket_ready = fds[1].revents().intersects(PollFlags::IN | PollFlags::HUP);
+        let socket_ready = fds[1]
+            .revents()
+            .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR);
 
         if socket_ready {
             match socket_reader.read(&mut chunk) {
-                Ok(0) | Err(_) => return Ok(AttachOutcome::Ended),
+                Ok(0) => return Ok(PumpOutcome::StreamEnded),
                 Ok(n) => {
                     stdout.write_all(&chunk[..n])?;
                     stdout.flush()?;
                 }
+                Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
             }
         }
         if stdin_ready {
             let n = { stdin.lock().read(&mut chunk)? };
             if n == 0 {
                 // Local EOF (terminal gone): treat as detach — job survives.
-                return Ok(AttachOutcome::Detached);
+                return Ok(PumpOutcome::Detached);
             }
             if let Some(pos) = chunk[..n].iter().position(|&b| b == DETACH) {
                 if pos > 0 {
                     socket_writer.write_all(&chunk[..pos])?;
                 }
                 let _ = stream.shutdown(std::net::Shutdown::Both);
-                return Ok(AttachOutcome::Detached);
+                return Ok(PumpOutcome::Detached);
             }
             socket_writer.write_all(&chunk[..n])?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_end_without_authoritative_status_is_an_error() {
+        let socket = std::env::temp_dir().join(format!(
+            "agsh-broker-missing-status-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let client = Client::at(socket);
+
+        assert!(classify_stream_end(&client, "k1", 7).is_err());
     }
 }

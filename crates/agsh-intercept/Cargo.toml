@@ -2,6 +2,7 @@
 name = "agsh-intercept"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Optional exec-interposition layer for agsh shell interception (DYLD_INSERT_LIBRARIES / LD_PRELOAD)."
 repository.workspace = true

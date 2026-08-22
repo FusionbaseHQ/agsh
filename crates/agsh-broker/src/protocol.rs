@@ -19,6 +19,10 @@ pub enum Request {
     List,
     Status {
         id: String,
+        /// Only attach clients receive this token. It lets the broker retain
+        /// the authoritative terminal status across immediate record pruning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach_token: Option<u64>,
     },
     /// Send the last `bytes` of the job's output log (header + raw bytes).
     Tail {
@@ -44,7 +48,7 @@ pub enum Request {
         cols: u16,
         replay: u64,
     },
-    /// Drop a finished job from the table (its log file stays).
+    /// Drop a finished job from the table and delete its log generations.
     Remove {
         id: String,
     },
@@ -114,6 +118,9 @@ pub enum Response {
     /// The connection now streams raw bytes both ways.
     Attached {
         info: JobInfo,
+        /// Correlates the stream's terminal EOF with its authoritative status.
+        #[serde(default)]
+        token: u64,
     },
     Err {
         message: String,
@@ -188,6 +195,10 @@ mod tests {
                 cols: 120,
                 replay: 32768,
             },
+            Request::Status {
+                id: "k1".into(),
+                attach_token: Some(7),
+            },
             Request::Signal {
                 id: "k1".into(),
                 signal: "TERM".into(),
@@ -216,14 +227,16 @@ mod tests {
                 attached: true,
                 log: "/l/k1.log".into(),
             },
+            token: 7,
         };
         let mut buf = Vec::new();
         write_line(&mut buf, &resp).unwrap();
         let back: Response = read_line(&mut buf.as_slice()).unwrap().unwrap();
         match back {
-            Response::Attached { info } => {
+            Response::Attached { info, token } => {
                 assert_eq!(info.id, "k1");
                 assert!(matches!(info.kind, JobKind::Session));
+                assert_eq!(token, 7);
             }
             other => panic!("wrong variant: {other:?}"),
         }

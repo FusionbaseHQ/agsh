@@ -2,7 +2,7 @@
 //! serves the unix-socket protocol. Runs as `agsh --broker-daemon` in its own
 //! session (started detached via `agsh --broker-launch`).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::paths;
 use crate::protocol::{
@@ -21,11 +21,25 @@ use crate::protocol::{
 const SCROLLBACK_CAP: usize = 64 * 1024;
 /// Rotate a job log once it exceeds this (old generation kept ⇒ ≤2× on disk).
 const LOG_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
-/// Keep at most this many finished jobs listed (oldest pruned on spawn).
+/// Rotate the daemon's sparse operational log at runtime; retain one generation.
+const DAEMON_LOG_ROTATE_BYTES: u64 = 1024 * 1024;
+/// Retain a small, bounded recovery window for logs orphaned by a prior daemon
+/// generation. They are not addressable through the fresh in-memory job table.
+const ORPHAN_LOG_JOB_CAP: usize = 20;
+const ORPHAN_LOG_BYTES_CAP: u64 = 128 * 1024 * 1024;
+/// Keep at most this many finished jobs listed (oldest pruned on completion).
 const FINISHED_CAP: usize = 20;
+/// Each kept PTY owns a process, descriptors, memory, and log state. Same-UID
+/// clients share this hard global ceiling rather than growing them unboundedly.
+const MAX_RUNNING_JOBS: usize = 64;
 const MAX_CONNECTIONS: usize = 64;
+/// Token-scoped terminal statuses bridge attach EOF to its follow-up status
+/// request without allowing clients that never follow up to grow memory.
+const PENDING_ATTACH_EXIT_CAP: usize = MAX_CONNECTIONS;
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+const ATTACH_INPUT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+static DAEMON_LOG_REFRESH: Mutex<()> = Mutex::new(());
 
 struct ActiveConnection {
     count: Arc<AtomicUsize>,
@@ -44,6 +58,52 @@ fn reserve_connection(count: &Arc<AtomicUsize>, limit: usize) -> Option<ActiveCo
         })
         .ok()?;
     Some(ActiveConnection {
+        count: Arc::clone(count),
+    })
+}
+
+fn spawn_connection_worker_with<F>(
+    worker: F,
+    spawn: impl FnOnce(F) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    spawn(worker)
+}
+
+fn spawn_connection_worker(worker: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    spawn_connection_worker_with(worker, |worker| {
+        std::thread::Builder::new()
+            .name("agsh-control".into())
+            .spawn(worker)
+            .map(drop)
+    })
+}
+
+#[derive(Debug)]
+struct ActiveRunningJob {
+    count: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveRunningJob {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn reserve_running_job(
+    count: &Arc<AtomicUsize>,
+    limit: usize,
+) -> std::io::Result<ActiveRunningJob> {
+    count
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < limit).then_some(current + 1)
+        })
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("broker running-job limit reached ({limit})"),
+            )
+        })?;
+    Ok(ActiveRunningJob {
         count: Arc::clone(count),
     })
 }
@@ -75,6 +135,177 @@ fn open_private_append(path: &Path) -> std::io::Result<File> {
     rustix::fs::fchmod(&file, Mode::RUSR | Mode::WUSR)
         .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
     Ok(file)
+}
+
+fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn rotated_log_path(path: &Path) -> PathBuf {
+    path.with_extension("log.old")
+}
+
+fn remove_job_logs(log_path: &Path) -> std::io::Result<()> {
+    let current = remove_file_if_present(log_path);
+    let old = remove_file_if_present(&rotated_log_path(log_path));
+    current.and(old)
+}
+
+fn rotate_job_log(log_path: &Path) -> std::io::Result<()> {
+    let old = rotated_log_path(log_path);
+    remove_file_if_present(&old)?;
+    std::fs::rename(log_path, old)
+}
+
+/// Rotate when the path reaches its threshold. `true` means callers must open
+/// and install a fresh current file (the path was absent or was just rotated).
+fn rotate_daemon_log(log_path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = match std::fs::symlink_metadata(log_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "broker daemon log path is not a regular file",
+        ));
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "broker daemon log is owned by another user",
+        ));
+    }
+    if metadata.len() < DAEMON_LOG_ROTATE_BYTES {
+        return Ok(false);
+    }
+
+    let old = rotated_log_path(log_path);
+    remove_file_if_present(&old)?;
+    std::fs::rename(log_path, old)?;
+    Ok(true)
+}
+
+fn acquire_generation_lock(parent: &Path) -> std::io::Result<File> {
+    let path = parent.join("agshd.lock");
+    let file = open_private_append(&path)?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+        |error| {
+            let io_error = std::io::Error::from_raw_os_error(error.raw_os_error());
+            if io_error.kind() == std::io::ErrorKind::WouldBlock {
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "another broker generation is still running",
+                )
+            } else {
+                io_error
+            }
+        },
+    )?;
+    Ok(file)
+}
+
+fn job_log_sequence(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix('k')?;
+    let digits = rest
+        .strip_suffix(".log.old")
+        .or_else(|| rest.strip_suffix(".log"))?;
+    let sequence = digits.parse::<u64>().ok()?;
+    (sequence > 0 && sequence.to_string() == digits).then_some(sequence)
+}
+
+/// Bound logs left by an earlier, now-dead broker generation. The caller must
+/// hold the generation lock before invoking this function. Exact broker names
+/// are considered; unrelated files are untouched, and symlinks are unlinked
+/// rather than followed.
+fn prune_orphan_logs(logs_dir: &Path, job_cap: usize, bytes_cap: u64) -> std::io::Result<()> {
+    let mut groups: BTreeMap<u64, Vec<(PathBuf, u64)>> = BTreeMap::new();
+    let mut total_bytes = 0u64;
+    for entry in std::fs::read_dir(logs_dir)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(sequence) = job_log_sequence(&name) else {
+            continue;
+        };
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            remove_file_if_present(&path)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("broker job log is not a regular file: {}", path.display()),
+            ));
+        }
+        // Reopen without following a raced final symlink, validate ownership,
+        // and restore the broker's 0600 invariant before retaining the file.
+        let file = open_private_append(&path)?;
+        let bytes = file.metadata()?.len();
+        total_bytes = total_bytes.saturating_add(bytes);
+        groups.entry(sequence).or_default().push((path, bytes));
+    }
+
+    while groups.len() > job_cap || total_bytes > bytes_cap {
+        let Some((_sequence, files)) = groups.pop_first() else {
+            break;
+        };
+        for (path, bytes) in files {
+            remove_file_if_present(&path)?;
+            total_bytes = total_bytes.saturating_sub(bytes);
+        }
+    }
+    Ok(())
+}
+
+fn refreshed_daemon_log_file(log: &Path, force_reopen: bool) -> std::io::Result<Option<File>> {
+    let reopen = rotate_daemon_log(log)?;
+    if force_reopen || reopen {
+        open_private_append(log).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn redirect_daemon_log_locked(force_reopen: bool) -> std::io::Result<()> {
+    let Some(log) = paths::daemon_log_path() else {
+        return Ok(());
+    };
+    let Some(out) = refreshed_daemon_log_file(&log, force_reopen)? else {
+        return Ok(());
+    };
+    rustix::stdio::dup2_stdout(&out)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+    rustix::stdio::dup2_stderr(&out)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+fn redirect_daemon_log(force_reopen: bool) -> std::io::Result<()> {
+    let _guard = DAEMON_LOG_REFRESH
+        .lock()
+        .map_err(|_| std::io::Error::other("daemon log lock poisoned"))?;
+    redirect_daemon_log_locked(force_reopen)
+}
+
+fn log_daemon_error(message: String) {
+    let Ok(_guard) = DAEMON_LOG_REFRESH.lock() else {
+        return;
+    };
+    // Check immediately before the one bounded diagnostic. If this write
+    // crosses the threshold, the next diagnostic or accepted connection
+    // rotates it, so overshoot is limited to this message.
+    let _ = redirect_daemon_log_locked(false);
+    eprintln!("{message}");
 }
 
 fn configure_requested_cwd(command: &mut Command, cwd: &Path) -> std::io::Result<()> {
@@ -237,6 +468,9 @@ fn unix_now() -> u64 {
 #[derive(Clone, Copy, PartialEq)]
 enum RunState {
     Running,
+    /// The direct child was reaped, but the PTY pump is draining final bytes.
+    /// PID-targeting operations and new attaches are already forbidden.
+    Finishing(i32),
     Exited(i32),
 }
 
@@ -251,6 +485,48 @@ struct Output {
     attach_gen: u64,
 }
 
+/// Run `action` only while the broker still owns an unreaped direct child.
+/// The state guard remains held across the action so the pump cannot reap and
+/// publish a non-running transition while a PID/controller operation is in
+/// flight.
+fn with_running_state<T>(
+    state: &Mutex<RunState>,
+    id: &str,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let state = state
+        .lock()
+        .map_err(|_| format!("job {id} state lock poisoned"))?;
+    if !matches!(*state, RunState::Running) {
+        return Err(format!("job {id} has exited"));
+    }
+    action()
+}
+
+/// Serialize attach installation against final exit publication. Both paths
+/// take the locks in state → output order, so an attach either installs first
+/// and is removed by exit or observes a non-running state and is refused.
+fn with_running_output<T>(
+    state: &Mutex<RunState>,
+    output: &Mutex<Output>,
+    action: impl FnOnce(&mut Output) -> T,
+) -> Option<T> {
+    let state = state.lock().unwrap_or_else(|error| error.into_inner());
+    let mut output = output.lock().unwrap_or_else(|error| error.into_inner());
+    matches!(*state, RunState::Running).then(|| action(&mut output))
+}
+
+fn publish_exit_and_take_attachment(
+    state: &Mutex<RunState>,
+    output: &Mutex<Output>,
+    code: i32,
+) -> Option<(u64, UnixStream)> {
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    let mut output = output.lock().unwrap_or_else(|error| error.into_inner());
+    *state = RunState::Exited(code);
+    output.attach.take()
+}
+
 impl Output {
     fn push_and_forward(&mut self, chunk: &[u8]) {
         for &byte in chunk {
@@ -259,13 +535,17 @@ impl Output {
             }
             self.ring.push_back(byte);
         }
-        if let Some((_, stream)) = &mut self.attach {
-            if stream
+        let attach_failed = if let Some((_, stream)) = &mut self.attach {
+            stream
                 .write_all(chunk)
                 .and_then(|()| stream.flush())
                 .is_err()
-            {
-                self.attach = None;
+        } else {
+            false
+        };
+        if attach_failed {
+            if let Some((_, stream)) = self.attach.take() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
             }
         }
     }
@@ -281,7 +561,7 @@ struct KeptJob {
     log_path: PathBuf,
     /// Non-blocking controller clone for client input and winsize ioctls.
     controller: Mutex<File>,
-    child: Mutex<Child>,
+    child: Mutex<ReapOnDropChild>,
     state: Mutex<RunState>,
     output: Mutex<Output>,
 }
@@ -294,6 +574,10 @@ impl KeptJob {
             .lock()
             .map(|o| o.attach.is_some())
             .unwrap_or(false);
+        self.info_from(state, attached)
+    }
+
+    fn info_from(&self, state: RunState, attached: bool) -> JobInfo {
         JobInfo {
             id: self.id.clone(),
             kind: self.kind,
@@ -301,9 +585,9 @@ impl KeptJob {
             cwd: self.cwd.clone(),
             pid: self.pid,
             started_at: self.started_at,
-            running: state == RunState::Running,
+            running: !matches!(state, RunState::Exited(_)),
             exit_code: match state {
-                RunState::Running => None,
+                RunState::Running | RunState::Finishing(_) => None,
                 RunState::Exited(code) => Some(code),
             },
             attached,
@@ -311,20 +595,29 @@ impl KeptJob {
         }
     }
 
-    fn set_winsize(&self, rows: u16, cols: u16) {
-        let size = rustix::termios::Winsize {
-            ws_row: rows.max(1),
-            ws_col: cols.max(1),
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        if let Ok(controller) = self.controller.lock() {
-            let _ = rustix::termios::tcsetwinsize(&*controller, size);
-        }
-        let _ = self.signal("WINCH");
+    fn set_winsize(&self, rows: u16, cols: u16) -> Result<(), String> {
+        with_running_state(&self.state, &self.id, || {
+            let size = rustix::termios::Winsize {
+                ws_row: rows.max(1),
+                ws_col: cols.max(1),
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            let controller = self
+                .controller
+                .lock()
+                .map_err(|_| format!("job {} controller lock poisoned", self.id))?;
+            rustix::termios::tcsetwinsize(&*controller, size)
+                .map_err(|error| format!("resize job {}: {error}", self.id))?;
+            self.signal_unchecked("WINCH")
+        })
     }
 
     fn signal(&self, name: &str) -> Result<(), String> {
+        with_running_state(&self.state, &self.id, || self.signal_unchecked(name))
+    }
+
+    fn signal_unchecked(&self, name: &str) -> Result<(), String> {
         let Some(signal) = signal_by_name(name) else {
             return Err(format!("unknown signal {name}"));
         };
@@ -339,6 +632,48 @@ impl KeptJob {
                 .map_err(|e| format!("kill -{name} {}: {e}", self.pid)),
             Err(e) => Err(format!("kill -{name} -{}: {e}", self.pid)),
         }
+    }
+}
+
+fn retry_interrupted<T>(mut operation: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+struct ReapOnDropChild(Child);
+
+impl ReapOnDropChild {
+    fn new(child: Child) -> Self {
+        Self(child)
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0.try_wait()
+    }
+
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for ReapOnDropChild {
+    fn drop(&mut self) {
+        if matches!(retry_interrupted(|| self.0.try_wait()), Ok(Some(_))) {
+            return;
+        }
+
+        // `Ok(None)` is the normal setup-failure path. For any other wait
+        // error, the child state is unknown, so still make a best-effort kill
+        // and reap rather than silently abandoning a possibly live process.
+        if let Some(pid) = rustix::process::Pid::from_raw(self.0.id() as i32) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+        let _ = retry_interrupted(|| self.0.kill());
+        let _ = retry_interrupted(|| self.0.wait());
     }
 }
 
@@ -362,8 +697,74 @@ fn signal_by_name(name: &str) -> Option<rustix::process::Signal> {
     })
 }
 
+fn prune_oldest_finished<T>(
+    records: &mut Vec<T>,
+    cap: usize,
+    mut is_finished: impl FnMut(&T) -> bool,
+    mut cleanup: impl FnMut(&T) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let excess = records
+        .iter()
+        .filter(|record| is_finished(record))
+        .count()
+        .saturating_sub(cap);
+    let mut first_error = None;
+    for _ in 0..excess {
+        let Some(pos) = records.iter().position(&mut is_finished) else {
+            break;
+        };
+        if let Err(error) = cleanup(&records[pos]) {
+            first_error.get_or_insert(error);
+        }
+        // The in-memory bound is authoritative even when best-effort unlinking
+        // fails. Startup's orphan sweep gets another chance after this daemon.
+        records.remove(pos);
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+type AttachedExitKey = (String, u64);
+
+fn remember_attached_exit(
+    pending: &Mutex<VecDeque<(AttachedExitKey, JobInfo)>>,
+    id: &str,
+    token: u64,
+    info: JobInfo,
+) {
+    let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+    let key = (id.to_string(), token);
+    if let Some(pos) = pending.iter().position(|(existing, _)| existing == &key) {
+        pending.remove(pos);
+    }
+    while pending.len() >= PENDING_ATTACH_EXIT_CAP {
+        pending.pop_front();
+    }
+    pending.push_back((key, info));
+}
+
+fn take_attached_exit(
+    pending: &Mutex<VecDeque<(AttachedExitKey, JobInfo)>>,
+    id: &str,
+    token: u64,
+) -> Option<JobInfo> {
+    let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+    let key = (id.to_string(), token);
+    let pos = pending.iter().position(|(existing, _)| existing == &key)?;
+    pending.remove(pos).map(|(_, info)| info)
+}
+
+fn discard_attached_exit(
+    pending: &Mutex<VecDeque<(AttachedExitKey, JobInfo)>>,
+    id: &str,
+    token: u64,
+) {
+    drop(take_attached_exit(pending, id, token));
+}
+
 struct Broker {
     jobs: Mutex<Vec<Arc<KeptJob>>>,
+    pending_attach_exits: Mutex<VecDeque<(AttachedExitKey, JobInfo)>>,
+    running_jobs: Arc<AtomicUsize>,
     next_id: AtomicU64,
     logs_dir: PathBuf,
     exe: PathBuf,
@@ -378,8 +779,9 @@ fn existing_job_sequence(logs_dir: &Path) -> u64 {
         .filter_map(|entry| {
             let name = entry.file_name();
             let name = name.to_str()?;
-            let number = name.strip_prefix('k')?.strip_suffix(".log")?;
-            number.parse::<u64>().ok()
+            let digits = name.strip_prefix('k')?.strip_suffix(".log")?;
+            let sequence = digits.parse::<u64>().ok()?;
+            (sequence > 0 && sequence.to_string() == digits).then_some(sequence)
         })
         .max()
         .unwrap_or(0)
@@ -399,28 +801,51 @@ impl Broker {
         self.jobs.lock().ok()?.iter().find(|j| j.id == id).cloned()
     }
 
-    /// Drop the oldest finished jobs beyond the cap (called on spawn). Jobs
-    /// are stored in spawn order, so the first finished match is the oldest.
-    fn prune_finished(&self) {
-        let Ok(mut jobs) = self.jobs.lock() else {
-            return;
-        };
-        let is_finished = |j: &Arc<KeptJob>| {
-            !matches!(
-                *j.state.lock().unwrap_or_else(|e| e.into_inner()),
-                RunState::Running
-            )
-        };
-        let excess = jobs
-            .iter()
-            .filter(|j| is_finished(j))
-            .count()
-            .saturating_sub(FINISHED_CAP);
-        for _ in 0..excess {
-            if let Some(pos) = jobs.iter().position(is_finished) {
-                jobs.remove(pos);
+    fn status(&self, id: &str, attach_token: Option<u64>) -> Option<JobInfo> {
+        if let Some(token) = attach_token {
+            if let Some(info) = take_attached_exit(&self.pending_attach_exits, id, token) {
+                return Some(info);
             }
         }
+        self.find(id).map(|job| job.info())
+    }
+
+    /// Drop the oldest finished jobs beyond the cap. Jobs are stored in spawn
+    /// order, so the first finished match is the oldest.
+    fn prune_finished(&self) -> std::io::Result<()> {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| std::io::Error::other("broker job table lock poisoned"))?;
+        let is_finished = |j: &Arc<KeptJob>| {
+            matches!(
+                *j.state.lock().unwrap_or_else(|e| e.into_inner()),
+                RunState::Exited(_)
+            )
+        };
+        prune_oldest_finished(&mut jobs, FINISHED_CAP, is_finished, |job| {
+            remove_job_logs(&job.log_path)
+        })
+    }
+
+    fn remove_finished(&self, id: &str) -> Result<(), String> {
+        let mut jobs = self.jobs.lock().map_err(|_| "lock poisoned".to_string())?;
+        let Some(pos) = jobs.iter().position(|job| job.id == id) else {
+            return Err(format!("no finished job {id} (running jobs stay listed)"));
+        };
+        if !matches!(
+            *jobs[pos]
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            RunState::Exited(_)
+        ) {
+            return Err(format!("no finished job {id} (running jobs stay listed)"));
+        }
+        remove_job_logs(&jobs[pos].log_path)
+            .map_err(|error| format!("remove logs for job {id}: {error}"))?;
+        jobs.remove(pos);
+        Ok(())
     }
 
     fn spawn(self: &Arc<Self>, spec: SpawnSpec) -> std::io::Result<Arc<KeptJob>> {
@@ -443,6 +868,8 @@ impl Broker {
         let mut command = Command::new(&self.exe);
         command.arg("--supervise").arg("--").args(&cmd);
         configure_requested_cwd(&mut command, Path::new(&cwd))?;
+        self.prune_finished()?;
+        let running_slot = reserve_running_job(&self.running_jobs, MAX_RUNNING_JOBS)?;
 
         let controller = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)
             .map_err(|e| std::io::Error::other(format!("openpt: {e}")))?;
@@ -493,15 +920,17 @@ impl Broker {
         command.stdin(Stdio::from(peripheral.try_clone()?));
         command.stdout(Stdio::from(peripheral.try_clone()?));
         command.stderr(Stdio::from(peripheral));
-        let child = command.spawn()?;
-        let pid = child.id() as i32;
-
         // Non-blocking controller: the reader thread polls + drains without
         // ever wedging on a quiet PTY (macOS may block instead of EOFing).
         rustix::io::ioctl_fionbio(&controller, true)
             .map_err(|e| std::io::Error::other(format!("nonblock: {e}")))?;
         let controller = File::from(controller);
         let reader_half = controller.try_clone()?;
+
+        // From this point onward every fallible setup path owns a guard that
+        // kills and reaps the spawned child if job publication cannot finish.
+        let child = ReapOnDropChild::new(command.spawn()?);
+        let pid = child.id() as i32;
 
         let job = Arc::new(KeptJob {
             id,
@@ -520,20 +949,33 @@ impl Broker {
                 attach_gen: 0,
             }),
         });
-        self.prune_finished();
-        if let Ok(mut jobs) = self.jobs.lock() {
-            jobs.push(job.clone());
-        }
-
         let pumped = job.clone();
-        std::thread::spawn(move || pump_job(pumped, reader_half));
+        let broker = Arc::clone(self);
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| std::io::Error::other("broker job table lock poisoned"))?;
+        std::thread::Builder::new()
+            .name(format!("agsh-pump-{}", job.id))
+            .spawn(move || {
+                pump_job(&broker, pumped, reader_half, running_slot);
+                if let Err(error) = broker.prune_finished() {
+                    log_daemon_error(format!("agshd: cannot prune finished job logs: {error}"));
+                }
+            })?;
+        jobs.push(job.clone());
         Ok(job)
     }
 }
 
 /// Per-job pump: PTY controller → log file + scrollback + attached client;
 /// detects exit, reaps the child, and notifies/detaches the client.
-fn pump_job(job: Arc<KeptJob>, mut controller: File) {
+fn pump_job(
+    broker: &Broker,
+    job: Arc<KeptJob>,
+    mut controller: File,
+    _running_slot: ActiveRunningJob,
+) {
     let mut log = open_private_append(&job.log_path).ok();
     let mut logged: u64 = log
         .as_ref()
@@ -551,16 +993,41 @@ fn pump_job(job: Arc<KeptJob>, mut controller: File) {
                 Ok(0) => break,
                 Ok(n) => {
                     saw_data = true;
-                    if let Some(file) = &mut log {
-                        let _ = file.write_all(&chunk[..n]);
-                        logged += n as u64;
-                        if logged > LOG_ROTATE_BYTES {
-                            let _ = file.flush();
-                            let old = job.log_path.with_extension("log.old");
-                            let _ = std::fs::rename(&job.log_path, &old);
-                            log = open_private_append(&job.log_path).ok();
-                            logged = 0;
+                    let write_error = if let Some(file) = &mut log {
+                        match file.write_all(&chunk[..n]) {
+                            Ok(()) => {
+                                logged += n as u64;
+                                None
+                            }
+                            Err(error) => Some(error),
                         }
+                    } else {
+                        None
+                    };
+                    if let Some(error) = write_error {
+                        log = None;
+                        logged = 0;
+                        log_daemon_error(format!(
+                            "agshd: disabling log for job {} after write error: {error}",
+                            job.id
+                        ));
+                    } else if logged > LOG_ROTATE_BYTES {
+                        if let Some(mut current) = log.take() {
+                            let _ = current.flush();
+                            drop(current);
+                        }
+                        match rotate_job_log(&job.log_path)
+                            .and_then(|()| open_private_append(&job.log_path))
+                        {
+                            Ok(next) => log = Some(next),
+                            Err(error) => {
+                                log_daemon_error(format!(
+                                    "agshd: disabling log for job {} after rotation error: {error}",
+                                    job.id
+                                ));
+                            }
+                        }
+                        logged = 0;
                     }
                     if let Ok(mut output) = job.output.lock() {
                         output.push_and_forward(&chunk[..n]);
@@ -572,29 +1039,46 @@ fn pump_job(job: Arc<KeptJob>, mut controller: File) {
         }
 
         if exit_code.is_none() {
-            if let Ok(mut child) = job.child.lock() {
-                if let Ok(Some(status)) = child.try_wait() {
-                    exit_code = Some(exit_status_code(status));
+            let mut state = job.state.lock().unwrap_or_else(|error| error.into_inner());
+            match *state {
+                RunState::Running => {
+                    let mut child = job.child.lock().unwrap_or_else(|error| error.into_inner());
+                    if let Ok(Some(status)) = child.try_wait() {
+                        let code = exit_status_code(status);
+                        // Publish non-running while the state guard still
+                        // excludes signal/resize/input operations. No PID/PGID
+                        // operation can begin after this reap.
+                        *state = RunState::Finishing(code);
+                        exit_code = Some(code);
+                    }
                 }
+                RunState::Finishing(code) | RunState::Exited(code) => exit_code = Some(code),
             }
         }
         if let Some(code) = exit_code {
             if !saw_data {
                 // Child gone and the PTY is drained: finalize.
-                if let Ok(mut state) = job.state.lock() {
-                    *state = RunState::Exited(code);
-                }
                 if let Some(file) = &mut log {
                     let _ = writeln!(file, "\n[keep {} exited: code {code}]", job.id);
+                    let _ = file.flush();
                 }
-                if let Ok(mut output) = job.output.lock() {
-                    if let Some((_, mut stream)) = output.attach.take() {
-                        let _ = stream.write_all(
-                            format!("\r\n[keep: job exited (code {code}) — detaching]\r\n")
-                                .as_bytes(),
-                        );
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
-                    }
+                // Exit publication and attachment removal are one state→output
+                // critical section. If an attached record is pruned before the
+                // client's status round trip, retain its token-scoped terminal
+                // status until consumed (or the bounded cache evicts it).
+                if let Some((token, mut stream)) =
+                    publish_exit_and_take_attachment(&job.state, &job.output, code)
+                {
+                    remember_attached_exit(
+                        &broker.pending_attach_exits,
+                        &job.id,
+                        token,
+                        job.info(),
+                    );
+                    let _ = stream.write_all(
+                        format!("\r\n[keep: job exited (code {code}) — detaching]\r\n").as_bytes(),
+                    );
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
                 }
                 return;
             }
@@ -636,14 +1120,28 @@ pub fn run(socket: &Path) -> std::io::Result<()> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     paths::ensure_socket_parent(parent)?;
+    let logs_dir = paths::logs_dir()
+        .ok_or_else(|| std::io::Error::other("no broker logs path (HOME unset?)"))?;
+    paths::ensure_dir(&logs_dir)?;
+    let state_dir = logs_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    paths::ensure_dir(state_dir)?;
+    // The socket normally excludes a second daemon, but its pathname can be
+    // manually unlinked while the process lives. Hold a separate advisory lock
+    // so startup cleanup can prove no prior generation still owns job logs.
+    let _generation_lock = acquire_generation_lock(state_dir)?;
     prepare_socket_path(socket)?;
     let listener = bind_private_listener(socket)?;
+    redirect_daemon_log(true)?;
 
-    let logs_dir = paths::logs_dir().unwrap_or_else(|| PathBuf::from("."));
-    paths::ensure_dir(&logs_dir)?;
     let next_id = existing_job_sequence(&logs_dir);
+    prune_orphan_logs(&logs_dir, ORPHAN_LOG_JOB_CAP, ORPHAN_LOG_BYTES_CAP)?;
     let broker = Arc::new(Broker {
         jobs: Mutex::new(Vec::new()),
+        pending_attach_exits: Mutex::new(VecDeque::new()),
+        running_jobs: Arc::new(AtomicUsize::new(0)),
         next_id: AtomicU64::new(next_id),
         logs_dir,
         exe: std::env::current_exe()?,
@@ -653,6 +1151,10 @@ pub fn run(socket: &Path) -> std::io::Result<()> {
     let active_connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        // The accept loop is the daemon's serialized operational checkpoint.
+        // Reopen only at the threshold; a bounded request may overshoot it by
+        // one bounded diagnostic before the next accepted connection.
+        redirect_daemon_log(false)?;
         if verify_peer_uid(&stream).is_err() {
             continue;
         }
@@ -660,10 +1162,12 @@ pub fn run(socket: &Path) -> std::io::Result<()> {
             continue;
         };
         let broker = broker.clone();
-        std::thread::spawn(move || {
+        if let Err(error) = spawn_connection_worker(move || {
             let _connection = connection;
             let _ = handle_conn(&broker, stream);
-        });
+        }) {
+            log_daemon_error(format!("agshd: cannot start connection worker: {error}"));
+        }
     }
     Ok(())
 }
@@ -697,8 +1201,8 @@ fn handle_conn(broker: &Arc<Broker>, stream: UnixStream) -> std::io::Result<()> 
                 .unwrap_or_default();
             write_line(&mut writer, &Response::Jobs { jobs })
         }
-        Request::Status { id } => match broker.find(&id) {
-            Some(job) => write_line(&mut writer, &Response::Job { info: job.info() }),
+        Request::Status { id, attach_token } => match broker.status(&id, attach_token) {
+            Some(info) => write_line(&mut writer, &Response::Job { info }),
             None => write_line(&mut writer, &Response::err(format!("no job {id}"))),
         },
         Request::Tail { id, bytes } => match broker.find(&id) {
@@ -713,10 +1217,10 @@ fn handle_conn(broker: &Arc<Broker>, stream: UnixStream) -> std::io::Result<()> 
             None => write_line(&mut writer, &Response::err(format!("no job {id}"))),
         },
         Request::Resize { id, rows, cols } => match broker.find(&id) {
-            Some(job) => {
-                job.set_winsize(rows, cols);
-                write_line(&mut writer, &Response::Ok)
-            }
+            Some(job) => match job.set_winsize(rows, cols) {
+                Ok(()) => write_line(&mut writer, &Response::Ok),
+                Err(message) => write_line(&mut writer, &Response::err(message)),
+            },
             None => write_line(&mut writer, &Response::err(format!("no job {id}"))),
         },
         Request::Attach {
@@ -725,27 +1229,10 @@ fn handle_conn(broker: &Arc<Broker>, stream: UnixStream) -> std::io::Result<()> 
             cols,
             replay,
         } => attach_conn(broker, stream, id, rows, cols, replay),
-        Request::Remove { id } => {
-            let Ok(mut jobs) = broker.jobs.lock() else {
-                return write_line(&mut writer, &Response::err("lock poisoned"));
-            };
-            let before = jobs.len();
-            jobs.retain(|j| {
-                j.id != id
-                    || matches!(
-                        *j.state.lock().unwrap_or_else(|e| e.into_inner()),
-                        RunState::Running
-                    )
-            });
-            if jobs.len() < before {
-                write_line(&mut writer, &Response::Ok)
-            } else {
-                write_line(
-                    &mut writer,
-                    &Response::err(format!("no finished job {id} (running jobs stay listed)")),
-                )
-            }
-        }
+        Request::Remove { id } => match broker.remove_finished(&id) {
+            Ok(()) => write_line(&mut writer, &Response::Ok),
+            Err(message) => write_line(&mut writer, &Response::err(message)),
+        },
         Request::Shutdown => {
             write_line(&mut writer, &Response::Ok)?;
             // Kept jobs are their own sessions: closing our PTY controllers
@@ -794,15 +1281,10 @@ fn attach_conn(
     let Some(job) = broker.find(&id) else {
         return write_line(&mut writer, &Response::err(format!("no job {id}")));
     };
-    if !matches!(
-        *job.state.lock().unwrap_or_else(|e| e.into_inner()),
-        RunState::Running
-    ) {
-        return write_line(&mut writer, &Response::err(format!("job {id} has exited")));
+    if let Err(message) = job.set_winsize(rows, cols) {
+        return write_line(&mut writer, &Response::err(message));
     }
-    job.set_winsize(rows, cols);
-    // Computed before taking the output lock — job.info() reads it too.
-    let info = job.info();
+    let installed_writer = writer.try_clone()?;
 
     // Handshake + takeover + replay + install are ONE atomic section under the
     // output lock, so "the client received its handshake" implies "the client
@@ -811,33 +1293,45 @@ fn attach_conn(
     // installs itself, and then the OLDER one's delayed install hangs up the
     // newer client and squats on the slot (caught by CI as a takeover test
     // timing failure on a loaded runner).
-    let generation = {
-        let Ok(mut output) = job.output.lock() else {
-            return Ok(());
-        };
-        // Last attach wins (like `tmux attach -d`): hang up any previous client.
-        if let Some((_, old)) = output.attach.take() {
-            let _ = old.shutdown(std::net::Shutdown::Both);
-        }
-        write_line(&mut writer, &Response::Attached { info })?;
-        let ring = &output.ring;
-        let take = (replay as usize).min(ring.len());
-        let start = ring.len() - take;
-        let (a, b) = ring.as_slices();
-        let mut sent = 0usize;
-        for slice in [a, b] {
-            let begin = start.saturating_sub(sent);
-            if begin < slice.len() {
-                writer.write_all(&slice[begin..])?;
+    let Some(generation) =
+        with_running_output(&job.state, &job.output, |output| -> std::io::Result<u64> {
+            let generation = output
+                .attach_gen
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("attach generation space exhausted"))?;
+            // Last attach wins (like `tmux attach -d`): hang up any previous client.
+            if let Some((_, old)) = output.attach.take() {
+                let _ = old.shutdown(std::net::Shutdown::Both);
             }
-            sent += slice.len();
-        }
-        writer.flush()?;
-        output.attach_gen += 1;
-        let generation = output.attach_gen;
-        output.attach = Some((generation, writer));
-        generation
+            let info = job.info_from(RunState::Running, true);
+            write_line(
+                &mut writer,
+                &Response::Attached {
+                    info,
+                    token: generation,
+                },
+            )?;
+            let ring = &output.ring;
+            let take = (replay as usize).min(ring.len());
+            let start = ring.len() - take;
+            let (a, b) = ring.as_slices();
+            let mut sent = 0usize;
+            for slice in [a, b] {
+                let begin = start.saturating_sub(sent);
+                if begin < slice.len() {
+                    writer.write_all(&slice[begin..])?;
+                }
+                sent += slice.len();
+            }
+            writer.flush()?;
+            output.attach_gen = generation;
+            output.attach = Some((generation, installed_writer));
+            Ok(generation)
+        })
+    else {
+        return write_line(&mut writer, &Response::err(format!("job {id} has exited")));
     };
+    let generation = generation?;
 
     // This thread becomes the input pump: client bytes → PTY.
     let mut reader = stream;
@@ -846,8 +1340,18 @@ fn attach_conn(
         match reader.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if write_to_controller(&job, &chunk[..n]).is_err() {
-                    break;
+                if let Err(error) = write_to_controller(&job, &chunk[..n]) {
+                    // Once the direct child is reaped, keep this input half
+                    // alive until the output pump publishes terminal EOF. That
+                    // keeps the token-scoped status bounded by a live attach
+                    // connection and avoids losing exit status during pruning.
+                    if error.kind() != std::io::ErrorKind::BrokenPipe {
+                        log_daemon_error(format!(
+                            "agshd: dropping attachment for job {} after input error: {error}",
+                            job.id
+                        ));
+                        break;
+                    }
                 }
             }
         }
@@ -858,23 +1362,64 @@ fn attach_conn(
             output.attach = None;
         }
     }
+    let exited = matches!(
+        *job.state.lock().unwrap_or_else(|error| error.into_inner()),
+        RunState::Exited(_)
+    );
+    if !exited {
+        discard_attached_exit(&broker.pending_attach_exits, &id, generation);
+    }
     Ok(())
 }
 
 /// Write client input to the (non-blocking) PTY controller, retrying briefly
 /// when the kernel input buffer is full.
-fn write_to_controller(job: &KeptJob, mut bytes: &[u8]) -> std::io::Result<()> {
-    let Ok(mut controller) = job.controller.lock() else {
-        return Err(std::io::Error::other("controller lock poisoned"));
-    };
+fn write_to_controller(job: &KeptJob, bytes: &[u8]) -> std::io::Result<()> {
+    with_running_state(&job.state, &job.id, || {
+        let mut controller = job
+            .controller
+            .lock()
+            .map_err(|_| format!("job {} controller lock poisoned", job.id))?;
+        write_all_with_deadline(&mut *controller, bytes, ATTACH_INPUT_WRITE_TIMEOUT)
+            .map_err(|error| format!("write input to job {}: {error}", job.id))
+    })
+    .map_err(|message| {
+        let kind = if message.ends_with("has exited") {
+            std::io::ErrorKind::BrokenPipe
+        } else {
+            std::io::ErrorKind::Other
+        };
+        std::io::Error::new(kind, message)
+    })
+}
+
+fn write_all_with_deadline(
+    writer: &mut impl Write,
+    mut bytes: &[u8],
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
     while !bytes.is_empty() {
-        match controller.write(bytes) {
-            Ok(0) => return Err(std::io::Error::other("pty closed")),
-            Ok(n) => bytes = &bytes[n..],
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(2));
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("PTY input remained blocked for {} ms", timeout.as_millis()),
+            ));
+        }
+        match writer.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "PTY closed while writing input",
+                ));
             }
-            Err(e) => return Err(e),
+            Ok(n) => bytes = &bytes[n..],
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(Duration::from_millis(2).min(remaining));
+            }
+            Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(())
@@ -907,6 +1452,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::sync::atomic::AtomicBool;
 
     fn test_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("agsh-broker-{label}-{}", std::process::id()));
@@ -962,6 +1508,358 @@ mod tests {
         drop(second);
         drop(replacement);
         assert_eq!(count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn failed_connection_worker_spawn_drops_captured_resources() {
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let captured = DropFlag(Arc::clone(&dropped));
+        let error = spawn_connection_worker_with(
+            move || drop(captured),
+            |_worker| Err(std::io::Error::other("injected thread exhaustion")),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("thread exhaustion"));
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn running_job_reservations_are_bounded_and_released() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let first = reserve_running_job(&count, 2).unwrap();
+        let second = reserve_running_job(&count, 2).unwrap();
+
+        let error = reserve_running_job(&count, 2).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("running-job limit"), "{error}");
+
+        drop(first);
+        let replacement = reserve_running_job(&count, 2).unwrap();
+        assert_eq!(count.load(Ordering::Acquire), 2);
+
+        drop(second);
+        drop(replacement);
+        assert_eq!(count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn exit_publication_and_attach_install_are_atomic() {
+        for _ in 0..128 {
+            let state = Arc::new(Mutex::new(RunState::Running));
+            let output = Arc::new(Mutex::new(Output {
+                ring: VecDeque::new(),
+                attach: None,
+                attach_gen: 0,
+            }));
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let (attachment, _peer) = UnixStream::pair().unwrap();
+
+            let attach_state = Arc::clone(&state);
+            let attach_output = Arc::clone(&output);
+            let attach_barrier = Arc::clone(&barrier);
+            let attach = std::thread::spawn(move || {
+                attach_barrier.wait();
+                with_running_output(&attach_state, &attach_output, |output| {
+                    output.attach_gen += 1;
+                    output.attach = Some((output.attach_gen, attachment));
+                })
+                .is_some()
+            });
+
+            let exit_state = Arc::clone(&state);
+            let exit_output = Arc::clone(&output);
+            let exit_barrier = Arc::clone(&barrier);
+            let exit = std::thread::spawn(move || {
+                exit_barrier.wait();
+                drop(publish_exit_and_take_attachment(
+                    &exit_state,
+                    &exit_output,
+                    23,
+                ));
+            });
+
+            barrier.wait();
+            let _installed_before_exit = attach.join().unwrap();
+            exit.join().unwrap();
+            assert!(matches!(*state.lock().unwrap(), RunState::Exited(23)));
+            assert!(
+                output.lock().unwrap().attach.is_none(),
+                "an attachment was installed after exit publication"
+            );
+        }
+    }
+
+    #[test]
+    fn non_running_jobs_reject_pid_and_controller_actions() {
+        for state in [RunState::Finishing(7), RunState::Exited(7)] {
+            let state = Mutex::new(state);
+            let touched = AtomicBool::new(false);
+
+            let error = with_running_state(&state, "k1", || {
+                touched.store(true, Ordering::Release);
+                Ok(())
+            })
+            .unwrap_err();
+
+            assert_eq!(error, "job k1 has exited");
+            assert!(!touched.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn controller_write_would_block_has_a_deadline() {
+        struct BlockedWriter;
+
+        impl Write for BlockedWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let started = Instant::now();
+        let error =
+            write_all_with_deadline(&mut BlockedWriter, b"input", Duration::from_millis(20))
+                .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn spawned_child_guard_kills_and_reaps_on_drop() {
+        let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+
+        drop(ReapOnDropChild::new(child));
+
+        assert_eq!(
+            rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap_err(),
+            rustix::io::Errno::SRCH
+        );
+    }
+
+    #[test]
+    fn child_cleanup_retries_interrupted_wait_operations() {
+        let mut attempts = 0;
+        let result = retry_interrupted(|| {
+            attempts += 1;
+            if attempts <= 2 {
+                Err(std::io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(attempts)
+            }
+        });
+
+        assert_eq!(result.unwrap(), 3);
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn prune_removes_excess_records_even_when_log_cleanup_fails() {
+        let mut records = vec![(0_u8, true), (1, true), (2, true), (3, true)];
+
+        let error = prune_oldest_finished(
+            &mut records,
+            2,
+            |(_, finished)| *finished,
+            |(id, _)| {
+                if *id == 0 {
+                    Err(std::io::Error::other("injected unlink failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected unlink failure"));
+        assert_eq!(records, vec![(2, true), (3, true)]);
+    }
+
+    #[test]
+    fn attached_exit_status_survives_record_pruning_until_consumed() {
+        let pending = Mutex::new(VecDeque::new());
+        let info = JobInfo {
+            id: "k1".into(),
+            kind: JobKind::Job,
+            title: "exit 37".into(),
+            cwd: "/".into(),
+            pid: 42,
+            started_at: 1,
+            running: false,
+            exit_code: Some(37),
+            attached: false,
+            log: "/tmp/k1.log".into(),
+        };
+        remember_attached_exit(&pending, "k1", 9, info.clone());
+
+        let mut records = vec!["k1"];
+        prune_oldest_finished(&mut records, 0, |_| true, |_| Ok(())).unwrap();
+
+        let recovered = take_attached_exit(&pending, "k1", 9).expect("terminal status");
+        assert_eq!(recovered.exit_code, Some(37));
+        assert!(take_attached_exit(&pending, "k1", 9).is_none());
+    }
+
+    #[test]
+    fn unclaimed_attached_exit_statuses_have_a_hard_cap() {
+        let pending = Mutex::new(VecDeque::new());
+        for index in 0..=PENDING_ATTACH_EXIT_CAP {
+            let id = format!("k{index}");
+            remember_attached_exit(
+                &pending,
+                &id,
+                1,
+                JobInfo {
+                    id: id.clone(),
+                    kind: JobKind::Job,
+                    title: "exit 0".into(),
+                    cwd: "/".into(),
+                    pid: 42,
+                    started_at: 1,
+                    running: false,
+                    exit_code: Some(0),
+                    attached: false,
+                    log: "/tmp/job.log".into(),
+                },
+            );
+        }
+
+        assert_eq!(pending.lock().unwrap().len(), PENDING_ATTACH_EXIT_CAP);
+        assert!(take_attached_exit(&pending, "k0", 1).is_none());
+        assert!(take_attached_exit(&pending, &format!("k{PENDING_ATTACH_EXIT_CAP}"), 1).is_some());
+    }
+
+    #[test]
+    fn job_log_cleanup_removes_current_and_rotated_generations_only() {
+        let dir = test_dir("job-log-cleanup");
+        let log = dir.join("k1.log");
+        let old = dir.join("k1.log.old");
+        let neighbor = dir.join("k10.log");
+        std::fs::write(&log, b"current").unwrap();
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::write(&neighbor, b"neighbor").unwrap();
+
+        remove_job_logs(&log).unwrap();
+
+        assert!(!log.exists());
+        assert!(!old.exists());
+        assert_eq!(std::fs::read(&neighbor).unwrap(), b"neighbor");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn job_log_rotation_fails_if_the_old_generation_is_not_a_file() {
+        let dir = test_dir("job-log-rotation-invalid-old");
+        let log = dir.join("k1.log");
+        let old = dir.join("k1.log.old");
+        std::fs::write(&log, b"bounded-current").unwrap();
+        std::fs::create_dir(&old).unwrap();
+
+        assert!(rotate_job_log(&log).is_err());
+        assert_eq!(std::fs::read(&log).unwrap(), b"bounded-current");
+        assert!(old.is_dir());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn daemon_log_rotation_keeps_one_bounded_old_generation() {
+        let dir = test_dir("daemon-log-rotation");
+        let log = dir.join("agshd.log");
+        let old = dir.join("agshd.log.old");
+        std::fs::write(&log, vec![b'x'; DAEMON_LOG_ROTATE_BYTES as usize]).unwrap();
+        std::fs::write(&old, b"stale").unwrap();
+
+        rotate_daemon_log(&log).unwrap();
+
+        assert!(!log.exists());
+        assert_eq!(
+            std::fs::metadata(&old).unwrap().len(),
+            DAEMON_LOG_ROTATE_BYTES
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn runtime_daemon_log_refresh_reopens_after_the_threshold() {
+        let dir = test_dir("daemon-log-runtime-refresh");
+        let log = dir.join("agshd.log");
+        let old = dir.join("agshd.log.old");
+        let mut first = refreshed_daemon_log_file(&log, true)
+            .unwrap()
+            .expect("initial log file");
+        first
+            .write_all(&vec![b'x'; DAEMON_LOG_ROTATE_BYTES as usize])
+            .unwrap();
+        first.flush().unwrap();
+
+        let mut second = refreshed_daemon_log_file(&log, false)
+            .unwrap()
+            .expect("threshold must reopen the log");
+        second.write_all(b"new-generation").unwrap();
+        second.flush().unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&old).unwrap().len(),
+            DAEMON_LOG_ROTATE_BYTES
+        );
+        assert_eq!(std::fs::read(&log).unwrap(), b"new-generation");
+        assert!(refreshed_daemon_log_file(&log, false).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn generation_lock_excludes_a_second_daemon() {
+        let dir = test_dir("generation-lock");
+        let first = acquire_generation_lock(&dir).unwrap();
+
+        let error = acquire_generation_lock(&dir).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+
+        drop(first);
+        acquire_generation_lock(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn orphan_log_sweep_bounds_retained_jobs_and_never_follows_symlinks() {
+        let dir = test_dir("orphan-log-sweep");
+        for (name, contents) in [
+            ("k1.log", b"1111".as_slice()),
+            ("k1.log.old", b"aaaa".as_slice()),
+            ("k2.log", b"2222".as_slice()),
+            ("k3.log", b"3333".as_slice()),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, contents).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"unchanged").unwrap();
+        symlink(&victim, dir.join("k4.log")).unwrap();
+
+        prune_orphan_logs(&dir, 2, 8).unwrap();
+
+        assert!(!dir.join("k1.log").exists());
+        assert!(!dir.join("k1.log.old").exists());
+        assert!(dir.join("k2.log").exists());
+        assert!(dir.join("k3.log").exists());
+        assert!(!dir.join("k4.log").exists());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

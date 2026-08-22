@@ -47,6 +47,7 @@ name = "agsh-compat"
 version = "0.2.0"
 dependencies = [
  "agsh-core",
+ "rustix",
 ]
 
 [[package]]

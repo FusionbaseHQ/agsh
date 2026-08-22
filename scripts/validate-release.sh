@@ -17,6 +17,10 @@ toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml | head -n
 [ -n "$toolchain" ] || fail "rust-toolchain.toml channel is missing"
 [ "${toolchain%.*}" = "$rust_version" ] ||
     fail "rust-version $rust_version and pinned toolchain $toolchain disagree"
+for manifest in crates/*/Cargo.toml; do
+    grep -F -x -q 'rust-version.workspace = true' "$manifest" ||
+        fail "$manifest does not inherit workspace rust-version"
+done
 
 license_input_hash=$(scripts/license-input-hash.sh)
 CARGO_ABOUT_VERSION=0.9.1

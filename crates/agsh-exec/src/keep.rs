@@ -183,7 +183,7 @@ fn spawn(cmd: &[String], state: &mut ShellState) -> CommandOutcome {
         "keep: [{}] started (pid {}) — Ctrl-] detaches; it survives this shell",
         info.id, info.pid
     );
-    finish_attach(&client, &info.id, attach_interactive(&client, &info.id))
+    finish_attach(&info.id, attach_interactive(&client, &info.id))
 }
 
 /// Compatibility entry point for the legacy `agjob` builtin. Jobs use the
@@ -242,15 +242,11 @@ fn attach(id: &str) -> CommandOutcome {
             format!("keep attach: needs a terminal (use `keep tail {id}` for the output)"),
         );
     }
-    finish_attach(&client, id, attach_interactive(&client, id))
+    finish_attach(id, attach_interactive(&client, id))
 }
 
 /// Turn an attach result into the builtin's outcome (summary on stdout).
-fn finish_attach(
-    client: &Client,
-    id: &str,
-    outcome: std::io::Result<AttachOutcome>,
-) -> CommandOutcome {
+fn finish_attach(id: &str, outcome: std::io::Result<AttachOutcome>) -> CommandOutcome {
     match outcome {
         Ok(AttachOutcome::Detached) => CommandOutcome::captured(
             0,
@@ -258,50 +254,50 @@ fn finish_attach(
                 .into_bytes(),
             Vec::new(),
         ),
-        Ok(AttachOutcome::Ended) => {
-            // The stream closing means job exit OR another client taking the
-            // attach over — the job's status tells them apart.
-            match client.status(id) {
-                Ok(info) if info.running => CommandOutcome::captured(
-                    0,
-                    format!(
-                        "keep: attach taken over by another client — [{id}] keeps running \
-                         (reattach: keep attach {id})\n"
-                    )
-                    .into_bytes(),
-                    Vec::new(),
-                ),
-                status => {
-                    let code = status.ok().and_then(|info| info.exit_code).unwrap_or(0);
-                    CommandOutcome::captured(
-                        code,
-                        format!("keep: [{id}] exited (code {code})\n").into_bytes(),
-                        Vec::new(),
-                    )
-                }
-            }
-        }
+        Ok(AttachOutcome::TakenOver) => CommandOutcome::captured(
+            0,
+            format!(
+                "keep: attach taken over by another client — [{id}] keeps running \
+                 (reattach: keep attach {id})\n"
+            )
+            .into_bytes(),
+            Vec::new(),
+        ),
+        Ok(AttachOutcome::Exited(code)) => CommandOutcome::captured(
+            code,
+            format!("keep: [{id}] exited (code {code})\n").into_bytes(),
+            Vec::new(),
+        ),
         Err(e) => fail(1, format!("keep attach: {e}")),
     }
 }
 
-fn render_job(job: &JobInfo) -> String {
+fn render_job(job: &JobInfo) -> Result<String, String> {
     let state = if job.running {
+        if job.exit_code.is_some() {
+            return Err(format!("job {} is running but has an exit code", job.id));
+        }
         if job.attached {
             "running*".to_string()
         } else {
             "running".to_string()
         }
     } else {
-        format!("exit {}", job.exit_code.unwrap_or(0))
+        if job.attached {
+            return Err(format!("finished job {} is still marked attached", job.id));
+        }
+        let code = job
+            .exit_code
+            .ok_or_else(|| format!("finished job {} has no exit code", job.id))?;
+        format!("exit {code}")
     };
-    format!(
+    Ok(format!(
         "{:<4} {:<9} {:>4}  {}\n",
         job.id,
         state,
         ago(job.started_at),
         job.title,
-    )
+    ))
 }
 
 fn list() -> CommandOutcome {
@@ -318,7 +314,11 @@ fn list() -> CommandOutcome {
         Ok(jobs) => {
             let mut out = String::new();
             for job in &jobs {
-                out.push_str(&render_job(job));
+                let line = match render_job(job) {
+                    Ok(line) => line,
+                    Err(message) => return fail(1, format!("keep list: {message}")),
+                };
+                out.push_str(&line);
             }
             out.push_str("(* = attached · keep attach ID · keep tail ID · Ctrl-] detaches)\n");
             CommandOutcome::captured(0, out.into_bytes(), Vec::new())
@@ -333,7 +333,10 @@ fn status(id: &str) -> CommandOutcome {
         Err(message) => return fail(1, message),
     };
     match client.status(id) {
-        Ok(job) => CommandOutcome::captured(0, render_job(&job).into_bytes(), Vec::new()),
+        Ok(job) => match render_job(&job) {
+            Ok(line) => CommandOutcome::captured(0, line.into_bytes(), Vec::new()),
+            Err(message) => fail(1, format!("keep status: {message}")),
+        },
         Err(e) => fail(1, format!("keep status: {e}")),
     }
 }
@@ -447,5 +450,23 @@ mod tests {
 
         assert_eq!(outcome.exit_code, 126);
         assert!(String::from_utf8_lossy(&outcome.stderr).contains("echo: not permitted"));
+    }
+
+    #[test]
+    fn rendering_a_finished_job_requires_a_known_exit_code() {
+        let job = JobInfo {
+            id: "k1".into(),
+            kind: JobKind::Job,
+            title: "invalid".into(),
+            cwd: "/".into(),
+            pid: 42,
+            started_at: 1,
+            running: false,
+            exit_code: None,
+            attached: false,
+            log: "/tmp/k1.log".into(),
+        };
+
+        assert!(render_job(&job).is_err());
     }
 }

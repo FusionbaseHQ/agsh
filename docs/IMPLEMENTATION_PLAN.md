@@ -6,12 +6,13 @@ because types or command-line syntax exist for it.
 
 ## Release stance
 
-`agsh` 0.2.0 is the first public release. The local interactive shell,
-command executor, output layer, and keep broker have broad automated coverage on
-macOS and Ubuntu. Optional capabilities that are not part of this release remain
-explicitly scoped below: Linux kernel confinement and the authenticated agent
-server are not implemented. See [SECURITY_MODEL.md](SECURITY_MODEL.md) for the
-security boundary.
+`agsh` 0.2.0 is the first supported public **pre-1.0 preview**. The local
+interactive shell, command executor, output layer, and keep broker have broad
+automated coverage on macOS and Ubuntu, but the project does not claim complete
+POSIX/Bash compatibility or general production maturity. Optional capabilities
+that are not part of this release remain explicitly scoped below: Linux kernel
+confinement and the authenticated agent server are not implemented. See
+[SECURITY_MODEL.md](SECURITY_MODEL.md) for the security boundary.
 
 ## Phase status
 
@@ -48,6 +49,9 @@ security boundary.
 - Redirections involving descriptors above `2` are rejected before execution.
   Standard stdin/stdout/stderr file, append, close, and `2>&1`/`1>&2` forms are
   supported; arbitrary descriptor mapping needs a dedicated safe spawn helper.
+- The `pty`/`agpty` wrapper currently captures output only. It does not forward
+  interactive input; piped or fd-0 redirected input is rejected with status 2
+  before the payload starts instead of being ignored or allowed to hang.
 - Background command-list items inherit scalar variables, arrays, aliases,
   functions, variable attributes, and shell options through an acknowledged,
   bounded Unix-socket handoff; no secret-bearing temporary file is created.
@@ -64,10 +68,13 @@ security boundary.
   writes remain viable; post-cutoff bytes are discarded and traces are marked
   incomplete rather than replayed. These are safety drains, not async output
   collectors: each retained stdout/stderr stream owns one worker until kernel
-  EOF, so a long-lived descendant can keep up to two workers alive. This bounded
-  per-command but process-heavy lifecycle is accepted only as a pre-1.0
-  limitation. There is no global admission bound: repeated indefinitely
-  retaining descendants can create an unbounded aggregate number of workers.
+  EOF, so a long-lived descendant can keep up to two workers alive. A shell-wide
+  ceiling reserves one of 64 admissions when each capture reader is created and
+  transfers that reservation to its acknowledged helper. Saturated capture
+  therefore fails explicitly during setup, with spawned pipeline stages reaped
+  and no complete trace published, rather than waiting after execution or
+  closing an admitted live pipe. This globally bounded but process-heavy
+  lifecycle is accepted only as a pre-1.0 limitation.
   Before advertising structured async capture, replace this fallback with a
   graph/session-wide ordered event spool that records each byte range with its
   launch-time logical destination, backed by a detached internal collector for
@@ -95,10 +102,13 @@ security boundary.
 - Trace recovery is bounded: the in-session index defaults to 200 commands and
   persisted traces default to 512 files with a hard 2 GiB directory ceiling.
   Old references can expire.
-- Broker control requests and per-job log generations are bounded, but there is
-  no aggregate cap on running jobs, accumulated old job logs, or the daemon log.
-  Same-UID peers and unredacted broker/session files remain inside the trust
-  boundary; external cleanup is required for long-lived broker directories.
+- Broker control requests and per-job log generations are bounded. The daemon
+  admits at most 64 running jobs, retains 20 finished records, deletes logs on
+  record pruning/removal, and keeps at most 20 prior-generation job IDs / 128
+  MiB after its generation-locked startup sweep. The daemon log rotates at 1
+  MiB with one old generation; its serialized accept loop performs runtime
+  rotation/reopen checks. Same-UID peers and unredacted broker/session files
+  remain inside the trust boundary.
 - `snapshot` checkpoints tracked working-tree content only. Untracked/ignored
   files are excluded, restore overwrites tracked files below the cwd, and Git
   subprocess capture/time limits can make the operation fail explicitly.
