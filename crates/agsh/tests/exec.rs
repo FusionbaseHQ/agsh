@@ -1984,44 +1984,88 @@ fn semantic_capture_detaches_retained_streams_without_killing_descendant() {
 fn dynamic_capture_paths_detach_opaque_descendant_streams() {
     let base = history_test_dir("dynamic_detached_descendants");
     let script = base.join("spawn.agsh");
+    let waiter = base.join("wait-for-release.sh");
     let markers = [
         base.join("eval"),
         base.join("source"),
         base.join("function"),
     ];
+    let releases = [
+        base.join("eval-release"),
+        base.join("source-release"),
+        base.join("function-release"),
+    ];
+    std::fs::write(
+        &waiter,
+        b"release=$1\nmarker=$2\nattempt=0\nwhile [ ! -e \"$release\" ] && [ \"$attempt\" -lt 100 ]; do\n  attempt=$((attempt + 1))\n  sleep 0.1\ndone\nprintf descendant-out\nprintf descendant-err >&2\ntouch \"$marker\"\n",
+    )
+    .unwrap();
     std::fs::write(
         &script,
-        format!(
-            "sh -c '(sleep 2; printf source-out; printf source-err >&2; touch {}) &'\n",
-            markers[1].display()
-        ),
+        "sh -c 'sh wait-for-release.sh source-release source &'\n",
     )
     .unwrap();
     let sources = [
-        format!(
-            "eval \"sh -c '(sleep 2; printf eval-out; printf eval-err >&2; touch {}) &'\"",
-            markers[0].display()
-        ),
+        "eval \"sh -c 'sh wait-for-release.sh eval-release eval &'\"".to_string(),
         format!("source '{}'", script.display()),
-        format!(
-            "f() {{ sh -c '(sleep 2; printf function-out; printf function-err >&2; touch {}) &'; }}; f",
-            markers[2].display()
-        ),
+        "f() { sh -c 'sh wait-for-release.sh function-release function &' ; }; f".to_string(),
     ];
 
     for (index, source) in sources.iter().enumerate() {
         let history = base.join(format!("history-{index}.jsonl"));
-        let started = std::time::Instant::now();
-        let output = isolated_agsh(&base, &history)
+        let mut command = isolated_agsh(&base, &history);
+        command
             .args(["--output", "semantic", "-c", source])
-            .output()
-            .unwrap();
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().expect("spawn agsh capture fixture");
+        let child_pid = child.id();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let output_thread = std::thread::spawn(move || {
+            let _ = sender.send(child.wait_with_output());
+        });
+        let output = match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(output) => {
+                assert!(
+                    !markers[index].exists(),
+                    "source={source:?} descendant completed without its release"
+                );
+                std::fs::write(&releases[index], b"release").unwrap();
+                output.unwrap()
+            }
+            Err(error) => {
+                // Always release the bounded fixture so a failed detachment
+                // cannot strand the output thread or a descendant in CI.
+                std::fs::write(&releases[index], b"release").unwrap();
+                match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(delayed) => {
+                        output_thread.join().unwrap();
+                        panic!(
+                            "source={source:?} did not detach its opaque descendant within 5s: {error}; delayed result={delayed:?}"
+                        );
+                    }
+                    Err(delayed_error) => {
+                        let kill_result = Command::new("kill")
+                            .args(["-KILL", &child_pid.to_string()])
+                            .status();
+                        let killed = receiver.recv_timeout(std::time::Duration::from_secs(5));
+                        if killed.is_ok() {
+                            output_thread.join().unwrap();
+                        }
+                        panic!(
+                            "source={source:?} remained stuck after releasing its descendant: initial={error}; delayed={delayed_error}; kill={kill_result:?}; final={killed:?}"
+                        );
+                    }
+                }
+            }
+        };
+        output_thread.join().unwrap();
         assert!(
             output.status.success(),
             "source={source:?} stderr={:?}",
             output.stderr
         );
-        assert!(started.elapsed() < std::time::Duration::from_millis(1500));
         assert!(
             output.stderr.is_empty(),
             "source={source:?} stderr={:?}",
@@ -2031,6 +2075,11 @@ fn dynamic_capture_paths_detach_opaque_descendant_streams() {
             output.stdout.starts_with(b"{"),
             "source={source:?} stdout={:?}",
             output.stdout
+        );
+        let observation = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            observation.contains("\"complete\": false"),
+            "source={source:?} did not report a detached/incomplete trace: {observation}"
         );
     }
 

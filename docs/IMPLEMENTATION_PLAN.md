@@ -80,7 +80,9 @@ confinement and the authenticated agent server are not implemented. See
   Under experimental deep interception, executable text entered through the
   helper's explicit ENOEXEC `/bin/sh` fallback stays within one raw subtree via
   `AGSH_INTERCEPT_ACTIVE=1`. Absolute shell launches in that subtree are not
-  observed again, preserving byte-exact pipe and redirect behavior.
+  observed again, and only agsh's own preload entry is removed before the
+  fallback interpreter starts, preserving byte-exact pipe and redirect behavior
+  without discarding unrelated caller preloads.
   This does not rewrite the semantics of an explicitly invoked interpreter.
   In particular, the current macOS strict-confinement backend enters its bounded
   sandbox through `/bin/sh -c`; commands nested inside that interpreter retain

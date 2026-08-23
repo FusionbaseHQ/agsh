@@ -182,9 +182,11 @@ lines per invocation (1 MiB per input line), and grep scans at most the hard
 > Executable text entered through agsh's explicit ENOEXEC `/bin/sh` fallback is
 > kept inside one raw observation subtree. `AGSH_INTERCEPT_ACTIVE=1` prevents
 > `:deep` re-entry throughout that subtree so pipes and redirects retain exact
-> bytes; an absolute shell launched from that fallback is therefore not observed
-> again. This is a documented experimental interception gap, not a security
-> boundary.
+> bytes. agsh removes only its own preload-library entry before starting the
+> fallback interpreter, preserving unrelated caller preloads and avoiding a
+> loader-architecture failure in Apple system shells. An absolute shell launched
+> from that fallback is therefore not observed again. This is a documented
+> experimental interception gap, not a security boundary.
 
 On macOS, names beginning `AGSH_INTERNAL_EXEC_DYLD_V1_` are reserved for the
 private hardened-helper environment transport. agsh removes caller-provided

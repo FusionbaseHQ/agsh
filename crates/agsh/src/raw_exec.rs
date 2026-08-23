@@ -10,6 +10,13 @@ use std::path::Path;
 // Keep protocol v1 backward-compatible: installers publish the helper before
 // the main binary so an interrupted future upgrade can briefly pair versions.
 pub const INTERNAL_EXEC_HELPER_FLAG: &str = "--internal-exec-helper-v1";
+// The boolean enables LD_PRELOAD's additional ASCII-whitespace separator;
+// DYLD_INSERT_LIBRARIES uses colon-separated paths. Inspect only the binding
+// understood by this platform so an inert caller variable is never rewritten.
+#[cfg(target_os = "macos")]
+const PRELOAD_ENVIRONMENT: (&[u8], bool) = (b"DYLD_INSERT_LIBRARIES=", false);
+#[cfg(not(target_os = "macos"))]
+const PRELOAD_ENVIRONMENT: (&[u8], bool) = (b"LD_PRELOAD=", true);
 
 /// Replace this process with `argv[0]` without libc's implicit ENOEXEC shell
 /// fallback. If the kernel rejects an executable text file, perform one
@@ -54,15 +61,23 @@ pub fn execve_with_text_fallback(argv: &[OsString]) -> io::Error {
 /// observed would compact bytes intended for a pipe or redirect.
 fn text_fallback_environment(environment: &[CString]) -> Vec<CString> {
     let active_prefix = b"AGSH_INTERCEPT_ACTIVE=";
-    let mut fallback = environment.to_vec();
-    if environment
+    if !deep_intercept_environment(environment) {
+        return environment.to_vec();
+    }
+
+    // The fallback is already inside a raw boundary, so loading our interposer
+    // serves no purpose. More importantly, Apple system shells can use an
+    // arm64e slice that cannot load an ordinary arm64 development dylib. Keep
+    // unrelated caller preloads while removing only agsh's own entry.
+    let mut fallback = environment
+        .iter()
+        .filter_map(environment_without_agsh_interposer)
+        .collect::<Vec<_>>();
+
+    if !environment
         .iter()
         .any(|binding| binding.as_bytes().starts_with(active_prefix))
     {
-        return fallback;
-    }
-
-    if deep_intercept_environment(environment) {
         fallback.push(CString::new("AGSH_INTERCEPT_ACTIVE=1").unwrap());
     }
     fallback
@@ -74,29 +89,72 @@ fn deep_intercept_environment(environment: &[CString]) -> bool {
             .iter()
             .any(|binding| binding.as_bytes().starts_with(prefix))
     };
+    let (preload_prefix, split_whitespace) = PRELOAD_ENVIRONMENT;
     let has_interposer = environment.iter().any(|binding| {
-        [
-            b"DYLD_INSERT_LIBRARIES=".as_slice(),
-            b"LD_PRELOAD=".as_slice(),
-        ]
-        .iter()
-        .find_map(|prefix| binding.as_bytes().strip_prefix(*prefix))
-        .is_some_and(preload_contains_agsh_interposer)
+        binding
+            .as_bytes()
+            .strip_prefix(preload_prefix)
+            .is_some_and(|value| preload_contains_agsh_interposer(value, split_whitespace))
     });
     has_binding(b"AGSH_SELF=") && has_interposer
 }
 
-fn preload_contains_agsh_interposer(value: &[u8]) -> bool {
+fn preload_contains_agsh_interposer(value: &[u8], split_whitespace: bool) -> bool {
+    preload_entries(value, split_whitespace).any(is_agsh_interposer_entry)
+}
+
+fn preload_entries(value: &[u8], split_whitespace: bool) -> impl Iterator<Item = &[u8]> {
     value
-        .split(|byte| *byte == b':' || byte.is_ascii_whitespace())
+        .split(move |byte| *byte == b':' || (split_whitespace && byte.is_ascii_whitespace()))
         .filter(|entry| !entry.is_empty())
-        .filter_map(|entry| entry.rsplit(|byte| *byte == b'/').next())
-        .any(|basename| {
+}
+
+fn is_agsh_interposer_entry(entry: &[u8]) -> bool {
+    entry
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .is_some_and(|basename| {
             matches!(
                 basename,
                 b"libagsh_intercept.dylib" | b"libagsh_intercept.so"
             )
         })
+}
+
+fn environment_without_agsh_interposer(binding: &CString) -> Option<CString> {
+    let (prefix, split_whitespace) = PRELOAD_ENVIRONMENT;
+    let Some(value) = binding.as_bytes().strip_prefix(prefix) else {
+        return Some(binding.clone());
+    };
+    if !preload_contains_agsh_interposer(value, split_whitespace) {
+        return Some(binding.clone());
+    }
+
+    // install_deep_intercept prepends agsh's library. Remove that first
+    // reserved-basename entry only; a later same-named caller preload belongs
+    // to the caller and must survive this fallback-specific sanitization.
+    let mut removed_agsh_entry = false;
+    let retained = preload_entries(value, split_whitespace)
+        .filter(|entry| {
+            if !removed_agsh_entry && is_agsh_interposer_entry(entry) {
+                removed_agsh_entry = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>();
+    if retained.is_empty() {
+        return None;
+    }
+    let mut sanitized = prefix.to_vec();
+    for (index, entry) in retained.iter().enumerate() {
+        if index > 0 {
+            sanitized.push(b':');
+        }
+        sanitized.extend_from_slice(entry);
+    }
+    Some(CString::new(sanitized).expect("existing environment cannot contain an interior NUL"))
 }
 
 fn encoded_environment() -> io::Result<Vec<CString>> {
@@ -285,7 +343,14 @@ mod tests {
     fn text_fallback_preserves_an_existing_observation_boundary() {
         let environment = [
             CString::new("PATH=/bin").unwrap(),
+            CString::new("AGSH_SELF=/tmp/agsh").unwrap(),
             CString::new("AGSH_INTERCEPT_ACTIVE=1").unwrap(),
+            CString::new(if cfg!(target_os = "macos") {
+                "DYLD_INSERT_LIBRARIES=/tmp/libagsh_intercept.dylib"
+            } else {
+                "LD_PRELOAD=/tmp/libagsh_intercept.so"
+            })
+            .unwrap(),
         ];
         let fallback = text_fallback_environment(&environment);
         let bindings = fallback
@@ -302,6 +367,7 @@ mod tests {
                 .count(),
             1
         );
+        assert!(!deep_intercept_environment(&fallback));
     }
 
     #[test]
@@ -320,6 +386,7 @@ mod tests {
         assert!(fallback
             .iter()
             .any(|binding| binding.to_bytes() == b"AGSH_INTERCEPT_ACTIVE=1"));
+        assert!(!deep_intercept_environment(&fallback));
     }
 
     #[test]
@@ -335,11 +402,112 @@ mod tests {
     fn text_fallback_does_not_match_a_similarly_named_preload_library() {
         let environment = [
             CString::new("AGSH_SELF=/tmp/agsh").unwrap(),
-            CString::new("LD_PRELOAD=/tmp/libagsh_intercept_backup.so").unwrap(),
+            CString::new(if cfg!(target_os = "macos") {
+                "DYLD_INSERT_LIBRARIES=/tmp/libagsh_intercept_backup.dylib"
+            } else {
+                "LD_PRELOAD=/tmp/libagsh_intercept_backup.so"
+            })
+            .unwrap(),
         ];
         let fallback = text_fallback_environment(&environment);
         assert!(!fallback
             .iter()
             .any(|binding| binding.as_bytes().starts_with(b"AGSH_INTERCEPT_ACTIVE=")));
+    }
+
+    #[test]
+    fn text_fallback_ignores_the_other_platforms_preload_binding() {
+        let inert_binding = if cfg!(target_os = "macos") {
+            "LD_PRELOAD=/tmp/libagsh_intercept.so"
+        } else {
+            "DYLD_INSERT_LIBRARIES=/tmp/libagsh_intercept.dylib"
+        };
+        let environment = [
+            CString::new("AGSH_SELF=/tmp/agsh").unwrap(),
+            CString::new(inert_binding).unwrap(),
+        ];
+
+        let fallback = text_fallback_environment(&environment);
+        assert_eq!(fallback.as_slice(), environment.as_slice());
+        assert!(!fallback
+            .iter()
+            .any(|binding| binding.as_bytes().starts_with(b"AGSH_INTERCEPT_ACTIVE=")));
+    }
+
+    #[test]
+    fn text_fallback_preserves_unrelated_preload_entries() {
+        let (binding, expected) = if cfg!(target_os = "macos") {
+            (
+                "DYLD_INSERT_LIBRARIES=/tmp/libagsh_intercept.dylib:/opt/first.dylib:/opt/second.dylib",
+                b"DYLD_INSERT_LIBRARIES=/opt/first.dylib:/opt/second.dylib".as_slice(),
+            )
+        } else {
+            (
+                "LD_PRELOAD=/tmp/libagsh_intercept.so:/opt/first.so /opt/second.so",
+                b"LD_PRELOAD=/opt/first.so:/opt/second.so".as_slice(),
+            )
+        };
+        let environment = [
+            CString::new("AGSH_SELF=/tmp/agsh").unwrap(),
+            CString::new(binding).unwrap(),
+        ];
+        let fallback = text_fallback_environment(&environment);
+        assert!(fallback
+            .iter()
+            .any(|binding| binding.as_bytes() == expected));
+        assert!(fallback
+            .iter()
+            .any(|binding| binding.as_bytes() == b"AGSH_INTERCEPT_ACTIVE=1"));
+    }
+
+    #[test]
+    fn text_fallback_preserves_a_later_same_named_caller_preload() {
+        let (binding, caller_entry) = if cfg!(target_os = "macos") {
+            (
+                "DYLD_INSERT_LIBRARIES=/tmp/libagsh_intercept.dylib:/caller/libagsh_intercept.dylib:/opt/other.dylib",
+                b"/caller/libagsh_intercept.dylib".as_slice(),
+            )
+        } else {
+            (
+                "LD_PRELOAD=/tmp/libagsh_intercept.so:/caller/libagsh_intercept.so:/opt/other.so",
+                b"/caller/libagsh_intercept.so".as_slice(),
+            )
+        };
+        let environment = [
+            CString::new("AGSH_SELF=/tmp/agsh").unwrap(),
+            CString::new(binding).unwrap(),
+        ];
+
+        let fallback = text_fallback_environment(&environment);
+        let (prefix, split_whitespace) = PRELOAD_ENVIRONMENT;
+        let preload = fallback
+            .iter()
+            .find_map(|binding| binding.as_bytes().strip_prefix(prefix))
+            .expect("caller preload binding must survive");
+        let entries = preload_entries(preload, split_whitespace).collect::<Vec<_>>();
+        assert!(entries.contains(&caller_entry));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| is_agsh_interposer_entry(entry))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn text_fallback_preserves_spaces_in_unrelated_dyld_paths() {
+        let environment = [
+            CString::new("AGSH_SELF=/tmp/agsh").unwrap(),
+            CString::new(
+                "DYLD_INSERT_LIBRARIES=/tmp/libagsh_intercept.dylib:/opt/My Library/other.dylib",
+            )
+            .unwrap(),
+        ];
+        let fallback = text_fallback_environment(&environment);
+        assert!(fallback.iter().any(|binding| {
+            binding.as_bytes() == b"DYLD_INSERT_LIBRARIES=/opt/My Library/other.dylib"
+        }));
     }
 }

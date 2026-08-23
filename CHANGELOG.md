@@ -56,9 +56,10 @@ release-integrity work required to ship them.
   raw-`execve` helper so malformed executable images cannot become implicit
   shell source; preserve explicit shebang-less text fallback, byte-exact Unix
   arguments, raw pipe/redirection bytes, default SIGPIPE behavior, PTY behavior,
-  one raw deep-interception subtree for executable-text fallback, macOS `DYLD_*`
-  target bindings across hardened helper/supervisor boundaries, and status 126 across
-  normal, pipeline, PTY, `exec`, snapshot, session-resume, and kept-job routes.
+  one raw deep-interception subtree for executable-text fallback without loading
+  agsh's interposer into the fallback shell, macOS `DYLD_*` target bindings across
+  hardened helper/supervisor boundaries, and status 126 across normal, pipeline,
+  PTY, `exec`, snapshot, session-resume, and kept-job routes.
 - Resolve PATH executables using effective-ID access checks, continue past an
   inaccessible earlier candidate, revalidate cached paths after permission
   changes, and consistently return 126 for existing non-executable commands.
