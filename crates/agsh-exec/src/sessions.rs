@@ -443,9 +443,16 @@ fn resume_nth(sessions: &[Session], n: usize, state: &ShellState) -> CommandOutc
         id8,
         s.cwd
     );
-    let mut cmd = std::process::Command::new(path);
-    cmd.args(&args);
-    state.configure_child_env(&mut cmd);
+    let mut cmd = match crate::executor::prepare_internal_external_command(&path, &args, state) {
+        Ok(command) => command,
+        Err(error) => {
+            return CommandOutcome::captured(
+                126,
+                Vec::new(),
+                format!("sessions: failed to run {prog}: {error}\n").into_bytes(),
+            )
+        }
+    };
     if !s.cwd.is_empty() {
         cmd.current_dir(&s.cwd);
     }

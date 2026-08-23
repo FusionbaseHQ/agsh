@@ -176,6 +176,12 @@ Job environments are passed explicitly by the spawning shell, so confinement
 hangs up its jobs (their PTYs close) — that is the documented `keep stop`
 contract, never an accident.
 
+An already running broker is not hot-upgraded when a new agsh binary is
+installed. After an upgrade, finish or deliberately stop kept jobs, run
+`keep stop`, and let the next `keep` command start the matching broker. Do not
+use `keep stop` as an automatic installer hook: stopping the broker hangs up all
+of its jobs.
+
 Broker clients are same-UID peers, not separately authenticated principals.
 Control traffic is capped at 64 concurrent connections and 4 MiB per JSON line,
 with 5-second control I/O deadlines; one tail response is capped at 16 MiB.

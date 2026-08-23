@@ -18,8 +18,9 @@ pub use confine::{
 };
 pub use executor::{
     install_confine_shims, install_deep_intercept, install_intercept_shims, intercept_active,
-    parse_intercept_spec, print_captured_if_needed, set_capture_drain_helper, uninstall_intercept,
-    CommandOutcome, ExecutionOptions, Executor, CAPTURE_DRAIN_READY,
+    parse_intercept_spec, print_captured_if_needed, set_capture_drain_helper,
+    set_exec_launch_helper, uninstall_intercept, CommandOutcome, ExecutionOptions, Executor,
+    CAPTURE_DRAIN_READY,
 };
 pub use state::{
     restore_background_snapshot_stdin, ResolvedTrace, ShellFunction, ShellState, TraceReader,

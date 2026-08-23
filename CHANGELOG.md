@@ -10,7 +10,7 @@ release.
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-08-22
+## [0.2.0] - 2026-08-23
 
 The first supported public preview combines the session-resilience and developer-workflow
 features prepared during private development with the production-hardening and
@@ -44,13 +44,20 @@ release-integrity work required to ship them.
   exact-trace APIs refuse partial data and semantic observations distinguish a
   capped trace, a persistence failure, and a configured opt-out.
 - Authenticate broker control peers by UID, validate private socket/journal/trust
-  paths, replace background-state temp files with an acknowledged anonymous
-  handoff, and use versioned SHA-256 project-environment trust records.
+  paths, replace background-state temp files with an acknowledged, bounded,
+  length-framed anonymous handoff, and use versioned SHA-256
+  project-environment trust records.
 - Build interception and best-effort confinement shims only in validated private
   generations, publish shell state after complete verification, and refuse the
   requested mode when provisioning fails instead of running with partial policy.
 
 ### Hardening fixes
+- Route agsh-managed direct external launches through a version-coupled
+  raw-`execve` helper so malformed executable images cannot become implicit
+  shell source; preserve explicit shebang-less text fallback, byte-exact Unix
+  arguments, raw pipe/redirection bytes, PTY behavior, macOS `DYLD_*` target
+  bindings across hardened helper/supervisor boundaries, and status 126 across
+  normal, pipeline, PTY, `exec`, snapshot, session-resume, and kept-job routes.
 - Resolve PATH executables using effective-ID access checks, continue past an
   inaccessible earlier candidate, revalidate cached paths after permission
   changes, and consistently return 126 for existing non-executable commands.
@@ -64,6 +71,9 @@ release-integrity work required to ship them.
 - Make the shipped rc template executable shell syntax, label inactive general
   config/policy files as design references, and isolate every binary integration
   launch from the maintainer's real HOME/XDG/history/trust/session state.
+- Use the fixed system Git executable for automatic prompt status probes, while
+  explicit Git features continue to resolve the shell's effective `PATH` through
+  the guarded external-launch path.
 - Reserve one of 64 capture-drain admissions before each captured stream starts
   and transfer it to an acknowledged helper, so saturation fails explicitly
   during setup instead of waiting forever after the direct child exits.
@@ -118,8 +128,8 @@ release-integrity work required to ship them.
   least-privilege tokens, and use the repository's exact Rust toolchain instead
   of a floating `stable` channel.
 - Prepare archives that include the optional deep-interception library, sign and
-  notarize both macOS Mach-O files, and validate release tags against Cargo and
-  changelog versions before publishing.
+  notarize all three macOS Mach-O files, smoke-test the hardened helper boundary,
+  and validate release tags against Cargo and changelog versions before publishing.
 - Harden `install.sh` with strict version/checksum parsing, release-workflow
   attestation constraints, an exact archive allowlist, and symlink rejection;
   prepare the installer itself for checksummed, attested publication.

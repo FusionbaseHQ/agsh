@@ -1,6 +1,5 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
-use std::net::Shutdown;
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -26,9 +25,10 @@ use agsh_output::{
 
 use crate::builtins::{is_builtin, run_builtin};
 use crate::state::{
-    BufferedStdin, CapturedTraceStreams, ExactTraceFile, ExactTraceSegment, InterceptInstall,
-    LoopControlKind, StreamingStdin, StreamingStdout, TraceSpoolIncompleteMarker, TraceSpoolWriter,
-    BACKGROUND_SNAPSHOT_MAX_BYTES, BACKGROUND_SNAPSHOT_READY,
+    write_background_snapshot_frame, BufferedStdin, CapturedTraceStreams, ExactTraceFile,
+    ExactTraceSegment, InterceptInstall, LoopControlKind, StreamingStdin, StreamingStdout,
+    TraceSpoolIncompleteMarker, TraceSpoolWriter, BACKGROUND_SNAPSHOT_MAX_BYTES,
+    BACKGROUND_SNAPSHOT_READY,
 };
 use crate::{ShellFunction, ShellState};
 
@@ -52,6 +52,7 @@ const NOT_EXECUTABLE_ERROR_CODE: &str = "agsh::execution::not_executable";
 pub const CAPTURE_DRAIN_READY: u8 = 0xa7;
 
 static CAPTURE_DRAIN_HELPER: OnceLock<PathBuf> = OnceLock::new();
+static EXEC_LAUNCH_HELPER: OnceLock<PathBuf> = OnceLock::new();
 static ACTIVE_CAPTURE_DRAIN_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
@@ -72,6 +73,12 @@ std::thread_local! {
 /// retained by descendants after their direct parent exits.
 pub fn set_capture_drain_helper(path: PathBuf) {
     let _ = CAPTURE_DRAIN_HELPER.set(path);
+}
+
+/// Register the trusted executable that performs raw `execve` for launches
+/// whose host process API may add an implicit ENOEXEC-to-`/bin/sh` fallback.
+pub fn set_exec_launch_helper(path: PathBuf) {
+    let _ = EXEC_LAUNCH_HELPER.set(path);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2114,10 +2121,19 @@ fn item_source(graph: &CommandGraph, item: &CommandListItem) -> String {
 }
 
 fn handoff_background_snapshot(handoff: &mut UnixStream, snapshot: &[u8]) -> io::Result<()> {
-    handoff.write_all(snapshot)?;
-    handoff.shutdown(Shutdown::Write)?;
+    write_background_snapshot_frame(handoff, snapshot).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not write background state: {error}"),
+        )
+    })?;
     let mut ready = [0u8; 1];
-    handoff.read_exact(&mut ready)?;
+    handoff.read_exact(&mut ready).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not read background state acknowledgement: {error}"),
+        )
+    })?;
     if ready[0] != BACKGROUND_SNAPSHOT_READY {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -6029,8 +6045,12 @@ fn exec_external(
     state: &ShellState,
     command_path: &Path,
 ) -> Result<CommandOutcome, ShellError> {
-    let mut command = Command::new(command_path);
-    command.args(&invocation.argv[1..]);
+    // `CommandExt::exec` uses libc `execvp`, whose ENOEXEC behavior can feed a
+    // malformed image to `/bin/sh`. Replace this shell with a trusted helper;
+    // it performs raw `execve` after these cwd/env/fd changes are materialized
+    // and applies only agsh's bounded executable-text fallback.
+    let helper = exec_launch_helper()?;
+    let mut command = exec_helper_command(helper, command_path, &invocation.argv[1..]);
     command.current_dir(state.cwd());
     state.configure_child_env(&mut command);
     for assignment in &invocation.assignments {
@@ -6059,6 +6079,7 @@ fn exec_external(
         &mut redirection_context,
     )?;
 
+    prepare_exec_helper_environment(&mut command);
     let error = command.exec();
     let failure = external_launch_error(command_path, &error);
     let exit_code = if failure.kind == ShellErrorKind::NotFound {
@@ -7021,7 +7042,155 @@ fn external_launch_error(path: &Path, error: &io::Error) -> ShellError {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalLaunchMode {
+    Direct,
+    ShellText,
+}
+
+/// Classify the small prefix that reference shells use to distinguish an
+/// executable text file (which receives the traditional `/bin/sh` fallback)
+/// from an invalid binary image. `std::process` is inconsistent here across
+/// Unix platforms and between `spawn` and `exec`, so leaving the fallback to
+/// the host would make the same command produce different statuses.
+///
+/// Opening is non-blocking and the descriptor is rechecked as a regular file;
+/// a failed or inconclusive probe stays on the kernel's direct-exec path. That
+/// preserves execute-only files and avoids turning a path observed as a
+/// FIFO/device during this test-only probe into blocking shell input.
+#[cfg(test)]
+fn external_launch_mode(path: &Path) -> ExternalLaunchMode {
+    use rustix::fs::{Mode, OFlags};
+
+    const PREFIX_BYTES: usize = 128;
+    let descriptor = match rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(_) => return ExternalLaunchMode::Direct,
+    };
+    let mut file = File::from(descriptor);
+    match file.metadata() {
+        Ok(metadata) if metadata.is_file() => {}
+        _ => return ExternalLaunchMode::Direct,
+    }
+
+    let mut prefix = [0u8; PREFIX_BYTES];
+    let mut length = 0;
+    while length < prefix.len() {
+        match file.read(&mut prefix[length..]) {
+            Ok(0) => break,
+            Ok(read) => length += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return ExternalLaunchMode::Direct,
+        }
+    }
+    let prefix = &prefix[..length];
+    let first_line_end = prefix
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(prefix.len());
+    let first_line = &prefix[..first_line_end];
+    if prefix.starts_with(b"#!") || has_native_executable_magic(prefix) || first_line.contains(&0) {
+        ExternalLaunchMode::Direct
+    } else {
+        ExternalLaunchMode::ShellText
+    }
+}
+
+#[cfg(test)]
+fn has_native_executable_magic(prefix: &[u8]) -> bool {
+    matches!(
+        prefix.get(..4),
+        Some(
+            b"\x7fELF"
+                | b"\xfe\xed\xfa\xce"
+                | b"\xce\xfa\xed\xfe"
+                | b"\xfe\xed\xfa\xcf"
+                | b"\xcf\xfa\xed\xfe"
+                | b"\xca\xfe\xba\xbe"
+                | b"\xbe\xba\xfe\xca"
+                | b"\xca\xfe\xba\xbf"
+                | b"\xbf\xba\xfe\xca"
+        )
+    )
+}
+
+// Protocol v1 must stay backward-compatible across interrupted upgrades.
+const INTERNAL_EXEC_HELPER_FLAG: &str = "--internal-exec-helper-v1";
+
+fn exec_launch_helper() -> Result<&'static Path, ShellError> {
+    EXEC_LAUNCH_HELPER
+        .get()
+        .map(PathBuf::as_path)
+        .ok_or_else(|| ShellError::execution("external exec helper is not configured"))
+}
+
+fn exec_helper_command(helper: &Path, path: &Path, args: &[String]) -> Command {
+    let mut command = Command::new(helper);
+    command
+        .arg(INTERNAL_EXEC_HELPER_FLAG)
+        .arg("--")
+        .arg(path)
+        .args(args);
+    command
+}
+
+fn external_command(path: &Path, args: &[String]) -> Result<Command, ShellError> {
+    if let Some(helper) = EXEC_LAUNCH_HELPER.get() {
+        return Ok(exec_helper_command(helper, path, args));
+    }
+
+    #[cfg(not(test))]
+    return Err(ShellError::execution(
+        "external exec helper is not configured",
+    ));
+
+    #[cfg(test)]
+    if external_launch_mode(path) == ExternalLaunchMode::ShellText {
+        let mut command = Command::new("/bin/sh");
+        command.arg(path).args(args);
+        return Ok(command);
+    }
+    #[cfg(test)]
+    let mut command = Command::new(path);
+    #[cfg(test)]
+    command.args(args);
+    #[cfg(test)]
+    Ok(command)
+}
+
+fn prepare_external_command(path: &Path, args: &[String]) -> Result<Command, ShellError> {
+    external_command(path, args)
+}
+
+/// Prepare a resolved PATH-controlled command launched by a builtin subsystem.
+/// It shares the raw-exec helper and final target environment behavior used by
+/// ordinary external invocations, so builtins cannot reintroduce libc's
+/// implicit ENOEXEC shell fallback.
+pub(crate) fn prepare_internal_external_command(
+    path: &Path,
+    args: &[String],
+    state: &ShellState,
+) -> Result<Command, ShellError> {
+    let mut command = external_command(path, args)?;
+    command.current_dir(state.cwd());
+    state.configure_child_env(&mut command);
+    prepare_exec_helper_environment(&mut command);
+    Ok(command)
+}
+
+fn prepare_exec_helper_environment(command: &mut Command) {
+    if EXEC_LAUNCH_HELPER.get().is_some() {
+        agsh_broker::transport_macos_dyld_environment(command);
+    }
+}
+
 fn spawn_external_command(command: &mut Command, path: &Path) -> Result<Child, ShellError> {
+    prepare_exec_helper_environment(command);
     command
         .spawn()
         .map_err(|error| external_launch_error(path, &error))
@@ -7728,7 +7897,6 @@ fn run_under_pty(
         }
         _ => return Ok(command_not_found_outcome(name, state)),
     };
-
     fn pty_err(label: &str, e: rustix::io::Errno) -> ShellError {
         ShellError::execution(format!("pty: {label}: {e}"))
     }
@@ -7751,8 +7919,7 @@ fn run_under_pty(
     // failure cannot create a process that then needs cleanup.
     rustix::io::ioctl_fionbio(&controller, true).map_err(|e| pty_err("nonblock", e))?;
 
-    let mut command = Command::new(&path);
-    command.args(&invocation.argv[1..]);
+    let mut command = external_command(&path, &invocation.argv[1..])?;
     command.current_dir(state.cwd());
     state.configure_child_env(&mut command);
     for assignment in &invocation.assignments {
@@ -8349,12 +8516,8 @@ fn run_external(
     command_path: Option<&Path>,
 ) -> Result<CommandOutcome, ShellError> {
     validate_expanded_redirection_descriptors(&invocation.redirections)?;
-    let mut command = if let Some(command_path) = command_path {
-        Command::new(command_path)
-    } else {
-        Command::new(&invocation.argv[0])
-    };
-    command.args(&invocation.argv[1..]);
+    let spawn_path = command_path.unwrap_or_else(|| Path::new(&invocation.argv[0]));
+    let mut command = prepare_external_command(spawn_path, &invocation.argv[1..])?;
     command.current_dir(state.cwd());
     state.configure_child_env(&mut command);
     for assignment in &invocation.assignments {
@@ -8465,7 +8628,6 @@ fn run_external(
                 let stderr_incomplete = stderr_spool
                     .as_ref()
                     .map(TraceSpoolWriter::incomplete_marker);
-                let spawn_path = command_path.unwrap_or_else(|| Path::new(&invocation.argv[0]));
                 let mut child = spawn_external_command(&mut command, spawn_path)?;
                 record_post_child_pid(&child);
                 // stdout streams to the pipe. Make stderr exit-aware so a
@@ -8592,7 +8754,6 @@ fn run_external(
         let stderr_incomplete = stderr_spool
             .as_ref()
             .map(TraceSpoolWriter::incomplete_marker);
-        let spawn_path = command_path.unwrap_or_else(|| Path::new(&invocation.argv[0]));
         let mut child = spawn_external_command(&mut command, spawn_path)?;
         record_post_child_pid(&child);
         drop(command);
@@ -8794,7 +8955,6 @@ fn run_external(
         }
         Ok(outcome)
     } else {
-        let spawn_path = command_path.unwrap_or_else(|| Path::new(&invocation.argv[0]));
         let mut child = spawn_external_command(&mut command, spawn_path)?;
         if stdin_is_piped {
             if let (Some(input), Some(mut stdin)) = (stdin_data, child.stdin.take()) {
@@ -9822,8 +9982,7 @@ fn spawn_resolved_external_stage(
     inherit_stdout: bool,
     inherit_stderr: bool,
 ) -> Result<(Child, StreamingOutputReaders), ShellError> {
-    let mut command = Command::new(&resolved.path);
-    command.args(&resolved.invocation.argv[1..]);
+    let mut command = external_command(&resolved.path, &resolved.invocation.argv[1..])?;
     command.current_dir(state.cwd());
     state.configure_child_env(&mut command);
     for assignment in &resolved.invocation.assignments {
@@ -9849,8 +10008,7 @@ fn spawn_resolved_external_stage_with_targets(
     stdout_target: StreamingOutputTarget,
     stderr_target: StreamingOutputTarget,
 ) -> Result<Child, ShellError> {
-    let mut command = Command::new(&resolved.path);
-    command.args(&resolved.invocation.argv[1..]);
+    let mut command = external_command(&resolved.path, &resolved.invocation.argv[1..])?;
     command.current_dir(state.cwd());
     state.configure_child_env(&mut command);
     for assignment in &resolved.invocation.assignments {
@@ -16751,8 +16909,9 @@ mod tests {
             .set_write_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let child_thread = std::thread::spawn(move || {
-            let mut snapshot = Vec::new();
-            child.read_to_end(&mut snapshot).unwrap();
+            // Length framing must complete without waiting for EOF: the parent
+            // keeps its full-duplex endpoint open to receive this acknowledgement.
+            let snapshot = crate::state::read_background_snapshot_frame(&mut child).unwrap();
             std::thread::sleep(Duration::from_millis(50));
             child.write_all(&[BACKGROUND_SNAPSHOT_READY]).unwrap();
             snapshot
@@ -25810,7 +25969,7 @@ mod tests {
         std::fs::set_permissions(&text_script, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let quiet_command = |path: &Path| {
-            let mut command = Command::new(path);
+            let mut command = prepare_external_command(path, &[]).unwrap();
             command
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -25818,16 +25977,16 @@ mod tests {
             command
         };
 
-        let mut command = quiet_command(&bad_image);
-        match spawn_external_command(&mut command, &bad_image) {
-            Ok(mut child) => assert_eq!(child.wait().unwrap().code(), Some(126)),
-            Err(error) => assert_eq!(
-                error.code(),
-                NOT_EXECUTABLE_ERROR_CODE,
-                "path={} error={error}",
-                bad_image.display()
-            ),
-        }
+        let error = external_launch_error(
+            &bad_image,
+            &io::Error::new(io::ErrorKind::InvalidData, "exec format error"),
+        );
+        assert_eq!(
+            error.code(),
+            NOT_EXECUTABLE_ERROR_CODE,
+            "path={} error={error}",
+            bad_image.display()
+        );
 
         for path in [&missing_interpreter, &denied] {
             let mut command = quiet_command(path);
@@ -25848,7 +26007,7 @@ mod tests {
 
         let mut command = quiet_command(&text_script);
         let mut child = spawn_external_command(&mut command, &text_script)
-            .expect("the platform shell fallback must run executable text");
+            .expect("the deterministic shell fallback must run executable text");
         assert_eq!(child.wait().unwrap().code(), Some(42));
 
         std::fs::remove_dir_all(temp).unwrap();

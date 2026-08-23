@@ -1,11 +1,13 @@
 use std::io::{IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use agsh_core::{parse_line, ShellError, ShellErrorKind};
 use agsh_exec::{print_captured_if_needed, ExecutionOptions, Executor, ShellState};
 use agsh_output::OutputMode;
 use agsh_tty::{pick_history, read_line, read_line_with_initial, render_prompt, HistorySelection};
+
+mod raw_exec;
 
 const MAX_SHELL_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RC_SOURCE_BYTES: usize = 1024 * 1024;
@@ -55,6 +57,7 @@ struct CliOptions {
 }
 
 fn main() {
+    run_internal_exec_helper_if_requested();
     let cli_args = match collect_cli_args() {
         Ok(args) => args,
         Err(message) => {
@@ -106,12 +109,28 @@ fn main() {
         return;
     }
     if let Some(argv) = options.supervise.clone() {
-        let error = agsh_broker::supervise_exec(&argv);
-        eprintln!(
-            "agsh: supervise: {}: {error}",
-            argv.first().map(String::as_str).unwrap_or("")
-        );
-        std::process::exit(127);
+        if argv.is_empty() {
+            eprintln!("agsh: supervise: empty command");
+            std::process::exit(2);
+        }
+        let mut argv = argv
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        if let Err((error, exit_code)) = resolve_supervised_program(&mut argv) {
+            let name = argv
+                .first()
+                .map(|program| Path::new(program).display().to_string())
+                .unwrap_or_else(|| "exec".to_string());
+            eprintln!("agsh: supervise: {name}: {error}");
+            std::process::exit(exit_code);
+        }
+        if let Err(error) = agsh_broker::prepare_supervised_terminal() {
+            eprintln!("agsh: {error}");
+            std::process::exit(1);
+        }
+        let error = raw_exec::execve_with_text_fallback(&argv);
+        report_exec_failure("supervise", &argv, &error);
     }
     // `--keep` / `--attach`: this process is a thin attach client; the real
     // interactive session lives under the broker and survives us.
@@ -123,7 +142,15 @@ fn main() {
     }
 
     if let Ok(exe) = std::env::current_exe() {
-        agsh_exec::set_capture_drain_helper(exe);
+        agsh_exec::set_capture_drain_helper(exe.clone());
+        let standalone =
+            exe.with_file_name(format!("agsh-exec-helper{}", std::env::consts::EXE_SUFFIX));
+        let exec_helper = if standalone.is_file() {
+            standalone
+        } else {
+            exe
+        };
+        agsh_exec::set_exec_launch_helper(exec_helper);
     }
     let mut state = ShellState::from_current_process();
     if options.background_state_stdin {
@@ -543,6 +570,86 @@ fn collect_cli_args() -> Result<Vec<String>, String> {
                 .map_err(|argument| format!("argument is not valid UTF-8: {argument:?}"))
         })
         .collect()
+}
+
+/// The fallback launch helper is handled before UTF-8 CLI decoding so resolved
+/// Unix paths and arguments cross the extra exec boundary byte-for-byte. A
+/// normal installation uses the small sibling binary; this private mode keeps
+/// copied development binaries correct when that sibling is unavailable.
+fn run_internal_exec_helper_if_requested() {
+    use std::ffi::{OsStr, OsString};
+
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().as_deref() != Some(OsStr::new(raw_exec::INTERNAL_EXEC_HELPER_FLAG)) {
+        return;
+    }
+    if arguments.next().as_deref() != Some(OsStr::new("--")) {
+        eprintln!("agsh: exec helper: invalid internal invocation");
+        std::process::exit(2);
+    }
+    let argv: Vec<OsString> = arguments.collect();
+    let error = raw_exec::execve_with_text_fallback(&argv);
+    report_exec_failure("exec", &argv, &error);
+}
+
+fn report_exec_failure(context: &str, argv: &[std::ffi::OsString], error: &std::io::Error) -> ! {
+    let name = argv
+        .first()
+        .map(|program| Path::new(program).display().to_string())
+        .unwrap_or_else(|| "exec".to_string());
+    eprintln!("agsh: {context}: {name}: {error}");
+    let disappeared = argv.first().is_some_and(|path| {
+        matches!(
+            std::fs::metadata(path),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                )
+        )
+    });
+    std::process::exit(if disappeared { 127 } else { 126 });
+}
+
+fn resolve_supervised_program(
+    argv: &mut [std::ffi::OsString],
+) -> Result<(), (std::io::Error, i32)> {
+    use agsh_compat::{CommandResolution, Resolver};
+
+    let Some(program) = argv.first() else {
+        return Err((std::io::Error::other("empty command"), 126));
+    };
+    let Some(name) = program.to_str() else {
+        return Err((
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "command name is not valid UTF-8",
+            ),
+            126,
+        ));
+    };
+    if name.contains('/') {
+        return Ok(());
+    }
+
+    let path = std::env::var("PATH").ok();
+    match Resolver::default().resolve_external_only(name, path.as_deref()) {
+        Some(CommandResolution::External(path)) => {
+            argv[0] = path.into_os_string();
+            Ok(())
+        }
+        Some(CommandResolution::NotExecutable(path)) => {
+            argv[0] = path.into_os_string();
+            Err((
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+                126,
+            ))
+        }
+        _ => Err((
+            std::io::Error::new(std::io::ErrorKind::NotFound, "command not found"),
+            127,
+        )),
+    }
 }
 
 fn read_utf8_limited(

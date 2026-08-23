@@ -43,6 +43,10 @@ const MAX_PACKED_REFS_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REF_ENTRIES: usize = 100_000;
 const MAX_REF_DEPTH: usize = 32;
 const MAX_STATUS_BYTES: usize = 2 * 1024 * 1024;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const SYSTEM_GIT_PATH: &str = "/usr/bin/git";
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const SYSTEM_GIT_PATH: &str = "git";
 
 fn read_regular_file_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     use rustix::fs::{Mode, OFlags};
@@ -209,7 +213,10 @@ fn git_dir(root: &Path) -> PathBuf {
 /// dirty flag and ahead/behind counts in one call. Returns `(None, 0, 0)` if it
 /// times out or errors (never blocks the prompt).
 fn probe_status(root: &Path) -> (Option<bool>, u32, u32) {
-    probe_status_with(root, OsStr::new("git"), STATUS_TIMEOUT)
+    // Prompt refresh is automatic, so it must not execute a PATH-controlled
+    // replacement. Supported release platforms provide the system Git path;
+    // failure simply leaves dirty/ahead/behind unknown.
+    probe_status_with(root, OsStr::new(SYSTEM_GIT_PATH), STATUS_TIMEOUT)
 }
 
 fn probe_status_with(root: &Path, git: &OsStr, timeout: Duration) -> (Option<bool>, u32, u32) {
@@ -497,7 +504,7 @@ mod tests {
         let fake_git = dir.join("git-descendant");
         std::fs::write(
             &fake_git,
-            "#!/bin/sh\nsleep 5 &\nprintf '# branch.ab +0 -0\\n'\n",
+            "#!/bin/sh\nsleep 5 &\nprintf '%s\\n' \"$!\" > \"$2/descendant.pid\"\nprintf '# branch.ab +0 -0\\n'\n",
         )
         .unwrap();
         std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -508,9 +515,19 @@ mod tests {
             (Some(false), 0, 0)
         );
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < Duration::from_millis(900),
             "status probe waited for a descendant holding stdout"
         );
+        if let Ok(pid) = std::fs::read_to_string(dir.join("descendant.pid")) {
+            if let Some(pid) = pid
+                .trim()
+                .parse()
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

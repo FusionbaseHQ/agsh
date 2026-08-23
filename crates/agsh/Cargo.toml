@@ -1,5 +1,6 @@
 [package]
 name = "agsh"
+default-run = "agsh"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -15,11 +16,13 @@ categories.workspace = true
 
 [dependencies]
 agsh-broker = { path = "../agsh-broker" }
+agsh-compat = { path = "../agsh-compat" }
 agsh-core = { path = "../agsh-core" }
 agsh-exec = { path = "../agsh-exec" }
 agsh-output = { path = "../agsh-output" }
 agsh-policy = { path = "../agsh-policy" }
 agsh-tty = { path = "../agsh-tty" }
+nix = { version = "0.25.1", default-features = false, features = ["process"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]

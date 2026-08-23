@@ -49,12 +49,45 @@ confinement and the authenticated agent server are not implemented. See
 - Redirections involving descriptors above `2` are rejected before execution.
   Standard stdin/stdout/stderr file, append, close, and `2>&1`/`1>&2` forms are
   supported; arbitrary descriptor mapping needs a dedicated safe spawn helper.
+- External launch uses the small, version-coupled `agsh-exec-helper` sibling
+  for a raw `execve` handoff, preventing libc from silently reinterpreting an
+  ENOEXEC image as shell source across agsh-managed direct spawn, PTY, pipeline,
+  `exec`, snapshot, session-resume, and kept-job routes.
+  The kernel always receives the target first, so custom executable handlers
+  retain precedence. Only after a real ENOEXEC does the helper make a bounded
+  4 KiB regular-file probe and explicitly invoke `/bin/sh` for executable
+  text; native-image magic, malformed shebangs, binary or inconclusive first
+  lines, unreadable files, and files observed as special during the probe fail
+  with 126. This costs one small helper exec per external launch in exchange for
+  byte-exact argv/fd behavior, ordinary exported target environments, and
+  cross-platform launch consistency; releases install the helper beside agsh,
+  while copied development binaries fall back to agsh's identical private mode.
+  External launching requires the OS to report agsh's current executable path;
+  unusual Linux chroots/containers without a usable `/proc/self/exe` may start
+  the shell but reject external commands as an unconfigured-helper error.
+  For the `exec` builtin, errors resolved before the handoff leave an interactive
+  shell running as usual. A target that fails only after agsh has successfully
+  replaced itself with the helper (for example, a post-resolution disappearance,
+  malformed image, or missing shebang interpreter) exits 126/127 instead of
+  returning to that shell; this rare state-losing divergence remains pre-1.0
+  compatibility work.
+  On macOS, `DYLD_*` target bindings cross hardened helper and kept-job
+  supervisor boundaries through a private encoded environment namespace that
+  is removed before the target starts; release gates exercise that boundary
+  with hardened ad-hoc signatures before Developer ID signing.
+  `AGSH_INTERNAL_EXEC_DYLD_V1_*` is reserved for that private macOS transport
+  and is removed from target environments; applications must not use the prefix.
+  This does not rewrite the semantics of an explicitly invoked interpreter.
+  In particular, the current macOS strict-confinement backend enters its bounded
+  sandbox through `/bin/sh -c`; commands nested inside that interpreter retain
+  its ENOEXEC fallback behavior, but remain subject to the sandbox policy.
 - The `pty`/`agpty` wrapper currently captures output only. It does not forward
   interactive input; piped or fd-0 redirected input is rejected with status 2
   before the payload starts instead of being ignored or allowed to hang.
 - Background command-list items inherit scalar variables, arrays, aliases,
   functions, variable attributes, and shell options through an acknowledged,
-  bounded Unix-socket handoff; no secret-bearing temporary file is created.
+  bounded, length-framed Unix-socket handoff; no secret-bearing temporary file
+  is created and startup does not depend on socket EOF delivery.
   Native typed `Value` variants outside the shell variable model are restored
   through their scalar representation.
 - A parsed top-level graph containing an asynchronous-list `&` operator forces

@@ -917,6 +917,7 @@ impl Broker {
             command.env("TERM", "xterm-256color");
         }
         command.env("AGSH_KEEP_ID", &id);
+        crate::transport_macos_dyld_environment(&mut command);
         command.stdin(Stdio::from(peripheral.try_clone()?));
         command.stdout(Stdio::from(peripheral.try_clone()?));
         command.stderr(Stdio::from(peripheral));
@@ -1830,7 +1831,26 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
 
         drop(first);
-        acquire_generation_lock(&dir).unwrap();
+        // Another parallel test can be between fork/posix_spawn and exec while
+        // briefly holding a copy of this CLOEXEC descriptor. The kernel drops
+        // that copy at exec, so require prompt eventual release rather than an
+        // unrealistically race-free immediate reacquire.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match acquire_generation_lock(&dir) {
+                Ok(lock) => {
+                    drop(lock);
+                    break;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("generation lock was not released promptly: {error}"),
+            }
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

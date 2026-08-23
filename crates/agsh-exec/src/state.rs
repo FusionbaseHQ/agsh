@@ -34,29 +34,53 @@ type CommandNameCache = Arc<Mutex<Option<(String, std::collections::HashSet<Stri
 /// each unique binding it touched, so leaving restores values and attributes.
 type ActiveEnv = Option<(PathBuf, Vec<VariableSnapshot>)>;
 
-/// Decode a bounded state handoff used by an asynchronous child shell. The
-/// reader is normally one half of a private Unix socket pair; no pathname or
-/// persistent secret-bearing file is involved.
-pub fn restore_background_snapshot_reader(
-    state: &mut ShellState,
-    reader: impl Read,
+/// Write one bounded, length-prefixed asynchronous-shell state frame.
+pub(crate) fn write_background_snapshot_frame(
+    writer: &mut impl Write,
+    snapshot: &[u8],
 ) -> io::Result<()> {
-    let mut bytes = Vec::new();
-    let mut limited = reader.take(BACKGROUND_SNAPSHOT_MAX_BYTES as u64 + 1);
-    limited.read_to_end(&mut bytes)?;
-    if bytes.len() > BACKGROUND_SNAPSHOT_MAX_BYTES {
+    if snapshot.len() > BACKGROUND_SNAPSHOT_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "background state exceeds its size limit",
+        ));
+    }
+    writer.write_all(&(snapshot.len() as u64).to_be_bytes())?;
+    writer.write_all(snapshot)
+}
+
+/// Read one bounded asynchronous-shell state frame without waiting for EOF on
+/// the full-duplex acknowledgement socket.
+pub(crate) fn read_background_snapshot_frame(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut encoded_length = [0_u8; size_of::<u64>()];
+    reader.read_exact(&mut encoded_length)?;
+    let length = u64::from_be_bytes(encoded_length);
+    if length > BACKGROUND_SNAPSHOT_MAX_BYTES as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "background state exceeds its size limit",
         ));
     }
+    let mut bytes = vec![0_u8; length as usize];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Decode a bounded state handoff used by an asynchronous child shell. The
+/// reader is normally one half of a private Unix socket pair; no pathname or
+/// persistent secret-bearing file is involved.
+pub fn restore_background_snapshot_reader(
+    state: &mut ShellState,
+    mut reader: impl Read,
+) -> io::Result<()> {
+    let bytes = read_background_snapshot_frame(&mut reader)?;
     state.restore_background_snapshot(&bytes)
 }
 
 /// Consume a background snapshot from stdin and acknowledge successful decode
-/// on that same full-duplex descriptor. Once the parent receives the byte and
-/// closes its socket half, commands launched by this shell observe stdin EOF,
-/// matching a normal asynchronous shell's `/dev/null` input behavior.
+/// on that same full-duplex descriptor. Before acknowledging, replace fd 0 with
+/// `/dev/null`, so commands launched by this shell match normal asynchronous
+/// shell stdin behavior without depending on socket EOF delivery.
 pub fn restore_background_snapshot_stdin(state: &mut ShellState) -> io::Result<()> {
     use std::os::fd::AsFd;
 
@@ -4316,7 +4340,9 @@ mod background_snapshot_tests {
         assert!(state.restore_background_snapshot(b"not json").is_err());
         assert_eq!(state.lookup("AGSH_SNAPSHOT_SENTINEL"), Some("before"));
 
-        let oversized = vec![b'x'; BACKGROUND_SNAPSHOT_MAX_BYTES + 1];
+        let oversized = ((BACKGROUND_SNAPSHOT_MAX_BYTES as u64) + 1)
+            .to_be_bytes()
+            .to_vec();
         assert!(
             super::restore_background_snapshot_reader(&mut state, Cursor::new(oversized)).is_err()
         );

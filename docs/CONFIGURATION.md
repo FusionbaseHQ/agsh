@@ -179,6 +179,11 @@ lines per invocation (1 MiB per input line), and grep scans at most the hard
 > archives ship a glibc interposer beside the otherwise static-musl `agsh` binary;
 > musl-only systems retain PATH-shim interception but cannot load that `.so`.
 
+On macOS, names beginning `AGSH_INTERNAL_EXEC_DYLD_V1_` are reserved for the
+private hardened-helper environment transport. agsh removes caller-provided
+bindings in that namespace before external targets start; applications should
+not use the prefix.
+
 Set it in your `agshrc` so it applies to every session, or per-agent:
 `AGSH_INTERCEPT=compact agsh -c 'my-agent …'`.
 

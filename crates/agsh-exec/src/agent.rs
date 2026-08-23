@@ -589,9 +589,20 @@ pub fn snapshot(args: &[String], state: &ShellState) -> CommandOutcome {
 /// Run `git <args>` in `cwd`, passing its stdout/stderr/exit through as the
 /// command outcome.
 fn git_run(git: &Path, args: &[&str], state: &ShellState, who: &str) -> CommandOutcome {
-    let mut command = std::process::Command::new(git);
-    command.args(args).current_dir(state.cwd());
-    state.configure_child_env(&mut command);
+    let args = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
+    let mut command = match crate::executor::prepare_internal_external_command(git, &args, state) {
+        Ok(command) => command,
+        Err(error) => {
+            return CommandOutcome::captured(
+                1,
+                Vec::new(),
+                format!("{who}: git: {error}\n").into_bytes(),
+            )
+        }
+    };
     match capture_command_with_limits(&mut command, MAX_GIT_CAPTURE_BYTES, GIT_CAPTURE_TIMEOUT) {
         Ok(output) => git_run_output(output, who),
         Err(e) => {
@@ -628,9 +639,12 @@ fn command_exit_code(status: ExitStatus) -> i32 {
 
 /// Run `git <args>` in `cwd`, returning trimmed stdout or an error string.
 fn git_capture(git: &Path, args: &[&str], state: &ShellState) -> Result<String, String> {
-    let mut command = std::process::Command::new(git);
-    command.args(args).current_dir(state.cwd());
-    state.configure_child_env(&mut command);
+    let args = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
+    let mut command = crate::executor::prepare_internal_external_command(git, &args, state)
+        .map_err(|error| format!("git: {error}"))?;
     let out = capture_command_with_limits(&mut command, MAX_GIT_CAPTURE_BYTES, GIT_CAPTURE_TIMEOUT)
         .map_err(|e| format!("git: {e}"))?;
     git_capture_output(out)

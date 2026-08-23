@@ -7,7 +7,8 @@ interactive tests), builds
 four targets on native runners (macOS 15 arm64/x86_64, Ubuntu 22.04
 x86_64/aarch64 with static-musl shell binaries), and builds the optional
 deep-interception library (native macOS or glibc Linux). Separate protected jobs
-then **sign and notarize both shipped macOS Mach-O files** and publish a GitHub
+then **sign and notarize all three shipped macOS Mach-O files** (the shell,
+raw-exec launch helper, and interception library) and publish a GitHub
 Release with binary tarballs, a complete corresponding-source tarball, the
 installer, `checksums.txt`, and notes extracted from `CHANGELOG.md`.
 `workflow_dispatch` always dry-runs the build and source-verification matrix
@@ -28,7 +29,8 @@ depending on crates.io remaining available indefinitely.
 The tag test gate also runs the installer fixture on both Ubuntu and macOS.
 Those cases inject deterministic Linux and Darwin platform responses and serve
 archives through a fake `curl`, so they validate the target-specific archive,
-interception-library, and notice branches without contacting a release service.
+version-coupled launch helper, interception-library, and notice branches without
+contacting a release service.
 
 After the source archive is created, a separate job with read-only repository
 permission and no signing or publication credentials downloads that exact
@@ -174,8 +176,9 @@ gh secret set APPLE_API_KEY_P8 -R FusionbaseHQ/agsh --env release-signing \
 - imports the certificate into a throwaway keychain (deleted before packaging),
 - `codesign --options runtime --timestamp` (hardened runtime — required for
   notarization),
-- signs both the executable and optional preload library, submits both with
-  `xcrun notarytool submit --wait`, and fails unless the verdict is **Accepted**,
+- signs the shell, launch helper, and optional preload library, submits all three
+  with `xcrun notarytool submit --wait`, and fails unless the verdict is
+  **Accepted**,
 - packages the *signed* files into the release tarball (checksums therefore
   cover the signatures).
 
@@ -253,24 +256,30 @@ shasum -a 256 -c selected-checksums.txt
   `curl | sh` installs never trip Gatekeeper. Notarization protects users who
   download tarballs from the Releases page in a browser, satisfies MDM/endpoint
   policies that require it, and is a prerequisite for a future Homebrew cask.
-- Verify a shipped binary locally:
-  `codesign --verify --strict -v ./agsh` and
-  `spctl -a -vv -t install ./agsh` (expect `source=Notarized Developer ID`).
+- Verify the shipped executables locally:
+  `codesign --verify --strict -v ./agsh ./agsh-exec-helper` and assess each with
+  `spctl -a -vv -t install` (expect `source=Notarized Developer ID`).
 
 ## Local pre-release signing/notarization smoke test
 
 With the required repository setting enabled, published assets and their tags
 are immutable. Never replace or re-sign an existing release; cut a new version
-for any correction. Before packaging, maintainers can exercise Apple's local
-signing/notarization path on both locally built Mach-O files:
+for any correction. The release build first applies temporary hardened ad-hoc
+signatures to copies and verifies that deep-interception `DYLD_*` target bindings
+survive the helper boundary without leaking private transport bindings; Developer
+ID signing still operates on the original staged payload. Before packaging,
+maintainers can exercise Apple's local signing/notarization path on all three
+locally built Mach-O files:
 
 ```sh
 codesign --force --sign "Developer ID Application: <Your Org> (<TEAMID>)" \
   --options runtime --timestamp libagsh_intercept.dylib
 codesign --force --sign "Developer ID Application: <Your Org> (<TEAMID>)" \
+  --options runtime --timestamp agsh-exec-helper
+codesign --force --sign "Developer ID Application: <Your Org> (<TEAMID>)" \
   --options runtime --timestamp agsh
 mkdir agsh-notarize
-cp agsh libagsh_intercept.dylib agsh-notarize/
+cp agsh agsh-exec-helper libagsh_intercept.dylib agsh-notarize/
 ditto -c -k --keepParent agsh-notarize agsh-notarize.zip
 # store credentials once — Apple ID + app-specific password…
 xcrun notarytool store-credentials agsh-notary \

@@ -13,11 +13,13 @@ name = "agsh"
 version = "0.2.0"
 dependencies = [
  "agsh-broker",
+ "agsh-compat",
  "agsh-core",
  "agsh-exec",
  "agsh-output",
  "agsh-policy",
  "agsh-tty",
+ "nix",
  "rustix",
 ]
 

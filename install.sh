@@ -87,9 +87,11 @@ base="https://github.com/$REPO/releases/download/$VERSION"
 tmp=$(mktemp -d)
 stage=
 binary_stage=
+helper_stage=
 cleanup() {
     [ -z "$stage" ] || rm -f "$stage"
     [ -z "$binary_stage" ] || rm -f "$binary_stage"
+    [ -z "$helper_stage" ] || rm -f "$helper_stage"
     rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -142,7 +144,7 @@ fi
 
 # ---- install -----------------------------------------------------------------
 archive_list="$tmp/archive.list"
-archive_member_count=11
+archive_member_count=12
 [ -z "$platform_copyright" ] || archive_member_count=$((archive_member_count + 1))
 if ! tar -tzf "$tmp/$name.tar.gz" |
     awk -v cap="$archive_member_count" 'NR > cap { exit 1 } { print }' >"$archive_list"
@@ -152,6 +154,7 @@ fi
 for member in \
     "$name/" \
     "$name/agsh" \
+    "$name/agsh-exec-helper" \
     "$name/$intercept_lib" \
     "$name/LICENSE" \
     "$name/NOTICE" \
@@ -170,7 +173,8 @@ done
     fail "archive is missing or duplicates expected member: $name/$platform_copyright"
 while IFS= read -r member; do
     case "$member" in
-    "$name/" | "$name/agsh" | "$name/$intercept_lib" | \
+    "$name/" | "$name/agsh" | "$name/agsh-exec-helper" | \
+        "$name/$intercept_lib" | \
         "$name/LICENSE" | "$name/NOTICE" | "$name/THIRD_PARTY_LICENSES.html" | \
         "$name/RUST_STANDARD_LIBRARY_COPYRIGHT.html" | "$name/README.md" | \
         "$name/CHANGELOG.md" | "$name/LICENSES/" | \
@@ -188,7 +192,8 @@ done <"$archive_list"
 extract="$tmp/extract"
 mkdir -p "$extract/$name"
 set -- \
-    "$name/agsh" "$name/$intercept_lib" "$name/LICENSE" "$name/NOTICE" \
+    "$name/agsh" "$name/agsh-exec-helper" "$name/$intercept_lib" \
+    "$name/LICENSE" "$name/NOTICE" \
     "$name/THIRD_PARTY_LICENSES.html" "$name/RUST_STANDARD_LIBRARY_COPYRIGHT.html" \
     "$name/LICENSES/Apache-2.0.txt"
 [ -z "$platform_copyright" ] || set -- "$@" "$name/$platform_copyright"
@@ -197,6 +202,9 @@ set -- \
     fail "could not extract release payload"
 [ -f "$extract/$name/agsh" ] && [ ! -L "$extract/$name/agsh" ] ||
     fail "archive did not contain a regular agsh binary"
+[ -f "$extract/$name/agsh-exec-helper" ] &&
+    [ ! -L "$extract/$name/agsh-exec-helper" ] ||
+    fail "archive did not contain a regular agsh exec helper"
 [ -f "$extract/$name/$intercept_lib" ] && [ ! -L "$extract/$name/$intercept_lib" ] ||
     fail "archive did not contain a regular interception library"
 for member in LICENSE NOTICE THIRD_PARTY_LICENSES.html \
@@ -230,6 +238,17 @@ install_atomic() {
 # Validate a staged executable on the destination filesystem. This supports
 # hardened systems where the temporary directory itself is mounted noexec,
 # while leaving any existing agsh executable untouched until validation passes.
+[ ! -d "$INSTALL_DIR/agsh-exec-helper" ] ||
+    fail "refusing to replace directory destination: $INSTALL_DIR/agsh-exec-helper"
+helper_stage=$(mktemp "$INSTALL_DIR/.agsh-exec-helper.XXXXXX") ||
+    fail "could not create helper staging file in $INSTALL_DIR"
+install -m 755 "$extract/$name/agsh-exec-helper" "$helper_stage" ||
+    fail "could not stage agsh exec helper"
+helper_version=$("$helper_stage" --version) ||
+    fail "downloaded agsh exec helper could not run on this platform"
+[ "$helper_version" = "agsh-exec-helper ${VERSION#v}" ] ||
+    fail "downloaded exec helper version does not match $VERSION (got: $helper_version)"
+
 [ ! -d "$INSTALL_DIR/agsh" ] ||
     fail "refusing to replace directory destination: $INSTALL_DIR/agsh"
 binary_stage=$(mktemp "$INSTALL_DIR/.agsh.XXXXXX") ||
@@ -252,6 +271,11 @@ install_atomic "$extract/$name/RUST_STANDARD_LIBRARY_COPYRIGHT.html" \
 [ -z "$platform_copyright" ] || install_atomic \
     "$extract/$name/$platform_copyright" "$DOC_DIR/$platform_copyright" 644
 install_atomic "$extract/$name/LICENSES/Apache-2.0.txt" "$DOC_DIR/Apache-2.0.txt" 644
+[ ! -d "$INSTALL_DIR/agsh-exec-helper" ] ||
+    fail "refusing to replace directory destination: $INSTALL_DIR/agsh-exec-helper"
+mv -f "$helper_stage" "$INSTALL_DIR/agsh-exec-helper" ||
+    fail "could not install agsh exec helper"
+helper_stage=
 [ ! -d "$INSTALL_DIR/agsh" ] ||
     fail "refusing to replace directory destination: $INSTALL_DIR/agsh"
 mv -f "$binary_stage" "$INSTALL_DIR/agsh" || fail "could not install agsh"

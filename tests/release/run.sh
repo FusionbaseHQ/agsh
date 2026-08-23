@@ -56,6 +56,9 @@ grep -F -q -- "if [ \"\${{ runner.os }}\" = Linux ]; then" "$workflow"
 grep -F -q -- "grep -q ' INTERP ' \"\$program_headers\"" "$workflow"
 grep -F -q -- "grep -q '(NEEDED)' \"\$dynamic_entries\"" "$workflow"
 grep -F -q -- 'test "$("$bin" --version)" = "agsh $expected_version"' "$workflow"
+grep -F -q -- 'Smoke test hardened macOS helper boundary' "$workflow"
+grep -F -q -- 'AGSH_INTERNAL_EXEC_DYLD_V1_' "$workflow"
+grep -F -q -- 'test "$result" = hardened-transport-ok' "$workflow"
 if grep -F -q -- 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER' "$workflow" ||
     grep -F -q -- 'CARGO_TARGET_$(echo' "$workflow"
 then

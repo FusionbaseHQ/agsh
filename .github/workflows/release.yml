@@ -158,30 +158,36 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           bin="target/${{ matrix.target }}/release/agsh"
+          helper="target/${{ matrix.target }}/release/agsh-exec-helper"
           lib="target/${{ matrix.intercept_target }}/release/${{ matrix.intercept_lib }}"
           install_name_tool -id "@rpath/${{ matrix.intercept_lib }}" "$lib"
           test "$(otool -D "$lib" | tail -n 1)" = "@rpath/${{ matrix.intercept_lib }}"
           test "$(otool -l "$bin" | awk '/minos/{print $2; exit}')" = '11.0'
+          test "$(otool -l "$helper" | awk '/minos/{print $2; exit}')" = '11.0'
           test "$(otool -l "$lib" | awk '/minos/{print $2; exit}')" = '11.0'
       - name: Smoke test unsigned build
         run: |
           bin="target/${{ matrix.target }}/release/agsh"
+          helper="target/${{ matrix.target }}/release/agsh-exec-helper"
           lib="target/${{ matrix.intercept_target }}/release/${{ matrix.intercept_lib }}"
           test -f "$bin"
+          test -f "$helper"
           test -f "$lib"
           if [ "${{ runner.os }}" = Linux ]; then
-            program_headers="$RUNNER_TEMP/agsh-program-headers"
-            dynamic_entries="$RUNNER_TEMP/agsh-dynamic-entries"
-            readelf -lW "$bin" > "$program_headers"
-            readelf -dW "$bin" > "$dynamic_entries"
-            if grep -q ' INTERP ' "$program_headers"; then
-              echo "::error::$bin has a runtime program interpreter"
-              exit 1
-            fi
-            if grep -q '(NEEDED)' "$dynamic_entries"; then
-              echo "::error::$bin has a dynamic-library dependency"
-              exit 1
-            fi
+            for executable in "$bin" "$helper"; do
+              program_headers="$RUNNER_TEMP/$(basename "$executable")-program-headers"
+              dynamic_entries="$RUNNER_TEMP/$(basename "$executable")-dynamic-entries"
+              readelf -lW "$executable" > "$program_headers"
+              readelf -dW "$executable" > "$dynamic_entries"
+              if grep -q ' INTERP ' "$program_headers"; then
+                echo "::error::$executable has a runtime program interpreter"
+                exit 1
+              fi
+              if grep -q '(NEEDED)' "$dynamic_entries"; then
+                echo "::error::$executable has a dynamic-library dependency"
+                exit 1
+              fi
+            done
           fi
           expected_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           test -n "$expected_version"
@@ -189,7 +195,10 @@ jobs:
             Darwin:arm64:aarch64-apple-darwin | Darwin:x86_64:x86_64-apple-darwin | \
             Linux:x86_64:x86_64-unknown-linux-musl | Linux:aarch64:aarch64-unknown-linux-musl)
               test "$("$bin" --version)" = "agsh $expected_version"
+              test "$("$helper" --version)" = "agsh-exec-helper $expected_version"
               test "$("$bin" -c 'echo release-smoke')" = "release-smoke"
+              test "$("$helper" --internal-exec-helper-v1 -- /bin/sh -c \
+                'printf helper-smoke')" = "helper-smoke"
               smoke_src="$RUNNER_TEMP/agsh-dlopen-smoke.c"
               smoke_bin="$RUNNER_TEMP/agsh-dlopen-smoke"
               printf '%s\n' \
@@ -205,6 +214,46 @@ jobs:
               ;;
             *) echo "Cross-built target; existence checked, execution skipped." ;;
           esac
+      - name: Smoke test hardened macOS helper boundary
+        if: runner.os == 'macOS'
+        run: |
+          bin="target/${{ matrix.target }}/release/agsh"
+          helper="target/${{ matrix.target }}/release/agsh-exec-helper"
+          lib="target/${{ matrix.intercept_target }}/release/${{ matrix.intercept_lib }}"
+          smoke_dir="$RUNNER_TEMP/agsh-hardened-smoke"
+          mkdir "$smoke_dir"
+          cp "$bin" "$smoke_dir/agsh"
+          cp "$helper" "$smoke_dir/agsh-exec-helper"
+          cp "$lib" "$smoke_dir/${{ matrix.intercept_lib }}"
+          codesign --force --sign - --options runtime \
+            "$smoke_dir/${{ matrix.intercept_lib }}"
+          codesign --force --sign - --options runtime \
+            "$smoke_dir/agsh-exec-helper"
+          codesign --force --sign - --options runtime "$smoke_dir/agsh"
+
+          probe_src="$RUNNER_TEMP/agsh-dyld-environment-smoke.c"
+          probe_bin="$RUNNER_TEMP/agsh-dyld-environment-smoke"
+          printf '%s\n' \
+            '#include <stdio.h>' \
+            '#include <stdlib.h>' \
+            '#include <string.h>' \
+            'extern char **environ;' \
+            'int main(void) {' \
+            '  const char *prefix = "AGSH_INTERNAL_EXEC_DYLD_V1_";' \
+            '  for (char **entry = environ; *entry != NULL; entry++) {' \
+            '    if (strncmp(*entry, prefix, strlen(prefix)) == 0) return 3;' \
+            '  }' \
+            '  const char *insert = getenv("DYLD_INSERT_LIBRARIES");' \
+            '  const char *custom = getenv("DYLD_AGSH_TEST");' \
+            '  if (insert == NULL || strstr(insert, "libagsh_intercept.dylib") == NULL) return 4;' \
+            '  if (custom == NULL || strcmp(custom, "custom") != 0) return 5;' \
+            '  puts("hardened-transport-ok");' \
+            '  return 0;' \
+            '}' > "$probe_src"
+          cc "$probe_src" -o "$probe_bin"
+          result=$(AGSH_INTERCEPT=semantic:deep "$smoke_dir/agsh" --output raw \
+            -c "DYLD_AGSH_TEST=custom '$probe_bin'")
+          test "$result" = hardened-transport-ok
       - name: Stage release payload
         id: package
         run: |
@@ -216,6 +265,7 @@ jobs:
           NAME="agsh-$VERSION-${{ matrix.target }}"
           mkdir -p "dist/$NAME"
           cp "target/${{ matrix.target }}/release/agsh" "dist/$NAME/"
+          cp "target/${{ matrix.target }}/release/agsh-exec-helper" "dist/$NAME/"
           cp "target/${{ matrix.intercept_target }}/release/${{ matrix.intercept_lib }}" "dist/$NAME/"
           cp LICENSE NOTICE THIRD_PARTY_LICENSES.html README.md CHANGELOG.md "dist/$NAME/"
           rust_copyright="$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html"
@@ -442,11 +492,12 @@ jobs:
           path: unsigned
       - name: Validate unsigned payload
         run: |
-          test "$(find unsigned -mindepth 1 -type f | wc -l)" -eq 9
+          test "$(find unsigned -mindepth 1 -type f | wc -l)" -eq 10
           test "$(find unsigned -mindepth 1 -type d | wc -l)" -eq 1
           test "$(find unsigned -mindepth 1 ! -type f ! -type d | wc -l)" -eq 0
           set -- \
             unsigned/agsh \
+            unsigned/agsh-exec-helper \
             unsigned/libagsh_intercept.dylib \
             unsigned/LICENSE \
             unsigned/NOTICE \
@@ -462,8 +513,10 @@ jobs:
           test -d unsigned/LICENSES
           test ! -L unsigned/LICENSES
           test "$(lipo -archs unsigned/agsh)" = "${{ matrix.arch }}"
+          test "$(lipo -archs unsigned/agsh-exec-helper)" = "${{ matrix.arch }}"
           test "$(lipo -archs unsigned/libagsh_intercept.dylib)" = "${{ matrix.arch }}"
-          chmod 755 unsigned/agsh unsigned/libagsh_intercept.dylib
+          chmod 755 unsigned/agsh unsigned/agsh-exec-helper \
+            unsigned/libagsh_intercept.dylib
       - name: Import Developer ID certificate
         env:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
@@ -498,13 +551,17 @@ jobs:
         run: |
           umask 077
           bin=unsigned/agsh
+          helper=unsigned/agsh-exec-helper
           lib=unsigned/libagsh_intercept.dylib
           trap 'rm -f "$RUNNER_TEMP/AuthKey.p8"' EXIT
           codesign --force --sign "$MACOS_SIGN_IDENTITY" \
             --options runtime --timestamp "$lib"
           codesign --force --sign "$MACOS_SIGN_IDENTITY" \
+            --options runtime --timestamp "$helper"
+          codesign --force --sign "$MACOS_SIGN_IDENTITY" \
             --options runtime --timestamp "$bin"
           codesign --verify --strict --verbose=2 "$lib"
+          codesign --verify --strict --verbose=2 "$helper"
           codesign --verify --strict --verbose=2 "$bin"
 
           if [ -n "$APPLE_API_KEY_P8" ]; then
@@ -531,7 +588,7 @@ jobs:
 
           notarize_dir="$RUNNER_TEMP/agsh-notarize"
           mkdir "$notarize_dir"
-          cp "$bin" "$lib" "$notarize_dir/"
+          cp "$bin" "$helper" "$lib" "$notarize_dir/"
           ditto -c -k --keepParent "$notarize_dir" "$RUNNER_TEMP/agsh-notarize.zip"
           xcrun notarytool submit "$RUNNER_TEMP/agsh-notarize.zip" \
             "${auth[@]}" \
@@ -553,7 +610,9 @@ jobs:
           NAME="agsh-$GITHUB_REF_NAME-${{ matrix.target }}"
           mkdir -p "package/$NAME" dist
           cp -R unsigned/. "package/$NAME/"
-          chmod 755 "package/$NAME/agsh" "package/$NAME/libagsh_intercept.dylib"
+          chmod 755 "package/$NAME/agsh" \
+            "package/$NAME/agsh-exec-helper" \
+            "package/$NAME/libagsh_intercept.dylib"
           tar -C package -czf "dist/$NAME.tar.gz" "$NAME"
           (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
           printf 'name=%s\n' "$NAME" >> "$GITHUB_OUTPUT"

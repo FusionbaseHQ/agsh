@@ -135,7 +135,14 @@ cat >"$PAYLOAD/agsh" <<'EOF'
 #!/bin/sh
 printf '%s\n' 'agsh 0.2.0'
 EOF
-chmod 755 "$PAYLOAD/agsh"
+cat >"$PAYLOAD/agsh-exec-helper" <<'EOF'
+#!/bin/sh
+case "${1:-}" in
+--version) printf '%s\n' 'agsh-exec-helper 0.2.0' ;;
+*) exit 2 ;;
+esac
+EOF
+chmod 755 "$PAYLOAD/agsh" "$PAYLOAD/agsh-exec-helper"
 printf 'fixture library\n' >"$PAYLOAD/$FIXTURE_INTERCEPT_LIB"
 for file in LICENSE NOTICE THIRD_PARTY_LICENSES.html \
     RUST_STANDARD_LIBRARY_COPYRIGHT.html README.md CHANGELOG.md
@@ -192,6 +199,8 @@ run_installer "$TMP/install" >/dev/null 2>"$TMP/install.err"
 test -x "$TMP/install/agsh"
 test ! -L "$TMP/install/agsh"
 test "$(cat "$TMP/victim")" = "do not overwrite through symlink"
+test -x "$TMP/install/agsh-exec-helper"
+test "$("$TMP/install/agsh-exec-helper" --version)" = "agsh-exec-helper 0.2.0"
 test -x "$TMP/install/$FIXTURE_INTERCEPT_LIB"
 test "$("$TMP/install/agsh" --version)" = "agsh 0.2.0"
 test -f "$TMP/install/docs/LICENSE"
@@ -253,10 +262,33 @@ if run_installer "$TMP/wrong-version" >/dev/null 2>"$TMP/wrong-version.err"; the
 fi
 grep -q 'binary version does not match' "$TMP/wrong-version.err"
 test ! -e "$TMP/wrong-version/agsh"
+test ! -e "$TMP/wrong-version/agsh-exec-helper"
 test ! -e "$TMP/wrong-version/$FIXTURE_INTERCEPT_LIB"
 sed 's/agsh 9.9.9/agsh 0.2.0/' "$PAYLOAD/agsh" >"$PAYLOAD/agsh.correct"
 mv "$PAYLOAD/agsh.correct" "$PAYLOAD/agsh"
 chmod 755 "$PAYLOAD/agsh"
+make_fixture "$FIXTURE_ARCHIVE" "$FIXTURE_CHECKSUMS"
+
+# The launch helper is a version-coupled executable and must be validated
+# before either executable becomes visible at its final path.
+sed 's/agsh-exec-helper 0.2.0/agsh-exec-helper 9.9.9/' \
+    "$PAYLOAD/agsh-exec-helper" >"$PAYLOAD/agsh-exec-helper.wrong"
+mv "$PAYLOAD/agsh-exec-helper.wrong" "$PAYLOAD/agsh-exec-helper"
+chmod 755 "$PAYLOAD/agsh-exec-helper"
+make_fixture "$FIXTURE_ARCHIVE" "$FIXTURE_CHECKSUMS"
+if run_installer "$TMP/wrong-helper-version" \
+    >/dev/null 2>"$TMP/wrong-helper-version.err"
+then
+    printf '%s\n' 'wrong-version exec helper was accepted' >&2
+    exit 1
+fi
+grep -q 'exec helper version does not match' "$TMP/wrong-helper-version.err"
+test ! -e "$TMP/wrong-helper-version/agsh"
+test ! -e "$TMP/wrong-helper-version/agsh-exec-helper"
+sed 's/agsh-exec-helper 9.9.9/agsh-exec-helper 0.2.0/' \
+    "$PAYLOAD/agsh-exec-helper" >"$PAYLOAD/agsh-exec-helper.correct"
+mv "$PAYLOAD/agsh-exec-helper.correct" "$PAYLOAD/agsh-exec-helper"
+chmod 755 "$PAYLOAD/agsh-exec-helper"
 make_fixture "$FIXTURE_ARCHIVE" "$FIXTURE_CHECKSUMS"
 
 # A checksum manifest must identify the asset exactly once.

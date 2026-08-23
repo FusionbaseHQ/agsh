@@ -209,7 +209,7 @@ archive with the tagged project source and locked vendored Rust dependencies.
 ```sh
 git clone https://github.com/FusionbaseHQ/agsh.git && cd agsh
 cargo build --release --locked
-install -m755 target/release/agsh ~/.local/bin/agsh   # or anywhere on PATH
+install -m755 target/release/agsh target/release/agsh-exec-helper ~/.local/bin/
 # Optional experimental :deep interception library, beside the executable:
 case "$(uname -s)" in Darwin) ext=dylib ;; Linux) ext=so ;; esac
 install -m755 "target/release/libagsh_intercept.$ext" ~/.local/bin/
