@@ -65,6 +65,12 @@ jobs:
           rustup default "$toolchain"
       - name: cargo build
         run: cargo build --workspace --locked --verbose
+      - name: Install x86_64 Rust target for Rosetta compatibility gate
+        if: runner.os == 'macOS'
+        run: rustup target add x86_64-apple-darwin
+      - name: Rosetta cross-architecture compatibility gate
+        if: runner.os == 'macOS'
+        run: AGSH_REQUIRE_ROSETTA_CHECK=1 scripts/check-rosetta.sh
       - name: cargo test
         run: cargo test --workspace --locked --verbose
       - name: golden checks

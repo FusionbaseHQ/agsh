@@ -77,6 +77,15 @@ confinement and the authenticated agent server are not implemented. See
   with hardened ad-hoc signatures before Developer ID signing.
   `AGSH_INTERNAL_EXEC_DYLD_V1_*` is reserved for that private macOS transport
   and is removed from target environments; applications must not use the prefix.
+  On macOS, agsh's architecture-specific interposer is forwarded only to targets
+  whose bounded Mach-O header advertises a compatible native slice, including the
+  ordinary-arm64/arm64e and x86_64-to-arm handoff cases. Scripts,
+  cross-architecture or unrecognized images, unreadable files, and unknown CPU
+  subtypes run without that managed entry; unrelated caller preloads are
+  preserved exactly, while deep interception below that target degrades to PATH
+  shims. Ownership is derived from the trusted helper layout rather than mutable
+  target environment values. Inspection is advisory and can race with replacement
+  before exec.
   Under experimental deep interception, executable text entered through the
   helper's explicit ENOEXEC `/bin/sh` fallback stays within one raw subtree via
   `AGSH_INTERCEPT_ACTIVE=1`. Absolute shell launches in that subtree are not
@@ -172,9 +181,10 @@ confinement and the authenticated agent server are not implemented. See
 
 ## Required gates
 
-Run `scripts/check.sh` for formatting, Rust tests, Clippy, build, golden tests,
-and both differential suites. Run `scripts/check-interactive.sh` for the local
-PTY suite. Tagged releases additionally run the PTY suite on GitHub-hosted
+Run `scripts/check.sh` for formatting, Rust tests, Clippy, build, the
+Apple-silicon Rosetta compatibility probe where supported, golden tests, and
+both differential suites. Run `scripts/check-interactive.sh` for the local PTY
+suite. Tagged releases additionally run the PTY suite on GitHub-hosted
 macOS and Ubuntu runners, build all four native release targets, validate the
 installer, sign/notarize macOS artifacts, and publish checksummed attestations.
 

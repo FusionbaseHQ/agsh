@@ -76,6 +76,12 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo build
         run: cargo build --workspace --locked --verbose
+      - name: Install x86_64 Rust target for Rosetta compatibility gate
+        if: runner.os == 'macOS'
+        run: rustup target add x86_64-apple-darwin
+      - name: Rosetta cross-architecture compatibility gate
+        if: runner.os == 'macOS'
+        run: AGSH_REQUIRE_ROSETTA_CHECK=1 scripts/check-rosetta.sh
       - name: cargo test
         run: cargo test --workspace --locked --verbose
       - name: golden checks
@@ -254,6 +260,65 @@ jobs:
           result=$(AGSH_INTERCEPT=semantic:deep "$smoke_dir/agsh" --output raw \
             -c "DYLD_AGSH_TEST=custom '$probe_bin'")
           test "$result" = hardened-transport-ok
+
+          if [ "${{ matrix.target }}" = aarch64-apple-darwin ]; then
+            otool -arch arm64e -hv /usr/bin/wc | \
+              grep -Eq 'ARM64[[:space:]]+E[[:space:]]+(LIB64|USR00)'
+            system_wc_result=$(AGSH_INTERCEPT=semantic:deep "$smoke_dir/agsh" \
+              --output raw -c "printf 'system-arm64e-ok\\n' | /usr/bin/wc -l")
+            test "$(printf '%s' "$system_wc_result" | tr -d '[:space:]')" = 1
+
+            # The system probe above owns the strict dyld regression. This
+            # non-platform fixture verifies exact caller-preload preservation.
+            arm64e_caller_src="$RUNNER_TEMP/agsh-arm64e-caller.c"
+            arm64e_caller="$RUNNER_TEMP/agsh-arm64e-caller.dylib"
+            arm64e_target_src="$RUNNER_TEMP/agsh-arm64e-target.c"
+            arm64e_target="$RUNNER_TEMP/agsh-arm64e-target"
+            arm64e_marker="$RUNNER_TEMP/agsh-arm64e-caller.marker"
+            printf '%s\n' \
+              '#include <fcntl.h>' \
+              '#include <stdlib.h>' \
+              '#include <unistd.h>' \
+              '__attribute__((constructor)) static void loaded(void) {' \
+              '  const char *marker = getenv("AGSH_CALLER_MARKER");' \
+              '  if (marker == NULL) return;' \
+              '  int fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0600);' \
+              '  if (fd < 0) return;' \
+              '  const char value[] = "caller-loaded\\n";' \
+              '  (void)write(fd, value, sizeof(value) - 1);' \
+              '  (void)close(fd);' \
+              '}' > "$arm64e_caller_src"
+            printf '%s\n' \
+              '#include <stdio.h>' \
+              '#include <stdlib.h>' \
+              '#include <string.h>' \
+              'extern char **environ;' \
+              'int main(void) {' \
+              '  const char *prefix = "AGSH_INTERNAL_EXEC_DYLD_V1_";' \
+              '  for (char **entry = environ; *entry != NULL; entry++) {' \
+              '    if (strncmp(*entry, prefix, strlen(prefix)) == 0) return 3;' \
+              '  }' \
+              '  const char *insert = getenv("DYLD_INSERT_LIBRARIES");' \
+              '  const char *expected = getenv("EXPECTED_PRELOAD");' \
+              '  if (insert == NULL || expected == NULL || strcmp(insert, expected) != 0) return 4;' \
+              '  const char *marker = getenv("AGSH_CALLER_MARKER");' \
+              '  if (marker == NULL) return 5;' \
+              '  FILE *file = fopen(marker, "r");' \
+              '  if (file == NULL) return 6;' \
+              '  char value[32] = {0};' \
+              '  if (fgets(value, sizeof(value), file) == NULL) return 7;' \
+              '  if (fclose(file) != 0 || strcmp(value, "caller-loaded\\n") != 0) return 8;' \
+              '  puts("arm64e-preload-ok");' \
+              '  return 0;' \
+              '}' > "$arm64e_target_src"
+            cc -arch arm64e -dynamiclib "$arm64e_caller_src" -o "$arm64e_caller"
+            cc -arch arm64e "$arm64e_target_src" -o "$arm64e_target"
+            arm64e_source="DYLD_INSERT_LIBRARIES='$smoke_dir/${{ matrix.intercept_lib }}:$arm64e_caller' EXPECTED_PRELOAD='$arm64e_caller' AGSH_CALLER_MARKER='$arm64e_marker' '$arm64e_target'"
+            arm64e_result=$(AGSH_INTERCEPT=semantic:deep "$smoke_dir/agsh" \
+              --output raw -c "$arm64e_source")
+            test "$arm64e_result" = arm64e-preload-ok
+            test "$(cat "$arm64e_marker")" = caller-loaded
+          fi
       - name: Stage release payload
         id: package
         run: |

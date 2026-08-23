@@ -14,7 +14,10 @@ scripts/check-interactive.sh
 `scripts/check.sh` runs release/installer validation, `cargo fmt --check`, all
 workspace tests, Clippy with warnings denied, a locked build, golden checks, the
 Bash differential suite, and the POSIX `sh` differential suite. The interactive
-script builds the binary and runs the PTY emulator suite separately.
+script builds the binary and runs the PTY emulator suite separately. On
+Apple-silicon macOS, the main check also runs x86_64 raw-exec unit tests under
+Rosetta and verifies an x86_64 agsh can hand off to an arm64-only target; CI and
+release gates require the cross target instead of silently skipping it.
 
 ## Test layers
 

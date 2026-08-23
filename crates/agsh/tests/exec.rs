@@ -3863,12 +3863,12 @@ int main(void){char*a[]={"/bin/bash","-c","echo DEEP-TEST-HIT;echo L2;echo L3;ec
         let _ = std::fs::remove_dir_all(&tmp);
         return;
     }
-    let out = isolated_program(&bin, &tmp)
-        .env("DYLD_INSERT_LIBRARIES", &lib)
-        .env("AGSH_SELF", &exe)
-        .env("AGSH_INTERCEPT_MODE", "compact")
+    let source = format!("'{}'", bin.display());
+    let out = isolated_agsh(&tmp, &tmp.join("history.jsonl"))
+        .env("AGSH_INTERCEPT", "compact:deep")
+        .args(["--output", "raw", "-c", &source])
         .output()
-        .expect("run harness");
+        .expect("run harness through agsh's raw-exec boundary");
     let text = String::from_utf8_lossy(&out.stdout);
     let _ = std::fs::remove_dir_all(&tmp);
     // Routed through agsh --observe: the marker survives AND the compact-summary
@@ -3878,6 +3878,226 @@ int main(void){char*a[]={"/bin/bash","-c","echo DEEP-TEST-HIT;echo L2;echo L3;ec
         text.contains("[ok]"),
         "absolute-path exec was not intercepted (no compact framing):\n{text}"
     );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn deep_intercept_keeps_arm64e_capability_system_tools_launchable() {
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agsh"));
+    let lib = exe
+        .parent()
+        .expect("agsh binary directory")
+        .join("libagsh_intercept.dylib");
+    if !interposer_fixture_available(&lib) {
+        return;
+    }
+
+    let base = history_test_dir("deep_arm64e_lib64_target");
+    let history = base.join("history.jsonl");
+    let header = isolated_program("/usr/bin/otool", &base)
+        .args(["-arch", "arm64e", "-hv", "/usr/bin/wc"])
+        .output()
+        .expect("inspect system wc architecture");
+    assert!(header.status.success(), "stderr={:?}", header.stderr);
+    let header = String::from_utf8_lossy(&header.stdout);
+    assert!(
+        header.lines().any(|line| line.contains("ARM64")
+            && line.split_whitespace().any(|field| field == "E")
+            && line
+                .split_whitespace()
+                .any(|field| matches!(field, "LIB64" | "USR00"))),
+        "system wc is no longer an arm64e capability-bit regression fixture:\n{header}"
+    );
+
+    let output = isolated_agsh(&base, &history)
+        .env("AGSH_INTERCEPT", "semantic:deep")
+        .args([
+            "--output",
+            "raw",
+            "-c",
+            "printf 'system-arm64e-ok\\n' | /usr/bin/wc -l",
+        ])
+        .output()
+        .expect("run arm64e+LIB64 system executable under deep interception");
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1");
+    assert!(output.stderr.is_empty(), "stderr={:?}", output.stderr);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn deep_intercept_sanitizes_arm64e_targets_without_claiming_caller_preloads() {
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agsh"));
+    let lib = exe
+        .parent()
+        .expect("agsh binary directory")
+        .join("libagsh_intercept.dylib");
+    if !interposer_fixture_available(&lib) {
+        return;
+    }
+
+    let base = history_test_dir("deep_arm64e_preload");
+    let history = base.join("history.jsonl");
+    let caller_source = base.join("caller.c");
+    let target_source = base.join("target.c");
+    let caller = base.join("caller-arm64e.dylib");
+    let same_name_directory = base.join("caller");
+    std::fs::create_dir(&same_name_directory).expect("create same-name caller directory");
+    let same_name_caller = same_name_directory.join("libagsh_intercept.dylib");
+    let target = base.join("arm64e-target");
+    std::fs::write(
+        &caller_source,
+        r#"#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+__attribute__((constructor)) static void loaded(void) {
+  const char *marker = getenv("AGSH_CALLER_MARKER");
+  if (marker == NULL) return;
+  int fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) return;
+  const char value[] = "caller-loaded\n";
+  (void)write(fd, value, sizeof(value) - 1);
+  (void)close(fd);
+}
+"#,
+    )
+    .expect("write arm64e caller source");
+    std::fs::write(
+        &target_source,
+        r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+extern char **environ;
+int main(void) {
+  const char *transport = "AGSH_INTERNAL_EXEC_DYLD_V1_";
+  for (char **entry = environ; *entry != NULL; entry++) {
+    if (strncmp(*entry, transport, strlen(transport)) == 0) return 3;
+  }
+  const char *insert = getenv("DYLD_INSERT_LIBRARIES");
+  const char *expected = getenv("EXPECTED_PRELOAD");
+  if (insert == NULL || expected == NULL || strcmp(insert, expected) != 0) return 4;
+  const char *marker = getenv("AGSH_CALLER_MARKER");
+  if (marker == NULL) return 5;
+  FILE *file = fopen(marker, "r");
+  if (file == NULL) return 6;
+  char value[32] = {0};
+  if (fgets(value, sizeof(value), file) == NULL) return 7;
+  if (fclose(file) != 0 || strcmp(value, "caller-loaded\n") != 0) return 8;
+  puts("arm64e-preload-ok");
+  return 0;
+}
+"#,
+    )
+    .expect("write arm64e target source");
+
+    for output in [&caller, &same_name_caller] {
+        let compile = isolated_program("cc", &base)
+            .args(["-arch", "arm64e", "-dynamiclib", "-o"])
+            .arg(output)
+            .arg(&caller_source)
+            .output()
+            .expect("compile arm64e caller library");
+        assert!(
+            compile.status.success(),
+            "cc arm64e caller {}: {}",
+            output.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+    let compile = isolated_program("cc", &base)
+        .args(["-arch", "arm64e", "-o"])
+        .arg(&target)
+        .arg(&target_source)
+        .output()
+        .expect("compile arm64e target");
+    assert!(
+        compile.status.success(),
+        "cc arm64e target: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    for (case, preload, include_managed, self_assignment) in [
+        ("managed-prefix", &caller, true, ""),
+        (
+            "managed-self-override",
+            &caller,
+            true,
+            "AGSH_SELF='/caller/override' ",
+        ),
+        ("managed-self-empty", &caller, true, "AGSH_SELF='' "),
+        ("caller-same-name", &same_name_caller, false, ""),
+    ] {
+        let marker = base.join(format!("{case}.marker"));
+        let dyld = if include_managed {
+            format!("{}:{}", lib.display(), preload.display())
+        } else {
+            preload.display().to_string()
+        };
+        let source = format!(
+            "{self_assignment}DYLD_INSERT_LIBRARIES='{dyld}' EXPECTED_PRELOAD='{}' \
+             AGSH_CALLER_MARKER='{}' '{}'",
+            preload.display(),
+            marker.display(),
+            target.display()
+        );
+        let output = isolated_agsh(&base, &history)
+            .env("AGSH_INTERCEPT", "semantic:deep")
+            .args(["--output", "raw", "-c", &source])
+            .output()
+            .unwrap_or_else(|error| panic!("run {case} arm64e preload probe: {error}"));
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "case={case} stderr={:?}",
+            output.stderr
+        );
+        assert_eq!(output.stdout, b"arm64e-preload-ok\n", "case={case}");
+        assert!(
+            output.stderr.is_empty(),
+            "case={case} stderr={:?}",
+            output.stderr
+        );
+        assert_eq!(
+            std::fs::read(&marker).expect("read caller constructor marker"),
+            b"caller-loaded\n",
+            "case={case}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn deep_intercept_keeps_arm64e_interpreter_scripts_launchable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agsh"));
+    let lib = exe
+        .parent()
+        .expect("agsh binary directory")
+        .join("libagsh_intercept.dylib");
+    if !interposer_fixture_available(&lib) {
+        return;
+    }
+
+    let base = history_test_dir("deep_arm64e_script");
+    let history = base.join("history.jsonl");
+    let script = base.join("script");
+    std::fs::write(&script, b"#!/bin/sh\nprintf 'arm64e-script-ok\\n'\n")
+        .expect("write interpreter script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+        .expect("make interpreter script executable");
+    let source = format!("'{}'", script.display());
+    let output = isolated_agsh(&base, &history)
+        .env("AGSH_INTERCEPT", "semantic:deep")
+        .args(["--output", "raw", "-c", &source])
+        .output()
+        .expect("run interpreter script under deep interception");
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert_eq!(output.stdout, b"arm64e-script-ok\n");
+    assert!(output.stderr.is_empty(), "stderr={:?}", output.stderr);
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

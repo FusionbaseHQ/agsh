@@ -178,6 +178,18 @@ lines per invocation (1 MiB per input line), and grep scans at most the hard
 > enforcement must use `confine`, never interception coverage. Prebuilt Linux
 > archives ship a glibc interposer beside the otherwise static-musl `agsh` binary;
 > musl-only systems retain PATH-shim interception but cannot load that `.so`.
+> On macOS, the raw-exec helper forwards agsh's architecture-specific interposer
+> only when a bounded Mach-O-header read advertises a compatible target slice. This
+> covers both ordinary-arm64 versus arm64e on Apple silicon and x86_64 agsh
+> handing off through Rosetta to an arm-only target. Scripts, cross-architecture
+> or unrecognized images, unreadable files, and unknown CPU subtypes run normally
+> without agsh's managed preload entry.
+> Unrelated caller preloads remain byte-for-byte intact, while that subtree keeps
+> PATH-shim coverage but not deep interception. The managed path is derived from
+> the running helper's trusted install layout, not mutable target variables such
+> as `AGSH_SELF`. This bounded header classification is an
+> execution-compatibility check, not a security decision, and a target can still
+> race between inspection and `execve`.
 >
 > Executable text entered through agsh's explicit ENOEXEC `/bin/sh` fallback is
 > kept inside one raw observation subtree. `AGSH_INTERCEPT_ACTIVE=1` prevents

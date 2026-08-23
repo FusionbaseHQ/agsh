@@ -7,6 +7,7 @@ cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --locked
+scripts/check-rosetta.sh
 echo "== golden checks =="
 python3 tests/checks/run.py
 echo "== differential (vs ${REF:-bash}) =="

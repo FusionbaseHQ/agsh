@@ -59,6 +59,13 @@ grep -F -q -- 'test "$("$bin" --version)" = "agsh $expected_version"' "$workflow
 grep -F -q -- 'Smoke test hardened macOS helper boundary' "$workflow"
 grep -F -q -- 'AGSH_INTERNAL_EXEC_DYLD_V1_' "$workflow"
 grep -F -q -- 'test "$result" = hardened-transport-ok' "$workflow"
+grep -F -q -- "otool -arch arm64e -hv /usr/bin/wc" "$workflow"
+grep -F -q -- "system_wc_result=" "$workflow"
+grep -F -q -- 'cc -arch arm64e -dynamiclib' "$workflow"
+grep -F -q -- 'test "$arm64e_result" = arm64e-preload-ok' "$workflow"
+grep -F -q -- 'test "$(cat "$arm64e_marker")" = caller-loaded' "$workflow"
+grep -F -q -- 'AGSH_REQUIRE_ROSETTA_CHECK=1 scripts/check-rosetta.sh' "$workflow"
+grep -F -q -- 'scripts/check-rosetta.sh' "$ROOT/scripts/check.sh"
 if grep -F -q -- 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER' "$workflow" ||
     grep -F -q -- 'CARGO_TARGET_$(echo' "$workflow"
 then
