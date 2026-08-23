@@ -55,8 +55,9 @@ release-integrity work required to ship them.
 - Route agsh-managed direct external launches through a version-coupled
   raw-`execve` helper so malformed executable images cannot become implicit
   shell source; preserve explicit shebang-less text fallback, byte-exact Unix
-  arguments, raw pipe/redirection bytes, PTY behavior, macOS `DYLD_*` target
-  bindings across hardened helper/supervisor boundaries, and status 126 across
+  arguments, raw pipe/redirection bytes, default SIGPIPE behavior, PTY behavior,
+  one raw deep-interception subtree for executable-text fallback, macOS `DYLD_*`
+  target bindings across hardened helper/supervisor boundaries, and status 126 across
   normal, pipeline, PTY, `exec`, snapshot, session-resume, and kept-job routes.
 - Resolve PATH executables using effective-ID access checks, continue past an
   inaccessible earlier candidate, revalidate cached paths after permission
@@ -217,8 +218,8 @@ commands without giving up shell-native storage.
   bypassing it. Proxy (default, runs the real shell), native-interpret
   (`:native`), and a deep exec-interposition layer (`:deep`) that also catches
   absolute-path `/bin/bash` and `posix_spawn` via
-  `DYLD_INSERT_LIBRARIES`/`LD_PRELOAD`. The deep layer is the new, isolated
-  `agsh-intercept` crate — the single first-party `unsafe` exception.
+  `DYLD_INSERT_LIBRARIES`/`LD_PRELOAD`. The deep layer is the isolated
+  `agsh-intercept` crate, one of two executable-boundary `unsafe` exceptions.
 - **`sessions`** now shows each session's folder; namespaced `mode:<aspect>`
   builtin.
 
@@ -315,8 +316,9 @@ POSIX-inspired pre-1.0 shell written in Rust for both humans and AI coding agent
     Java, Ruby, Shell, SQL, Lua, and config formats.
 
 ### Quality
-- `unsafe` is forbidden across all first-party crates except the isolated,
-  optional `agsh-intercept` preload library, whose platform FFI requires it.
+- `unsafe` is forbidden across ordinary first-party crates. Executable-boundary
+  operations are isolated in the optional `agsh-intercept` FFI library and the
+  one-call `agsh-signal` SIGPIPE reset wrapper.
 - Regression tests cover 2,000-deep adversarial parser/executor inputs, and
   security decisions remain deterministic.
 - Hardened via a multi-agent audit: recursion-depth guards make deeply nested

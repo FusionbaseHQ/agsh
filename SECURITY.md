@@ -31,9 +31,10 @@ Of particular interest:
   (writes/network/exec/secret reads), or a case where `confine` runs a payload
   *unconfined* instead of failing closed.
 - Stream-corruption bugs where piped/redirected bytes are altered.
-- Parser/executor crashes or memory-safety issues. `unsafe` is forbidden in all
-  first-party crates except the isolated, optional `agsh-intercept` preload
-  library.
+- Parser/executor crashes or memory-safety issues. `unsafe` is forbidden in
+  ordinary first-party crates; executable-boundary operations are isolated in
+  the optional `agsh-intercept` preload library and the one-call `agsh-signal`
+  SIGPIPE reset wrapper.
 
 ## Non-goals
 

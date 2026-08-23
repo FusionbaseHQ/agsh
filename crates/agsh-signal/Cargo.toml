@@ -1,0 +1,18 @@
+[package]
+name = "agsh-signal"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "Minimal Unix signal-disposition boundary for agsh launch helpers."
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc = "0.2"
+
+# This crate is the narrow process-boundary exception to the workspace-wide
+# unsafe ban. Its public API contains one audited SIGPIPE reset.

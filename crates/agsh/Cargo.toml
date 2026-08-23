@@ -21,6 +21,7 @@ agsh-core = { path = "../agsh-core" }
 agsh-exec = { path = "../agsh-exec" }
 agsh-output = { path = "../agsh-output" }
 agsh-policy = { path = "../agsh-policy" }
+agsh-signal = { path = "../agsh-signal" }
 agsh-tty = { path = "../agsh-tty" }
 nix = { version = "0.25.1", default-features = false, features = ["process"] }
 rustix = { version = "1.1.4", features = ["fs"] }

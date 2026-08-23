@@ -178,6 +178,13 @@ lines per invocation (1 MiB per input line), and grep scans at most the hard
 > enforcement must use `confine`, never interception coverage. Prebuilt Linux
 > archives ship a glibc interposer beside the otherwise static-musl `agsh` binary;
 > musl-only systems retain PATH-shim interception but cannot load that `.so`.
+>
+> Executable text entered through agsh's explicit ENOEXEC `/bin/sh` fallback is
+> kept inside one raw observation subtree. `AGSH_INTERCEPT_ACTIVE=1` prevents
+> `:deep` re-entry throughout that subtree so pipes and redirects retain exact
+> bytes; an absolute shell launched from that fallback is therefore not observed
+> again. This is a documented experimental interception gap, not a security
+> boundary.
 
 On macOS, names beginning `AGSH_INTERNAL_EXEC_DYLD_V1_` are reserved for the
 private hardened-helper environment transport. agsh removes caller-provided

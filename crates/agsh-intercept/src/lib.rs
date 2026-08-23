@@ -22,8 +22,9 @@
 //! `LD_PRELOAD` is ignored by static binaries and across setuid execs. Those cases
 //! fall back to the (still active) PATH shims.
 //!
-//! This crate is the single, isolated `unsafe` exception in the workspace; it does
-//! not opt into the `unsafe_code = "forbid"` lint. Everything else stays unsafe-free.
+//! This crate is one of two isolated executable-boundary `unsafe` exceptions in
+//! the workspace; it does not opt into the `unsafe_code = "forbid"` lint. The
+//! other is the one-call SIGPIPE reset wrapper in `agsh-signal`.
 
 #![cfg(unix)]
 

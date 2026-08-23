@@ -216,6 +216,11 @@ install -m755 "target/release/libagsh_intercept.$ext" ~/.local/bin/
 agsh
 ```
 
+Supported packages and source installs keep the version-coupled
+`agsh-exec-helper` beside `agsh`. A clean `cargo run` or a copied development
+binary uses the same embedded fallback path, while release artifacts always
+ship and smoke-test the dedicated helper.
+
 Then take it for a spin:
 
 ```sh
@@ -349,9 +354,10 @@ CI runs all of the above on Linux and macOS
 
 ## 🦀 Safe by construction
 
-`unsafe` is **forbidden** in every first-party crate except the optional
-`agsh-intercept` preload shim, which isolates the required FFI and is never
-linked into the shell. The PTY broker itself remains safe Rust. The parser and
+`unsafe` is **forbidden** in ordinary first-party crates. The optional
+`agsh-intercept` preload shim isolates exec-family FFI and is never linked into
+the shell; `agsh-signal` isolates the one required SIGPIPE disposition reset.
+The PTY broker itself remains safe Rust. The parser and
 executor have regression coverage for deeply nested adversarial inputs, and
 security behavior is deterministic by design: no LLM ever makes a sandboxing
 decision.

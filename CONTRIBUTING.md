@@ -30,9 +30,10 @@ python3 tests/interactive/run.py                  # PTY editor/completion/render
 
 ## Ground rules
 
-- **No `unsafe`** in first-party crates — the workspace forbids it (dependencies may
-  use it). The sole exception is `agsh-intercept`, the optional preload interposer,
-  which needs libc FFI and is deliberately isolated; don't add `unsafe` elsewhere.
+- **No new `unsafe`** in ordinary first-party crates — the workspace forbids it
+  (dependencies may use it). Existing executable-boundary operations are isolated
+  in `agsh-intercept` and the one-call `agsh-signal` wrapper; don't expand those
+  exceptions without an explicit design and security review.
 - **Never corrupt raw streams.** Pipes and redirects must receive exact bytes;
   rich rendering and native accelerations are opt-in and TTY-gated.
 - **Every bug fix adds a regression test.**

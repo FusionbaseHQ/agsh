@@ -18,6 +18,7 @@ dependencies = [
  "agsh-exec",
  "agsh-output",
  "agsh-policy",
+ "agsh-signal",
  "agsh-tty",
  "nix",
  "rustix",
@@ -119,6 +120,13 @@ dependencies = [
  "image",
  "rustix",
  "serde_json",
+]
+
+[[package]]
+name = "agsh-signal"
+version = "0.2.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

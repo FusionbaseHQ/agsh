@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -129,6 +131,10 @@ fn main() {
             eprintln!("agsh: {error}");
             std::process::exit(1);
         }
+        if let Err(error) = agsh_signal::reset_sigpipe_default_for_exec() {
+            eprintln!("agsh: supervise: cannot restore SIGPIPE disposition: {error}");
+            std::process::exit(126);
+        }
         let error = raw_exec::execve_with_text_fallback(&argv);
         report_exec_failure("supervise", &argv, &error);
     }
@@ -143,8 +149,7 @@ fn main() {
 
     if let Ok(exe) = std::env::current_exe() {
         agsh_exec::set_capture_drain_helper(exe.clone());
-        let standalone =
-            exe.with_file_name(format!("agsh-exec-helper{}", std::env::consts::EXE_SUFFIX));
+        let standalone = exec_helper_beside(&exe);
         let exec_helper = if standalone.is_file() {
             standalone
         } else {
@@ -572,10 +577,14 @@ fn collect_cli_args() -> Result<Vec<String>, String> {
         .collect()
 }
 
-/// The fallback launch helper is handled before UTF-8 CLI decoding so resolved
-/// Unix paths and arguments cross the extra exec boundary byte-for-byte. A
-/// normal installation uses the small sibling binary; this private mode keeps
-/// copied development binaries correct when that sibling is unavailable.
+fn exec_helper_beside(executable: &Path) -> PathBuf {
+    executable.with_file_name(format!("agsh-exec-helper{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// Handle the in-binary development fallback before UTF-8 CLI decoding so
+/// resolved Unix paths and arguments cross the exec boundary byte-for-byte.
+/// Supported releases install the smaller sibling helper; this mode keeps a
+/// clean `cargo run -p agsh` and copied development binaries functional.
 fn run_internal_exec_helper_if_requested() {
     use std::ffi::{OsStr, OsString};
 
@@ -586,6 +595,10 @@ fn run_internal_exec_helper_if_requested() {
     if arguments.next().as_deref() != Some(OsStr::new("--")) {
         eprintln!("agsh: exec helper: invalid internal invocation");
         std::process::exit(2);
+    }
+    if let Err(error) = agsh_signal::reset_sigpipe_default_for_exec() {
+        eprintln!("agsh: exec helper: cannot restore SIGPIPE disposition: {error}");
+        std::process::exit(126);
     }
     let argv: Vec<OsString> = arguments.collect();
     let error = raw_exec::execve_with_text_fallback(&argv);

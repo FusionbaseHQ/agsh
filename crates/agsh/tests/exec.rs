@@ -64,6 +64,20 @@ fn isolated_program(program: impl AsRef<OsStr>, base: &Path) -> Command {
     command
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn interposer_fixture_available(path: &Path) -> bool {
+    if path.exists() {
+        return true;
+    }
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "CI built the workspace but the interposer fixture is missing: {}",
+        path.display()
+    );
+    eprintln!("skip: interposer library not built");
+    false
+}
+
 fn isolated_agsh(base: &Path, history_file: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agsh"));
     isolate_command_environment(&mut command, base, history_file);
@@ -3776,8 +3790,7 @@ fn deep_intercept_catches_absolute_path_shell() {
     let exe = std::path::PathBuf::from(env!("CARGO_BIN_EXE_agsh"));
     let dir = exe.parent().unwrap();
     let lib = dir.join("libagsh_intercept.dylib");
-    if !lib.exists() {
-        eprintln!("skip: interposer dylib not built");
+    if !interposer_fixture_available(&lib) {
         return;
     }
     let tmp = std::env::temp_dir().join(format!("agsh_deep_{}", std::process::id()));
@@ -3818,25 +3831,33 @@ int main(void){char*a[]={"/bin/bash","-c","echo DEEP-TEST-HIT;echo L2;echo L3;ec
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn deep_intercept_preserves_shebangless_text_fallback_bytes() {
     use std::os::unix::fs::PermissionsExt;
 
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_agsh"));
+    let extension = if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
     let lib = exe
         .parent()
         .expect("agsh binary directory")
-        .join("libagsh_intercept.dylib");
-    if !lib.exists() {
-        eprintln!("skip: interposer dylib not built");
+        .join(format!("libagsh_intercept.{extension}"));
+    if !interposer_fixture_available(&lib) {
         return;
     }
 
     let base = history_test_dir("deep_text_fallback");
     let history = base.join("history.jsonl");
     let script = base.join("text-script");
-    std::fs::write(&script, b"printf 'PAYLOAD\\n'\n").expect("write text executable");
+    std::fs::write(
+        &script,
+        b"if [ \"$AGSH_INTERCEPT_ACTIVE\" != 1 ]; then printf 'missing raw fallback boundary\\n' >&2; exit 91; fi\nprintf 'PAYLOAD\\n'\n",
+    )
+    .expect("write text executable");
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
         .expect("make text executable");
 
@@ -3867,6 +3888,50 @@ fn deep_intercept_preserves_shebangless_text_fallback_bytes() {
     let _ = std::fs::remove_dir_all(base);
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn deep_intercept_keeps_text_fallback_subtree_raw() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agsh"));
+    let extension = if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
+    let lib = exe
+        .parent()
+        .expect("agsh binary directory")
+        .join(format!("libagsh_intercept.{extension}"));
+    if !interposer_fixture_available(&lib) {
+        return;
+    }
+
+    let base = history_test_dir("deep_text_reentry");
+    let history = base.join("history.jsonl");
+    let script = base.join("text-script");
+    std::fs::write(
+        &script,
+        b"exec /bin/bash -c 'echo DEEP-REENTER; echo L2; echo L3; echo L4; echo L5'\n",
+    )
+    .expect("write text executable");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+        .expect("make text executable");
+
+    let output = isolated_agsh(&base, &history)
+        .env("AGSH_INTERCEPT", "semantic:deep")
+        .args(["--output", "raw", "-c", script.to_str().unwrap()])
+        .output()
+        .expect("run nested shell after text fallback bootstrap");
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout, "DEEP-REENTER\nL2\nL3\nL4\nL5\n");
+    assert!(!stdout.contains("\"family\":"), "stdout={stdout}");
+    assert!(output.stderr.is_empty(), "stderr={:?}", output.stderr);
+
+    let _ = std::fs::remove_dir_all(base);
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn hardened_exec_helper_preserves_target_dyld_environment() {
@@ -3876,8 +3941,7 @@ fn hardened_exec_helper_preserves_target_dyld_environment() {
         .parent()
         .expect("agsh binary directory")
         .join("libagsh_intercept.dylib");
-    if !library.exists() {
-        eprintln!("skip: interposer dylib not built");
+    if !interposer_fixture_available(&library) {
         return;
     }
 
@@ -3910,11 +3974,14 @@ fn hardened_exec_helper_preserves_target_dyld_environment() {
     let probe = base.join("dyld-probe");
     std::fs::write(
         &probe_source,
-        r#"#include <stdio.h>
+        r#"#include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 extern char **environ;
 int main(void) {
+  struct sigaction action;
+  if (sigaction(SIGPIPE, NULL, &action) != 0 || action.sa_handler != SIG_DFL) return 2;
   const char *prefix = "AGSH_INTERNAL_EXEC_DYLD_V1_";
   for (char **entry = environ; *entry != NULL; entry++) {
     if (strncmp(*entry, prefix, strlen(prefix)) == 0) return 3;

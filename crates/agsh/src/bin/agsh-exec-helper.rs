@@ -5,6 +5,10 @@ use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 fn main() {
+    if let Err(error) = agsh_signal::reset_sigpipe_default_for_exec() {
+        eprintln!("agsh-exec-helper: cannot restore SIGPIPE disposition: {error}");
+        std::process::exit(126);
+    }
     let mut arguments = std::env::args_os().skip(1);
     let first = arguments.next();
     if first.as_deref() == Some(OsStr::new("--version")) {

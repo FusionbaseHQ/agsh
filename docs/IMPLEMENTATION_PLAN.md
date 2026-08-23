@@ -77,6 +77,10 @@ confinement and the authenticated agent server are not implemented. See
   with hardened ad-hoc signatures before Developer ID signing.
   `AGSH_INTERNAL_EXEC_DYLD_V1_*` is reserved for that private macOS transport
   and is removed from target environments; applications must not use the prefix.
+  Under experimental deep interception, executable text entered through the
+  helper's explicit ENOEXEC `/bin/sh` fallback stays within one raw subtree via
+  `AGSH_INTERCEPT_ACTIVE=1`. Absolute shell launches in that subtree are not
+  observed again, preserving byte-exact pipe and redirect behavior.
   This does not rewrite the semantics of an explicitly invoked interpreter.
   In particular, the current macOS strict-confinement backend enters its bounded
   sandbox through `/bin/sh -c`; commands nested inside that interpreter retain

@@ -432,6 +432,18 @@ fn copied_shell_falls_back_to_its_private_exec_helper_mode() {
         output.stderr
     );
 
+    let output = isolated_agsh_at(&base, &copied_shell)
+        .args(["-c", "seq 100000 | head -1; echo ok"])
+        .output()
+        .expect("run copied agsh early-closing pipeline");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"1\nok\n");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("Broken pipe"),
+        "copied shell leaked a broken-pipe diagnostic: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
     let invalid = base.join("invalid-image");
     let mut image = b"\x7fELF\x02".to_vec();
     image.resize(64, b'X');

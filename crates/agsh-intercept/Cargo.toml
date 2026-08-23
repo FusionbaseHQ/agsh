@@ -13,8 +13,8 @@ publish.workspace = true
 
 # A preloadable shared library. NOTE: this crate intentionally uses `unsafe` FFI
 # (execve/posix_spawn interposition) and therefore does NOT opt into the
-# workspace `unsafe_code = "forbid"` lint. It is the single, isolated exception;
-# all other first-party crates remain unsafe-free.
+# workspace `unsafe_code = "forbid"` lint. It and the one-call `agsh-signal`
+# wrapper are the two isolated executable-boundary exceptions.
 [lib]
 crate-type = ["cdylib"]
 

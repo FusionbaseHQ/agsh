@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsString};
 use std::fs::File;
@@ -20,10 +22,10 @@ pub fn execve_with_text_fallback(argv: &[OsString]) -> io::Error {
     };
     // A preload interposer may already be loaded in this helper (notably on
     // Linux and in unsigned development builds). Make its hook pass through our
-    // raw exec calls, but give the target the exact environment snapshot from
-    // before this private marker was set. Hardened macOS launches restore
-    // transported DYLD bindings in that snapshot. The target's own descendants
-    // therefore remain eligible for interception.
+    // raw exec calls, but give the direct target the exact environment snapshot
+    // from before this process-local boundary was set. Hardened macOS launches
+    // restore transported DYLD bindings in that snapshot. The bounded ENOEXEC
+    // text fallback below extends the boundary only when raw bytes require it.
     std::env::set_var("AGSH_INTERCEPT_ACTIVE", "1");
 
     let error = execve_once(argv, &environment);
@@ -42,7 +44,59 @@ pub fn execve_with_text_fallback(argv: &[OsString]) -> io::Error {
     shell_argv.push(OsString::from("/bin/sh"));
     shell_argv.push(program.clone());
     shell_argv.extend(argv.iter().skip(1).cloned());
-    execve_once(&shell_argv, &environment)
+    let fallback_environment = text_fallback_environment(&environment);
+    execve_once(&shell_argv, &fallback_environment)
+}
+
+/// Keep the explicit `/bin/sh` fallback and its descendants inside the raw
+/// observation boundary. In deep-interception mode, macOS may re-exec its shell
+/// bootstrap before reading the text file; allowing that transition to be
+/// observed would compact bytes intended for a pipe or redirect.
+fn text_fallback_environment(environment: &[CString]) -> Vec<CString> {
+    let active_prefix = b"AGSH_INTERCEPT_ACTIVE=";
+    let mut fallback = environment.to_vec();
+    if environment
+        .iter()
+        .any(|binding| binding.as_bytes().starts_with(active_prefix))
+    {
+        return fallback;
+    }
+
+    if deep_intercept_environment(environment) {
+        fallback.push(CString::new("AGSH_INTERCEPT_ACTIVE=1").unwrap());
+    }
+    fallback
+}
+
+fn deep_intercept_environment(environment: &[CString]) -> bool {
+    let has_binding = |prefix: &[u8]| {
+        environment
+            .iter()
+            .any(|binding| binding.as_bytes().starts_with(prefix))
+    };
+    let has_interposer = environment.iter().any(|binding| {
+        [
+            b"DYLD_INSERT_LIBRARIES=".as_slice(),
+            b"LD_PRELOAD=".as_slice(),
+        ]
+        .iter()
+        .find_map(|prefix| binding.as_bytes().strip_prefix(*prefix))
+        .is_some_and(preload_contains_agsh_interposer)
+    });
+    has_binding(b"AGSH_SELF=") && has_interposer
+}
+
+fn preload_contains_agsh_interposer(value: &[u8]) -> bool {
+    value
+        .split(|byte| *byte == b':' || byte.is_ascii_whitespace())
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| entry.rsplit(|byte| *byte == b'/').next())
+        .any(|basename| {
+            matches!(
+                basename,
+                b"libagsh_intercept.dylib" | b"libagsh_intercept.so"
+            )
+        })
 }
 
 fn encoded_environment() -> io::Result<Vec<CString>> {
@@ -221,4 +275,71 @@ fn has_native_executable_magic(prefix: &[u8]) -> bool {
                 | b"\xbf\xba\xfe\xca"
         )
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_fallback_preserves_an_existing_observation_boundary() {
+        let environment = [
+            CString::new("PATH=/bin").unwrap(),
+            CString::new("AGSH_INTERCEPT_ACTIVE=1").unwrap(),
+        ];
+        let fallback = text_fallback_environment(&environment);
+        let bindings = fallback
+            .iter()
+            .map(|binding| binding.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(bindings
+            .iter()
+            .any(|binding| binding == "AGSH_INTERCEPT_ACTIVE=1"));
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|binding| binding.starts_with("AGSH_INTERCEPT_ACTIVE="))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn text_fallback_keeps_an_active_deep_subtree_raw() {
+        let environment = [
+            CString::new("PATH=/bin").unwrap(),
+            CString::new("AGSH_SELF=/tmp/agsh").unwrap(),
+            CString::new(if cfg!(target_os = "macos") {
+                "DYLD_INSERT_LIBRARIES=/tmp/libagsh_intercept.dylib"
+            } else {
+                "LD_PRELOAD=/tmp/libagsh_intercept.so"
+            })
+            .unwrap(),
+        ];
+        let fallback = text_fallback_environment(&environment);
+        assert!(fallback
+            .iter()
+            .any(|binding| binding.to_bytes() == b"AGSH_INTERCEPT_ACTIVE=1"));
+    }
+
+    #[test]
+    fn text_fallback_does_not_mark_an_ordinary_target_as_active() {
+        let environment = [CString::new("PATH=/bin").unwrap()];
+        let fallback = text_fallback_environment(&environment);
+        assert!(!fallback
+            .iter()
+            .any(|binding| binding.as_bytes().starts_with(b"AGSH_INTERCEPT_ACTIVE=")));
+    }
+
+    #[test]
+    fn text_fallback_does_not_match_a_similarly_named_preload_library() {
+        let environment = [
+            CString::new("AGSH_SELF=/tmp/agsh").unwrap(),
+            CString::new("LD_PRELOAD=/tmp/libagsh_intercept_backup.so").unwrap(),
+        ];
+        let fallback = text_fallback_environment(&environment);
+        assert!(!fallback
+            .iter()
+            .any(|binding| binding.as_bytes().starts_with(b"AGSH_INTERCEPT_ACTIVE=")));
+    }
 }
