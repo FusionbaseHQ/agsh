@@ -104,9 +104,13 @@ grep -F -q -- 'AGSH_INTERNAL_EXEC_DYLD_V1_' "$workflow"
 grep -F -q -- 'test "$result" = hardened-transport-ok' "$workflow"
 grep -F -q -- "otool -arch arm64e -hv /usr/bin/wc" "$workflow"
 grep -F -q -- "system_wc_result=" "$workflow"
-grep -F -q -- 'cc -arch arm64e -dynamiclib' "$workflow"
-grep -F -q -- 'test "$arm64e_result" = arm64e-preload-ok' "$workflow"
-grep -F -q -- 'test "$(cat "$arm64e_marker")" = caller-loaded' "$workflow"
+grep -F -q -- 'cc -arch x86_64 -dynamiclib' "$workflow"
+grep -F -q -- 'test "$cross_arch_result" = cross-arch-preload-ok' "$workflow"
+grep -F -q -- 'test "$(cat "$cross_arch_marker")" = caller-loaded' "$workflow"
+if grep -F -q -- 'cc -arch arm64e -dynamiclib' "$workflow"; then
+    printf '%s\n' 'release tests: release smoke still builds a non-platform arm64e preload fixture' >&2
+    exit 1
+fi
 grep -F -q -- 'AGSH_REQUIRE_ROSETTA_CHECK=1 scripts/check-rosetta.sh' "$workflow"
 grep -F -q -- 'scripts/check-rosetta.sh' "$ROOT/scripts/check.sh"
 if grep -F -q -- 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER' "$workflow" ||

@@ -154,6 +154,9 @@ release-integrity work required to ship them.
 - Exercise offline installer packaging independently for Linux and Darwin in
   both CI and the release gate, including exact target archive, `.so`/`.dylib`,
   and platform-license membership.
+- Exercise macOS loader hardening with a real system arm64e executable and a
+  supported x86_64/Rosetta handoff, avoiding non-platform preview-ABI arm64e
+  libraries that macOS 15 may reject before process startup.
 
 ### Session resilience and developer experience
 

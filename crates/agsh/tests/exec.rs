@@ -3927,7 +3927,7 @@ fn deep_intercept_keeps_arm64e_capability_system_tools_launchable() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn deep_intercept_sanitizes_arm64e_targets_without_claiming_caller_preloads() {
+fn deep_intercept_sanitizes_cross_arch_targets_without_claiming_caller_preloads() {
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_agsh"));
     let lib = exe
         .parent()
@@ -3937,15 +3937,29 @@ fn deep_intercept_sanitizes_arm64e_targets_without_claiming_caller_preloads() {
         return;
     }
 
-    let base = history_test_dir("deep_arm64e_preload");
+    let base = history_test_dir("deep_cross_arch_preload");
+    let rosetta = isolated_program("/usr/bin/arch", &base)
+        .args(["-x86_64", "/usr/bin/true"])
+        .status()
+        .expect("probe Rosetta");
+    if !rosetta.success() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "Rosetta is required for the cross-architecture preload regression test"
+        );
+        eprintln!("skip: Rosetta unavailable");
+        let _ = std::fs::remove_dir_all(base);
+        return;
+    }
+
     let history = base.join("history.jsonl");
     let caller_source = base.join("caller.c");
     let target_source = base.join("target.c");
-    let caller = base.join("caller-arm64e.dylib");
+    let caller = base.join("caller-x86_64.dylib");
     let same_name_directory = base.join("caller");
     std::fs::create_dir(&same_name_directory).expect("create same-name caller directory");
     let same_name_caller = same_name_directory.join("libagsh_intercept.dylib");
-    let target = base.join("arm64e-target");
+    let target = base.join("x86_64-target");
     std::fs::write(
         &caller_source,
         r#"#include <fcntl.h>
@@ -3962,7 +3976,7 @@ __attribute__((constructor)) static void loaded(void) {
 }
 "#,
     )
-    .expect("write arm64e caller source");
+    .expect("write cross-architecture caller source");
     std::fs::write(
         &target_source,
         r#"#include <stdio.h>
@@ -3984,36 +3998,36 @@ int main(void) {
   char value[32] = {0};
   if (fgets(value, sizeof(value), file) == NULL) return 7;
   if (fclose(file) != 0 || strcmp(value, "caller-loaded\n") != 0) return 8;
-  puts("arm64e-preload-ok");
+  puts("cross-arch-preload-ok");
   return 0;
 }
 "#,
     )
-    .expect("write arm64e target source");
+    .expect("write cross-architecture target source");
 
     for output in [&caller, &same_name_caller] {
         let compile = isolated_program("cc", &base)
-            .args(["-arch", "arm64e", "-dynamiclib", "-o"])
+            .args(["-arch", "x86_64", "-dynamiclib", "-o"])
             .arg(output)
             .arg(&caller_source)
             .output()
-            .expect("compile arm64e caller library");
+            .expect("compile cross-architecture caller library");
         assert!(
             compile.status.success(),
-            "cc arm64e caller {}: {}",
+            "cc cross-architecture caller {}: {}",
             output.display(),
             String::from_utf8_lossy(&compile.stderr)
         );
     }
     let compile = isolated_program("cc", &base)
-        .args(["-arch", "arm64e", "-o"])
+        .args(["-arch", "x86_64", "-o"])
         .arg(&target)
         .arg(&target_source)
         .output()
-        .expect("compile arm64e target");
+        .expect("compile cross-architecture target");
     assert!(
         compile.status.success(),
-        "cc arm64e target: {}",
+        "cc cross-architecture target: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
 
@@ -4045,14 +4059,14 @@ int main(void) {
             .env("AGSH_INTERCEPT", "semantic:deep")
             .args(["--output", "raw", "-c", &source])
             .output()
-            .unwrap_or_else(|error| panic!("run {case} arm64e preload probe: {error}"));
+            .unwrap_or_else(|error| panic!("run {case} cross-architecture preload probe: {error}"));
         assert_eq!(
             output.status.code(),
             Some(0),
             "case={case} stderr={:?}",
             output.stderr
         );
-        assert_eq!(output.stdout, b"arm64e-preload-ok\n", "case={case}");
+        assert_eq!(output.stdout, b"cross-arch-preload-ok\n", "case={case}");
         assert!(
             output.stderr.is_empty(),
             "case={case} stderr={:?}",

@@ -269,13 +269,15 @@ jobs:
               --output raw -c "printf 'system-arm64e-ok\\n' | /usr/bin/wc -l")
             test "$(printf '%s' "$system_wc_result" | tr -d '[:space:]')" = 1
 
-            # The system probe above owns the strict dyld regression. This
-            # non-platform fixture verifies exact caller-preload preservation.
-            arm64e_caller_src="$RUNNER_TEMP/agsh-arm64e-caller.c"
-            arm64e_caller="$RUNNER_TEMP/agsh-arm64e-caller.dylib"
-            arm64e_target_src="$RUNNER_TEMP/agsh-arm64e-target.c"
-            arm64e_target="$RUNNER_TEMP/agsh-arm64e-target"
-            arm64e_marker="$RUNNER_TEMP/agsh-arm64e-caller.marker"
+            # The real system probe above owns the arm64e regression. Rosetta
+            # provides a supported incompatible-architecture handoff for
+            # verifying exact caller-preload preservation.
+            /usr/bin/arch -x86_64 /usr/bin/true
+            cross_arch_caller_src="$RUNNER_TEMP/agsh-x86_64-caller.c"
+            cross_arch_caller="$RUNNER_TEMP/agsh-x86_64-caller.dylib"
+            cross_arch_target_src="$RUNNER_TEMP/agsh-x86_64-target.c"
+            cross_arch_target="$RUNNER_TEMP/agsh-x86_64-target"
+            cross_arch_marker="$RUNNER_TEMP/agsh-x86_64-caller.marker"
             printf '%s\n' \
               '#include <fcntl.h>' \
               '#include <stdlib.h>' \
@@ -288,7 +290,7 @@ jobs:
               '  const char value[] = "caller-loaded\\n";' \
               '  (void)write(fd, value, sizeof(value) - 1);' \
               '  (void)close(fd);' \
-              '}' > "$arm64e_caller_src"
+              '}' > "$cross_arch_caller_src"
             printf '%s\n' \
               '#include <stdio.h>' \
               '#include <stdlib.h>' \
@@ -309,16 +311,16 @@ jobs:
               '  char value[32] = {0};' \
               '  if (fgets(value, sizeof(value), file) == NULL) return 7;' \
               '  if (fclose(file) != 0 || strcmp(value, "caller-loaded\\n") != 0) return 8;' \
-              '  puts("arm64e-preload-ok");' \
+              '  puts("cross-arch-preload-ok");' \
               '  return 0;' \
-              '}' > "$arm64e_target_src"
-            cc -arch arm64e -dynamiclib "$arm64e_caller_src" -o "$arm64e_caller"
-            cc -arch arm64e "$arm64e_target_src" -o "$arm64e_target"
-            arm64e_source="DYLD_INSERT_LIBRARIES='$smoke_dir/${{ matrix.intercept_lib }}:$arm64e_caller' EXPECTED_PRELOAD='$arm64e_caller' AGSH_CALLER_MARKER='$arm64e_marker' '$arm64e_target'"
-            arm64e_result=$(AGSH_INTERCEPT=semantic:deep "$smoke_dir/agsh" \
-              --output raw -c "$arm64e_source")
-            test "$arm64e_result" = arm64e-preload-ok
-            test "$(cat "$arm64e_marker")" = caller-loaded
+              '}' > "$cross_arch_target_src"
+            cc -arch x86_64 -dynamiclib "$cross_arch_caller_src" -o "$cross_arch_caller"
+            cc -arch x86_64 "$cross_arch_target_src" -o "$cross_arch_target"
+            cross_arch_source="DYLD_INSERT_LIBRARIES='$smoke_dir/${{ matrix.intercept_lib }}:$cross_arch_caller' EXPECTED_PRELOAD='$cross_arch_caller' AGSH_CALLER_MARKER='$cross_arch_marker' '$cross_arch_target'"
+            cross_arch_result=$(AGSH_INTERCEPT=semantic:deep "$smoke_dir/agsh" \
+              --output raw -c "$cross_arch_source")
+            test "$cross_arch_result" = cross-arch-preload-ok
+            test "$(cat "$cross_arch_marker")" = caller-loaded
           fi
       - name: Stage release payload
         id: package
