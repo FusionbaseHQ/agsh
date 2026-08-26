@@ -60,6 +60,10 @@ struct CliOptions {
 
 fn main() {
     run_internal_exec_helper_if_requested();
+    if let Err(error) = agsh_signal::reset_sigchld_default_for_shell() {
+        eprintln!("agsh: cannot restore SIGCHLD disposition: {error}");
+        std::process::exit(1);
+    }
     let cli_args = match collect_cli_args() {
         Ok(args) => args,
         Err(message) => {

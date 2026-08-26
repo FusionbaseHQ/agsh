@@ -107,6 +107,10 @@ grep -F -q -- "system_wc_result=" "$workflow"
 grep -F -q -- 'cc -arch x86_64 -dynamiclib' "$workflow"
 grep -F -q -- 'test "$cross_arch_result" = cross-arch-preload-ok' "$workflow"
 grep -F -q -- 'test "$(cat "$cross_arch_marker")" = caller-loaded' "$workflow"
+if grep -F -q -- 'caller-loaded\\n' "$workflow"; then
+    printf '%s\n' 'release tests: generated C fixture writes a literal backslash-n marker' >&2
+    exit 1
+fi
 if grep -F -q -- 'cc -arch arm64e -dynamiclib' "$workflow"; then
     printf '%s\n' 'release tests: release smoke still builds a non-platform arm64e preload fixture' >&2
     exit 1

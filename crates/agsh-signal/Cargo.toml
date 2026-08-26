@@ -5,7 +5,7 @@ rust-version.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
-description = "Minimal Unix signal-disposition boundary for agsh launch helpers."
+description = "Minimal Unix signal-disposition boundary for agsh process entry points."
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
@@ -15,4 +15,4 @@ publish.workspace = true
 libc = "0.2"
 
 # This crate is the narrow process-boundary exception to the workspace-wide
-# unsafe ban. Its public API contains one audited SIGPIPE reset.
+# unsafe ban. Its public API contains audited process-entry disposition resets.

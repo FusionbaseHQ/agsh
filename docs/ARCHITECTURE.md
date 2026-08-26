@@ -10,7 +10,7 @@ crates/
   agsh-exec/     shell state, builtins, executor, expansion, confine sandbox
   agsh-policy/   capabilities, risk analyzer, command allowlist
   agsh-output/   output modes, compaction, token-economy observations
-  agsh-signal/   isolated SIGPIPE reset for raw-exec intermediary paths
+  agsh-signal/   isolated process-entry signal-disposition resets
   agsh-render/   rich rendering: markdown, JSON, CSV, code, images
   agsh-style/    theme, palette, color levels, roles
   agsh-tty/      line editor, completion, history, syntax highlighting
@@ -56,9 +56,10 @@ crates/
 - `unsafe` is **forbidden** throughout the shell and every ordinary first-party
   crate (`unsafe_code = "forbid"`). Two executable-boundary exceptions are
   isolated from shell logic: the optional `agsh-intercept` preload library needs
-  `execve`/`posix_spawn` FFI, and `agsh-signal` wraps one audited `SIGPIPE`
-  disposition reset for raw-exec intermediary entry paths. The interposer is
-  opt-in; the shell reaches the signal operation only through a narrow safe API.
+  `execve`/`posix_spawn` FFI, and `agsh-signal` wraps audited process-entry
+  disposition resets: `SIGPIPE` for raw-exec intermediary paths and `SIGCHLD`
+  before the shell manages children. The interposer is opt-in; the shell reaches
+  the signal operations only through narrow safe APIs.
 - Regression tests cover deeply nested parser/executor inputs that previously
   risked stack exhaustion; security behavior is deterministic.
 - Kernel-backed `confine` presets are fail-closed: without a supported backend

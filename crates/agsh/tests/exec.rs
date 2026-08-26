@@ -134,6 +134,45 @@ fn run_isolated_command(name: &str, source: &str) -> std::process::Output {
     output
 }
 
+#[cfg(unix)]
+#[test]
+fn shell_restores_inherited_sigchld_before_bounded_capture() {
+    use std::os::unix::fs::symlink;
+
+    let base = history_test_dir("inherited_sigchld");
+    let history = base.join("history.jsonl");
+    let bin = base.join("bin");
+    std::fs::create_dir_all(&bin).expect("create fixture bin directory");
+    symlink("/usr/bin/true", bin.join("git")).expect("create fake git symlink");
+
+    // dash clears an ignored SIGCHLD while execing, making this regression
+    // vacuous on Ubuntu. Bash preserves it, matching the hostile inherited
+    // disposition that agsh must normalize itself.
+    let mut command = Command::new("/bin/bash");
+    isolate_command_environment(&mut command, &base, &history);
+    let output = command
+        .env("PATH", &bin)
+        .args([
+            "-c",
+            "trap '' CHLD\nexec \"$1\" -c 'snapshot list'",
+            "bash",
+            env!("CARGO_BIN_EXE_agsh"),
+        ])
+        .output()
+        .expect("run agsh with inherited SIGCHLD ignored");
+
+    assert!(
+        output.status.success(),
+        "status={:?}, stdout={:?}, stderr={:?}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"");
+    assert_eq!(output.stderr, b"");
+    std::fs::remove_dir_all(base).expect("remove test directory");
+}
+
 fn run_interactive(input: &str) -> String {
     let mut child = agsh_command()
         .stdin(Stdio::piped())

@@ -108,8 +108,12 @@ release-integrity work required to ship them.
 - Bound `read`, builtin `printf`, PTY capture, Git snapshots, trace inspection,
   session journals, and background-state decoding; trace persistence failure no
   longer changes command status or exposes an elided preview as exact output.
-- Honor the bounded post-exit drain window for Git helper captures, preserving
-  real diagnostics when a transient inherited descriptor delays EOF.
+- Honor the bounded post-exit drain window for Git helper captures, including a
+  final read after a stale nonblocking result, preserving real diagnostics when
+  a transient inherited descriptor or reader descheduling delays EOF; keep the
+  exited group leader waitable until descendant cleanup is signaled so PID reuse
+  cannot redirect that signal to an unrelated process group; normalize inherited
+  `SIGCHLD` before child management and refuse to signal an already unreserved ID.
 - Anchor relative trace directories across `cd`, route synthesized diagnostics
   through live compound descriptors, and mark retained-descriptor cutoffs
   incomplete in both general and Git-helper capture.
@@ -158,7 +162,8 @@ release-integrity work required to ship them.
   and platform-license membership.
 - Exercise macOS loader hardening with a real system arm64e executable and a
   supported x86_64/Rosetta handoff, avoiding non-platform preview-ABI arm64e
-  libraries that macOS 15 may reject before process startup.
+  libraries that macOS 15 may reject before process startup; keep the generated
+  caller marker newline-accurate and report the exact failed smoke assertion.
 
 ### Session resilience and developer experience
 

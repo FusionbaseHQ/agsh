@@ -737,16 +737,16 @@ fn capture_pipe<R: Read + std::os::fd::AsFd + Send + 'static>(
         let mut chunk = [0u8; 16 * 1024];
         let mut post_exit_started = None;
         let mut post_exit_bytes = 0usize;
+        let mut final_post_exit_read = false;
         loop {
             if abort.load(Ordering::Acquire) {
                 return Ok(PipeCapture::incomplete(output));
             }
+            let final_read = std::mem::take(&mut final_post_exit_read);
             let exited = direct_child_exited.load(Ordering::Acquire);
             if exited {
-                let started = *post_exit_started.get_or_insert_with(Instant::now);
-                if post_exit_bytes >= GIT_CAPTURE_POST_EXIT_BYTES
-                    || started.elapsed() >= GIT_CAPTURE_POST_EXIT_TIME
-                {
+                post_exit_started.get_or_insert_with(Instant::now);
+                if post_exit_bytes >= GIT_CAPTURE_POST_EXIT_BYTES {
                     return Ok(PipeCapture::incomplete(output));
                 }
             }
@@ -767,8 +767,17 @@ fn capture_pipe<R: Read + std::os::fd::AsFd + Send + 'static>(
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if exited {
-                        std::thread::sleep(Duration::from_millis(1));
-                        continue;
+                        let started = post_exit_started.expect("post-exit timer initialized");
+                        if started.elapsed() >= GIT_CAPTURE_POST_EXIT_TIME {
+                            // The nonblocking result can be stale by the time a
+                            // descheduled reader handles it. Always make one
+                            // final read before declaring the stream incomplete.
+                            if final_read {
+                                return Ok(PipeCapture::incomplete(output));
+                            }
+                            final_post_exit_read = true;
+                            continue;
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -788,6 +797,22 @@ fn kill_capture_group(child: &mut std::process::Child) -> std::io::Result<ExitSt
     }
     let _ = child.kill();
     child.wait()
+}
+
+fn capture_child_exited_without_reaping(pid: rustix::process::Pid) -> std::io::Result<bool> {
+    use rustix::process::{waitid, WaitId, WaitIdOptions};
+
+    let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+    loop {
+        match waitid(WaitId::Pid(pid), options) {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => return Ok(false),
+            Err(error) if error == rustix::io::Errno::INTR => continue,
+            Err(error) => {
+                return Err(std::io::Error::from_raw_os_error(error.raw_os_error()));
+            }
+        }
+    }
 }
 
 fn join_capture(
@@ -811,6 +836,18 @@ fn capture_command_with_limits(
         .stderr(Stdio::piped())
         .process_group(0);
     let mut child = command.spawn()?;
+    let child_pid = match i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        Some(pid) => pid,
+        None => {
+            let _ = kill_capture_group(&mut child);
+            return Err(std::io::Error::other(
+                "command returned an invalid process ID",
+            ));
+        }
+    };
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -857,7 +894,7 @@ fn capture_command_with_limits(
     };
     let started = Instant::now();
 
-    let status = loop {
+    loop {
         if abort.load(Ordering::Acquire) {
             let _ = kill_capture_group(&mut child);
             let stdout = join_capture(stdout_handle);
@@ -877,29 +914,38 @@ fn capture_command_with_limits(
                 format!("command exceeded {} second timeout", timeout.as_secs_f64()),
             ));
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+        match capture_child_exited_without_reaping(child_pid) {
+            Ok(true) => break,
+            Ok(false) => std::thread::sleep(Duration::from_millis(2)),
             Err(error) => {
                 abort.store(true, Ordering::Release);
-                let _ = kill_capture_group(&mut child);
+                // ECHILD means an inherited SIGCHLD disposition or an external
+                // reaper may already have released this PID. Never signal that
+                // now-unreserved numeric PID/process-group ID: it may have been
+                // reused by an unrelated process. The agsh binary normalizes
+                // SIGCHLD before spawning, while this branch keeps library use
+                // fail-safe as well.
+                if error.raw_os_error() != Some(rustix::io::Errno::CHILD.raw_os_error()) {
+                    let _ = kill_capture_group(&mut child);
+                }
                 let _ = join_capture(stdout_handle);
                 let _ = join_capture(stderr_handle);
                 return Err(error);
             }
         }
-    };
+    }
 
     // A child that daemonized a descendant must not leave our reader threads
-    // blocked forever on inherited pipe descriptors.
+    // blocked forever on inherited pipe descriptors. The direct child remains
+    // waitable here, reserving its PID while the group is signaled so a reused
+    // process-group ID can never be targeted.
     direct_child_exited.store(true, Ordering::Release);
-    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    }
+    let _ = rustix::process::kill_process_group(child_pid, rustix::process::Signal::KILL);
+    let status = child.wait();
     let stdout = join_capture(stdout_handle)?;
     let stderr = join_capture(stderr_handle)?;
     Ok(BoundedCommandOutput {
-        status,
+        status: status?,
         stdout,
         stderr,
     })
@@ -1369,6 +1415,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn capture_exit_poll_keeps_the_group_leader_reserved_until_cleanup() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 7"]).process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+        let started = Instant::now();
+        while !capture_child_exited_without_reaping(pid).unwrap() {
+            assert!(started.elapsed() < Duration::from_secs(1));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(
+            rustix::process::test_kill_process(pid).is_ok(),
+            "WNOWAIT must keep the group-leader PID reserved before cleanup"
+        );
+        assert_eq!(child.wait().unwrap().code(), Some(7));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn capture_pipe_drains_after_transient_post_exit_would_block() {
         use std::os::fd::{AsFd, BorrowedFd};
         use std::os::unix::net::UnixStream;
@@ -1423,6 +1491,7 @@ mod tests {
             .expect("capture reader must observe the empty retained descriptor");
         writer.write_all(b"captured").unwrap();
         drop(writer);
+        std::thread::sleep(GIT_CAPTURE_POST_EXIT_TIME + Duration::from_millis(20));
         resume_send.send(()).unwrap();
 
         let output = join_capture(handle).unwrap();
