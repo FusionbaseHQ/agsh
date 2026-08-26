@@ -83,46 +83,34 @@ EOF
 cat >"$TMP/fake-bin/gh" <<'EOF'
 #!/bin/sh
 set -eu
-[ "${1:-}" = attestation ] || exit 64
+if [ "${1:-}" = --version ]; then
+    printf 'gh version %s (fixture)\n' "${FAKE_GH_VERSION:-2.97.0}"
+    exit 0
+fi
+[ "${1:-}" = release ] || exit 64
 shift
-[ "${1:-}" = verify ] || exit 64
+[ "${1:-}" = verify-asset ] || exit 64
 shift
-artifact=${1:-}
-[ -n "$artifact" ] || exit 64
-shift
+tag=${1:-}
+artifact=${2:-}
+[ -n "$tag" ] && [ -n "$artifact" ] || exit 64
+shift 2
 
 repo=
-signer_workflow=
-source_ref=
-deny_self_hosted=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
     -R)
         repo=$2
         shift 2
         ;;
-    --signer-workflow)
-        signer_workflow=$2
-        shift 2
-        ;;
-    --source-ref)
-        source_ref=$2
-        shift 2
-        ;;
-    --deny-self-hosted-runners)
-        deny_self_hosted=1
-        shift
-        ;;
     *) exit 64 ;;
     esac
 done
 
+[ "$tag" = v0.2.0 ] || exit 65
 [ "${artifact##*/}" = "$EXPECTED_ARCHIVE_NAME" ] || exit 65
 [ "$repo" = FusionbaseHQ/agsh ] || exit 65
-[ "$signer_workflow" = FusionbaseHQ/agsh/.github/workflows/release.yml ] || exit 65
-[ "$source_ref" = refs/tags/v0.2.0 ] || exit 65
-[ "$deny_self_hosted" -eq 1 ] || exit 65
-printf '%s\n' "$source_ref" >"$GH_ARGS_LOG"
+printf '%s\n' "$tag" >"$GH_ARGS_LOG"
 printf '%s\n' "${artifact##*/}" >"$GH_ASSET_LOG"
 [ "${FAKE_GH_RESULT:-pass}" = pass ]
 EOF
@@ -177,6 +165,7 @@ run_installer() {
         AGSH_DOC_DIR="$install_dir/docs" \
         AGSH_REQUIRE_ATTESTATION="${TEST_REQUIRE_ATTESTATION:-1}" \
         FAKE_GH_RESULT="${TEST_GH_RESULT:-pass}" \
+        FAKE_GH_VERSION="${TEST_GH_VERSION:-2.97.0}" \
         GH_ARGS_LOG="$TMP/gh.args" \
         GH_ASSET_LOG="$TMP/gh.asset" \
         CURL_URL_LOG="$TMP/curl.urls" \
@@ -208,7 +197,7 @@ test -f "$TMP/install/docs/NOTICE"
 test -f "$TMP/install/docs/THIRD_PARTY_LICENSES.html"
 test -f "$TMP/install/docs/RUST_STANDARD_LIBRARY_COPYRIGHT.html"
 test -f "$TMP/install/docs/Apache-2.0.txt"
-test "$(cat "$TMP/gh.args")" = refs/tags/v0.2.0
+test "$(cat "$TMP/gh.args")" = v0.2.0
 test "$(cat "$TMP/gh.asset")" = "$NAME.tar.gz"
 grep -F -x -q \
     "https://github.com/FusionbaseHQ/agsh/releases/download/v0.2.0/$NAME.tar.gz" \
@@ -227,8 +216,8 @@ darwin-arm64)
     ;;
 esac
 
-# Required provenance verification must fail closed before extraction. The fake
-# gh command also rejects a missing or inexact --source-ref above.
+# Required immutable-release verification must fail closed before extraction.
+# The fake gh command also rejects a missing or inexact release tag above.
 if TEST_GH_RESULT=fail run_installer "$TMP/attestation-fail" \
     >/dev/null 2>"$TMP/attestation-fail.err"
 then
@@ -238,6 +227,21 @@ fi
 grep -q 'attestation verification failed' "$TMP/attestation-fail.err"
 test ! -e "$TMP/attestation-fail/agsh"
 unset TEST_GH_RESULT
+
+# Vulnerable GitHub CLI versions must never receive credentials during a
+# release-attestation request. Required mode fails before invoking verify-asset.
+rm -f "$TMP/gh.args" "$TMP/gh.asset"
+if TEST_GH_VERSION=2.96.0 run_installer "$TMP/old-gh" \
+    >/dev/null 2>"$TMP/old-gh.err"
+then
+    printf '%s\n' 'unsafe GitHub CLI version was accepted for attestation' >&2
+    exit 1
+fi
+grep -F -q 'GitHub CLI 2.97.0 or newer' "$TMP/old-gh.err"
+test ! -e "$TMP/gh.args"
+test ! -e "$TMP/gh.asset"
+test ! -e "$TMP/old-gh/agsh"
+unset TEST_GH_VERSION
 
 # A destination symlink resolving to a directory must not receive a staged
 # file or be silently accepted as the installed executable.

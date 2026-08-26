@@ -12,7 +12,8 @@
 #   AGSH_VERSION      release tag to install (default: latest, e.g. v0.2.0)
 #   AGSH_INSTALL_DIR  install directory (default: ~/.local/bin)
 #   AGSH_DOC_DIR      license/notice directory (default: <install>/../share/doc/agsh)
-#   AGSH_REQUIRE_ATTESTATION=1  require `gh attestation verify` to pass
+#   AGSH_REQUIRE_ATTESTATION=1  require `gh release verify-asset` to pass
+#                               (requires GitHub CLI 2.97.0 or newer)
 #
 # The commands above are the recommended installation path.
 
@@ -123,23 +124,32 @@ fi
   actual:   $actual
 The download may be corrupted or tampered with — not installing."
 
-if command -v gh >/dev/null 2>&1; then
-    if gh attestation verify "$tmp/$name.tar.gz" -R "$REPO" \
-        --signer-workflow "$REPO/.github/workflows/release.yml" \
-        --source-ref "refs/tags/$VERSION" \
-        --deny-self-hosted-runners >/dev/null 2>&1; then
-        say "Verified GitHub artifact attestation."
+gh_release_verify_safe() {
+    gh_version=$(gh --version 2>/dev/null | awk 'NR == 1 && $1 == "gh" && $2 == "version" { print $3 }')
+    gh_version=${gh_version#v}
+    printf '%s\n' "$gh_version" |
+        grep -E -q '^[0-9]+\.[0-9]+\.[0-9]+' || return 1
+    gh_major=$(printf '%s\n' "$gh_version" | awk -F. '{ print $1 }')
+    gh_minor=$(printf '%s\n' "$gh_version" | awk -F. '{ print $2 }')
+    [ "$gh_major" -gt 2 ] ||
+        { [ "$gh_major" -eq 2 ] && [ "$gh_minor" -ge 97 ]; }
+}
+
+if command -v gh >/dev/null 2>&1 && gh_release_verify_safe; then
+    if gh release verify-asset "$VERSION" "$tmp/$name.tar.gz" \
+        -R "$REPO" >/dev/null 2>&1; then
+        say "Verified immutable GitHub release attestation."
     elif [ "${AGSH_REQUIRE_ATTESTATION:-}" = "1" ]; then
-        fail "GitHub artifact attestation verification failed (ensure gh supports --source-ref)"
+        fail "GitHub immutable-release attestation verification failed (ensure gh supports release verify-asset)"
     else
-        say "NOTE: GitHub artifact attestation was unavailable or failed; checksum matched."
+        say "NOTE: GitHub immutable-release attestation was unavailable or failed; checksum matched."
     fi
 elif [ "${AGSH_REQUIRE_ATTESTATION:-}" = "1" ]; then
-    fail "AGSH_REQUIRE_ATTESTATION=1 requires GitHub CLI (`gh`)"
+    fail "AGSH_REQUIRE_ATTESTATION=1 requires GitHub CLI 2.97.0 or newer"
 else
     say "NOTE: checksum verification detects corruption but is not independent"
-    say "      release authentication. Install GitHub CLI and set"
-    say "      AGSH_REQUIRE_ATTESTATION=1 for provenance verification."
+    say "      release authentication. Install GitHub CLI 2.97.0 or newer and set"
+    say "      AGSH_REQUIRE_ATTESTATION=1 for immutable-release verification."
 fi
 
 # ---- install -----------------------------------------------------------------

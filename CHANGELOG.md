@@ -4,15 +4,15 @@ All notable changes to `agsh` are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-`0.2.0` is the first supported public pre-1.0 preview. The historical `v0.1.0`
-tag records an unsupported development preview; it was not a production-ready
-release.
+`0.2.0` is the first supported pre-1.0 preview. The obsolete `v0.1.0` tag is
+retired with this release; the older changelog section remains only as a record
+of the unsupported private development milestone.
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-08-23
+## [0.2.0] - 2026-08-26
 
-The first supported public preview combines the session-resilience and developer-workflow
+The first supported preview combines the session-resilience and developer-workflow
 features prepared during private development with the production-hardening and
 release-integrity work required to ship them.
 
@@ -136,17 +136,21 @@ release-integrity work required to ship them.
 - Prepare archives that include the optional deep-interception library, sign and
   notarize all three macOS Mach-O files, smoke-test the hardened helper boundary,
   and validate release tags against Cargo and changelog versions before publishing.
-- Harden `install.sh` with strict version/checksum parsing, release-workflow
-  attestation constraints, an exact archive allowlist, and symlink rejection;
-  prepare the installer itself for checksummed, attested publication.
+- Harden `install.sh` with strict version/checksum parsing, optional immutable-
+  release attestation verification, an exact archive allowlist, and symlink
+  rejection; prepare the installer itself for checksummed publication.
 - Add lockfile-fresh third-party license notices, rtk Apache-2.0 attribution,
   weekly Cargo/Actions Dependabot updates, and explicit non-publishable Cargo
   package metadata, including the workspace minimum Rust version, for the
   GitHub-release-only workspace.
-- Prepare checksummed, attested AGPL Corresponding Source with the exact tagged
-  project tree and locked vendored Rust dependencies; rebuild it with kernel-
-  denied network access, require immutable stable release tags, and revalidate
-  the annotated tag immediately before attestation and publication.
+- Prepare checksummed AGPL Corresponding Source with the exact tagged project
+  tree and locked vendored Rust dependencies; rebuild it with kernel-denied
+  network access, require immutable stable release tags, and revalidate the
+  annotated tag immediately before publication.
+- Support the initial immutable private release on GitHub Free with exact
+  checksums, its automatic GitHub release-integrity attestation, and Apple
+  Developer ID signing/notarization. Actions build-provenance attestations are
+  explicitly unavailable for private repositories on this plan.
 - Exercise offline installer packaging independently for Linux and Darwin in
   both CI and the release gate, including exact target archive, `.so`/`.dylib`,
   and platform-license membership.
@@ -194,7 +198,7 @@ commands without giving up shell-native storage.
 - **Release workflow** — prepares prebuilt binaries (macOS arm64/x86_64, Linux
   x86_64/aarch64 musl), checksums, and `install.sh`. Tagged macOS builds require
   Developer ID signing and notarization secrets and fail closed when absent.
-  The protected workflow is the sole publisher of public release artifacts.
+  The isolated workflow is the sole publisher of release artifacts.
 
 ### Added — history and command entry
 - **Native rich `history` workbench** — the history UI is scrollable over all
@@ -246,8 +250,10 @@ commands without giving up shell-native storage.
   [rtk](https://github.com/rtk-ai/rtk), natively integrated into the shell.
 - The prompt now emits OSC 7 current-directory integration so compatible
   terminals track `cd` changes live.
-- Release gates now run the full behavioral suite before publishing artifacts,
-  and public releases emit GitHub artifact attestations alongside checksums.
+- Release gates now run the full behavioral suite before publishing artifacts;
+  private `v0.2.0` assets ship with checksums and an immutable-release
+  attestation, while Actions build-provenance attestations remain unavailable on
+  the current private Free-plan repository.
 
 ### Fixed
 - **PTY controller fd leak** — spawned jobs inherited their own PTY controller

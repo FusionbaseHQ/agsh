@@ -1,7 +1,7 @@
 name: Release
 
-# Tag-triggered releases (v*), plus workflow_dispatch to dry-run the whole
-# build matrix without publishing anything.
+# Tag-triggered private releases (v*), plus workflow_dispatch to dry-run the
+# whole build matrix without Developer ID signing, notarization, or publication.
 on:
   push:
     tags: ["v*"]
@@ -20,6 +20,7 @@ concurrency:
 jobs:
   validate:
     name: validate release metadata
+    if: github.event_name != 'push' || github.event.deleted == false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -30,8 +31,8 @@ jobs:
       - name: Validate pins, version, tag, and changelog
         run: |
           if [ "$GITHUB_EVENT_NAME" = push ]; then
-            if [ "${{ github.event.repository.private }}" != false ]; then
-              echo "::error::release tags are refused while the repository is private; public releases require attestations"
+            if [ "${{ github.event.repository.private }}" != true ]; then
+              echo "::error::private release workflow requires the repository to remain private"
               exit 1
             fi
             case "$GITHUB_REF" in
@@ -526,17 +527,16 @@ jobs:
           if-no-files-found: error
 
   # This job never checks out or compiles repository code and never executes the
-  # downloaded payload. Its environment must be protected as documented.
+  # downloaded payload. GitHub Free cannot protect Actions environments in a
+  # private repository, so the required Apple credentials are repository secrets.
   sign-macos:
     name: sign (${{ matrix.target }})
     needs: build
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !github.event.repository.private
+    if: github.event_name == 'push' && github.event.deleted == false && startsWith(github.ref, 'refs/tags/v') && github.event.repository.private
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:
       contents: read
-    environment:
-      name: release-signing
     strategy:
       fail-fast: false
       matrix:
@@ -647,7 +647,7 @@ jobs:
                   --team-id "$APPLE_TEAM_ID"
                   --password "$APPLE_APP_PASSWORD")
           else
-            echo "::error::no notary credentials configured in release-signing"
+            echo "::error::no notary credentials configured for the release workflow"
             exit 1
           fi
 
@@ -692,20 +692,18 @@ jobs:
 
   # The publisher has no checkout and runs no Cargo/project code. It receives
   # only exact final artifacts after all non-publishing verification has passed.
+  # This GitHub Free repository cannot generate Actions build-provenance
+  # attestations while private, so this path is deliberately private-only and
+  # publishes checksummed artifacts after Apple signing/notarization instead.
   release:
     name: publish GitHub release
     needs: [build, source-package, source-verify, metadata, sign-macos]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !github.event.repository.private
+    if: github.event_name == 'push' && github.event.deleted == false && startsWith(github.ref, 'refs/tags/v') && github.event.repository.private
     runs-on: ubuntu-22.04
     timeout-minutes: 30
-    environment:
-      name: release-publication
     permissions:
       actions: read
       contents: write
-      id-token: write
-      attestations: write
-      artifact-metadata: write
     steps:
       - name: Download final macOS arm64 archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -849,26 +847,25 @@ jobs:
               return 1
             fi
           }
+
+          verify_repository_private() {
+            local repository_private
+            repository_private=$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)
+            if [ "$repository_private" != true ]; then
+              echo "::error::repository visibility changed from private before release publication"
+              return 1
+            fi
+          }
           BASH
-      - name: Revalidate annotated tag before attestation
+      - name: Revalidate private release preconditions
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/verify-release-tag-binding.sh"
+          verify_repository_private
           verify_release_tag_binding
-      - name: Attest release assets
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
-        with:
-          subject-path: |
-            dist/agsh-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
-            dist/agsh-${{ github.ref_name }}-x86_64-apple-darwin.tar.gz
-            dist/agsh-${{ github.ref_name }}-aarch64-unknown-linux-musl.tar.gz
-            dist/agsh-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz
-            dist/agsh-${{ github.ref_name }}-source.tar.gz
-            dist/install.sh
-            dist/checksums.txt
-      - name: Create release
+      - name: Create draft and publish release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -876,6 +873,7 @@ jobs:
           set -euo pipefail
           . "$RUNNER_TEMP/verify-release-tag-binding.sh"
           verify_release_tag_binding
+          verify_repository_private
           gh release create "$GITHUB_REF_NAME" \
             "dist/agsh-$GITHUB_REF_NAME-aarch64-apple-darwin.tar.gz" \
             "dist/agsh-$GITHUB_REF_NAME-x86_64-apple-darwin.tar.gz" \
@@ -886,8 +884,15 @@ jobs:
             dist/checksums.txt \
             --title "agsh $GITHUB_REF_NAME" \
             --notes-file incoming/metadata/notes.md \
+            --draft \
             --verify-tag
-          immutable=$(gh release view "$GITHUB_REF_NAME" --json isImmutable --jq .isImmutable)
+          verify_release_tag_binding
+          verify_repository_private
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          immutable=$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            --jq .immutable)
           if [ "$immutable" != true ]; then
             echo "::error::published release is mutable; enable repository release immutability"
             exit 1

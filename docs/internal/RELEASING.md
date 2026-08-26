@@ -6,13 +6,24 @@ clippy, cargo tests, golden checks, bash/sh differential tests, and PTY
 interactive tests), builds
 four targets on native runners (macOS 15 arm64/x86_64, Ubuntu 22.04
 x86_64/aarch64 with static-musl shell binaries), and builds the optional
-deep-interception library (native macOS or glibc Linux). Separate protected jobs
+deep-interception library (native macOS or glibc Linux). Separate isolated jobs
 then **sign and notarize all three shipped macOS Mach-O files** (the shell,
 raw-exec launch helper, and interception library) and publish a GitHub
 Release with binary tarballs, a complete corresponding-source tarball, the
 installer, `checksums.txt`, and notes extracted from `CHANGELOG.md`.
 `workflow_dispatch` always dry-runs the build and source-verification matrix
-without signing, attesting, or publishing, even when the selected ref is a tag.
+without Developer ID signing, notarizing, or publishing, even when the selected
+ref is a tag. Hardened helper-boundary tests still use temporary ad-hoc signatures.
+
+The `v0.2.0` workflow is deliberately restricted to a **private** repository.
+FusionbaseHQ currently uses GitHub Free, where Actions build-provenance artifact
+attestations are not available for private repositories. The workflow therefore
+does not claim build provenance it cannot provide. It does publish exact
+checksums and Apple-notarized macOS payloads. GitHub's separately generated
+immutable-release attestation binds the published tag, commit, and complete
+asset set after publication. The publisher uploads every asset to a draft,
+checks the tag binding and repository visibility again, and refuses to publish
+if either changed.
 
 Each binary archive includes the AGPL license, project and rtk attribution,
 the rtk Apache-2.0 text, and the lockfile-derived Rust dependency license
@@ -66,15 +77,15 @@ GitHub releases.
    in the release PR; the repository does not currently have an offline
    vulnerability database to make this a deterministic build step.
 6. Optional: `gh workflow run release.yml --ref main` to dry-run the matrix.
-7. `git tag -a vX.Y.Z -m "agsh vX.Y.Z" && git push origin vX.Y.Z` — done.
+7. `git tag -a vX.Y.Z -m "agsh vX.Y.Z" && git push origin vX.Y.Z`.
 
-Before the first release:
+Before the private `v0.2.0` release:
 
-1. Configure repository rules so `main` requires the CI workflow, only release
-   maintainers can create `v*` tags, and existing `v*` tags cannot be updated or
-   deleted. The release validator refuses a tag whose commit is not already
-   reachable from `origin/main`, and the publisher re-resolves the annotated tag
-   immediately before attestation and publication.
+1. Require a green CI run on the release commit and push the annotated tag only
+   after the full release dry run passes. Private-repository rulesets are not
+   available on the current GitHub Free plan, so the workflow compensates by
+   requiring the tag commit to be reachable from `origin/main` and re-resolving
+   the annotated tag immediately before publication.
 2. Enable **release immutability** under repository Settings > General >
    Releases. With an authenticated maintainer token that has Administration-read
    permission, verify the required setting before pushing the first tag:
@@ -86,23 +97,28 @@ Before the first release:
    ```
 
    The publication token intentionally has no repository-administration access,
-   so the workflow cannot perform this preflight itself. It does check the
-   published release's `isImmutable` result and raises a configuration alarm if
-   the setting was removed, but that post-publication alarm is not a substitute
-   for this maintainer preflight.
-3. Create `release-signing` and `release-publication` GitHub Environments. GitHub
-   otherwise creates a referenced environment without protection. Restrict both
-   environments to protected `v*` tags and add required maintainer reviewers.
-4. Store the Apple credentials only as `release-signing` environment secrets;
-   remove repository-level copies. `release-publication` needs no custom secret.
-5. Make the repository public. A tag push while it is private fails before any
-   build, signing, attestation, or publication job can run.
+   so the workflow cannot perform this preflight itself. After publication, the
+   workflow reads the release API's `immutable` field and raises a configuration
+   alarm if the release was not locked.
+3. Configure the Apple credentials as repository Actions secrets. GitHub Free
+   does not make environments or environment-scoped secrets available to private
+   repositories, so the workflow deliberately has no `environment:` dependency.
+   Repository-scoped signing credentials are available to eligible workflows;
+   tightly restrict write/admin access and review workflow changes. Migrate the
+   credentials to a protected signing environment before expanding access or
+   moving to a plan that supports private-repository environments.
+4. Keep the repository private. The tag validator, signing jobs, and publisher
+   are private-only for `v0.2.0` and fail if the event reports a public repository.
+   The publisher uploads to a draft first, then checks the tag and live private
+   visibility immediately before the one-call transition to a published release.
+   A failed final precondition can therefore leave an unpublished draft for
+   maintainer inspection; never publish that draft manually.
 
 ## macOS signing & notarization (one-time setup)
 
-Tagged builds **fail** unless the protected `release-signing` environment and its
-secrets exist. The signing job has no checkout, never compiles repository code,
-and never executes its downloaded payload. Dry runs cannot enter this job.
+Tagged builds **fail** unless the required repository secret expressions resolve.
+The signing job has no checkout, never compiles repository code, and never
+executes its downloaded payload. Dry runs cannot enter this job.
 
 Always required:
 
@@ -134,9 +150,9 @@ fine to start with A, consider migrating to B later.
 
 ```sh
 # Option A setup:
-gh secret set APPLE_ID -R FusionbaseHQ/agsh --env release-signing
-gh secret set APPLE_TEAM_ID -R FusionbaseHQ/agsh --env release-signing --body "<TEAMID>"
-gh secret set APPLE_APP_PASSWORD -R FusionbaseHQ/agsh --env release-signing
+gh secret set APPLE_ID -R FusionbaseHQ/agsh
+gh secret set APPLE_TEAM_ID -R FusionbaseHQ/agsh --body "<TEAMID>"
+gh secret set APPLE_APP_PASSWORD -R FusionbaseHQ/agsh
 ```
 
 ### 1. Export the Developer ID certificate as .p12
@@ -148,10 +164,9 @@ Certificates**, right-click *Developer ID Application: …* → **Export**, choo
 
 ```sh
 base64 -i DeveloperID.p12 | gh secret set MACOS_CERT_P12 \
-  -R FusionbaseHQ/agsh --env release-signing
-gh secret set MACOS_CERT_PASSWORD -R FusionbaseHQ/agsh --env release-signing
+  -R FusionbaseHQ/agsh
+gh secret set MACOS_CERT_PASSWORD -R FusionbaseHQ/agsh
 gh secret set MACOS_SIGN_IDENTITY -R FusionbaseHQ/agsh \
-  --env release-signing \
   --body "Developer ID Application: <Your Org> (<TEAMID>)"
 ```
 
@@ -163,9 +178,9 @@ Connect API](https://appstoreconnect.apple.com/access/integrations/api) →
 and **Issuer ID**, download the `.p8` (downloadable only once):
 
 ```sh
-gh secret set APPLE_API_KEY_ID -R FusionbaseHQ/agsh --env release-signing
-gh secret set APPLE_API_ISSUER -R FusionbaseHQ/agsh --env release-signing
-gh secret set APPLE_API_KEY_P8 -R FusionbaseHQ/agsh --env release-signing \
+gh secret set APPLE_API_KEY_ID -R FusionbaseHQ/agsh
+gh secret set APPLE_API_ISSUER -R FusionbaseHQ/agsh
+gh secret set APPLE_API_KEY_P8 -R FusionbaseHQ/agsh \
   < AuthKey_XXXXXXXXXX.p8
 ```
 
@@ -184,66 +199,54 @@ gh secret set APPLE_API_KEY_P8 -R FusionbaseHQ/agsh --env release-signing \
 
 ## Release integrity
 
-Release assets are protected in three layers:
+Private `v0.2.0` release assets are protected in three layers:
 
 1. `checksums.txt` contains SHA-256 digests for every binary and source tarball
    and the installer.
-2. Every release publication generates GitHub/Sigstore artifact attestations for
-   every tarball, the installer, and `checksums.txt`.
-3. The installer always checks SHA-256, and if `gh` is available it also runs
-   `gh attestation verify` restricted to this repository's release workflow,
-   exact `refs/tags/vX.Y.Z` source ref, and GitHub-hosted runners. Set
-   `AGSH_REQUIRE_ATTESTATION=1` to make attestation verification mandatory.
+2. All three Mach-O files in each macOS archive carry hardened-runtime Developer
+   ID signatures and receive an `Accepted` Apple notary verdict before packaging.
+3. GitHub release immutability locks the published asset set and its tag, and
+   automatically generates a release attestation binding the tag, commit, and
+   exact assets. The publisher re-resolves the annotated tag and checks private
+   visibility before creating the draft and again immediately before publishing
+   it.
 
-GitHub artifact attestations only work for private repositories on Enterprise
-Cloud plans. This project fails every release-tag push while the repository is
-private rather than silently publishing without provenance. Manual dry runs do
-not publish or attest anything.
+[GitHub documents](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations)
+that Actions artifact attestations for private repositories require Enterprise
+Cloud. The current Free plan cannot provide that build-provenance layer, so the
+workflow does not request `id-token`/attestation permissions or imply provenance
+it cannot deliver. This is distinct from the automatic immutable-release
+attestation: GitHub CLI 2.97.0 or newer verifies that with `gh release verify` or
+`gh release verify-asset`. `AGSH_REQUIRE_ATTESTATION=1` makes the installer's
+asset-level release-attestation check mandatory. Manual dry runs do not Developer
+ID-sign, notarize, publish, or generate a release attestation.
 
-The checksum manifest, installer, and tarballs share the same GitHub release
-trust domain: the checksum alone detects corruption, but not a compromised
-release account that replaces both files. Require the Sigstore-backed
-attestation for independent provenance verification
-(`AGSH_REQUIRE_ATTESTATION=1`). Repository rules must restrict creation of `v*`
-tags and deny their update or deletion. The workflow revalidates the remote
-annotated tag against the triggering commit immediately before attestation and
-again before publication. It rejects tags that are not stable
-`vMAJOR.MINOR.PATCH`, do not exactly match the workspace version, or lack exactly
-one corresponding `## [X.Y.Z] - YYYY-MM-DD` changelog section.
+The checksum manifest, installer, and tarballs share the same private GitHub
+release trust domain: checksums detect corruption, but not a compromised release
+account that replaces both files before immutability takes effect. The workflow
+mitigates that window by accepting only a stable annotated tag that exactly
+matches the workspace/changelog version and a commit already reachable from
+`origin/main`, then revalidating it immediately before publication.
 
-Manual verification requires a GitHub CLI version that supports `--source-ref`:
+Manual checksum verification:
 
 ```sh
 version=vX.Y.Z
 asset=agsh-$version-aarch64-apple-darwin.tar.gz
-base="https://github.com/FusionbaseHQ/agsh/releases/download/$version"
-curl --proto '=https' --tlsv1.2 -fsSLo install.sh \
-  "$base/install.sh"
-curl --proto '=https' --tlsv1.2 -fsSLo checksums.txt \
-  "$base/checksums.txt"
-curl --proto '=https' --tlsv1.2 -fsSLo "$asset" \
-  "$base/$asset"
-gh attestation verify install.sh \
-  -R FusionbaseHQ/agsh \
-  --signer-workflow FusionbaseHQ/agsh/.github/workflows/release.yml \
-  --source-ref "refs/tags/$version" \
-  --deny-self-hosted-runners
-
-gh attestation verify checksums.txt \
-  -R FusionbaseHQ/agsh \
-  --signer-workflow FusionbaseHQ/agsh/.github/workflows/release.yml \
-  --source-ref "refs/tags/$version" \
-  --deny-self-hosted-runners
-
-gh attestation verify "$asset" \
-  -R FusionbaseHQ/agsh \
-  --signer-workflow FusionbaseHQ/agsh/.github/workflows/release.yml \
-  --source-ref "refs/tags/$version" \
-  --deny-self-hosted-runners
+gh release download "$version" -R FusionbaseHQ/agsh \
+  --pattern install.sh \
+  --pattern checksums.txt \
+  --pattern "$asset"
 grep -F "  install.sh" checksums.txt > selected-checksums.txt
 grep -F "  $asset" checksums.txt >> selected-checksums.txt
 test "$(wc -l < selected-checksums.txt | tr -d ' ')" = 2
 shasum -a 256 -c selected-checksums.txt
+
+# With GitHub CLI 2.97.0 or newer, verify the immutable release attestation too.
+gh release verify "$version" -R FusionbaseHQ/agsh
+gh release verify-asset "$version" install.sh -R FusionbaseHQ/agsh
+gh release verify-asset "$version" checksums.txt -R FusionbaseHQ/agsh
+gh release verify-asset "$version" "$asset" -R FusionbaseHQ/agsh
 ```
 
 ### Notes on CLI-tool notarization
@@ -252,13 +255,16 @@ shasum -a 256 -c selected-checksums.txt
   not to a bare Mach-O executable or dylib. Gatekeeper fetches each ticket online
   (keyed by that file's code-directory hash) the first time it assesses the file;
   those same signed files are placed inside the `.tar.gz`.
-- **When it matters**: quarantine is only set by browsers and similar apps, so
-  `curl | sh` installs never trip Gatekeeper. Notarization protects users who
-  download tarballs from the Releases page in a browser, satisfies MDM/endpoint
-  policies that require it, and is a prerequisite for a future Homebrew cask.
-- Verify the shipped executables locally:
-  `codesign --verify --strict -v ./agsh ./agsh-exec-helper` and assess each with
-  `spctl -a -vv -t install` (expect `source=Notarized Developer ID`).
+- **When it matters**: browsers and similar download clients normally attach
+  quarantine metadata; command-line downloads usually do not. Notarization
+  protects users who download tarballs from the Releases page in a browser,
+  satisfies MDM/endpoint policies that require it, and is a prerequisite for a
+  future Homebrew cask.
+- Verify all three shipped Mach-O files locally with `codesign --verify --strict
+  --verbose=4`, then force an online ticket lookup for each with `codesign -vvvv
+  -R='notarized' --check-notarization`. Assess `agsh` and
+  `agsh-exec-helper` as executables with `spctl --assess --verbose=4 --type
+  execute` (expect `source=Notarized Developer ID`).
 
 ## Local pre-release signing/notarization smoke test
 
@@ -288,5 +294,6 @@ xcrun notarytool store-credentials agsh-notary \
 xcrun notarytool submit agsh-notarize.zip --keychain-profile agsh-notary --wait
 ```
 
-This smoke test does not produce release archives, checksums, or attestations;
-the protected workflow remains the only publication path.
+This smoke test does not produce release archives, checksums, or the automatic
+immutable-release attestation; the isolated workflow remains the only
+publication path.

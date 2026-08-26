@@ -185,6 +185,11 @@ checksums, needs no sudo, and targets `~/.local/bin`. Archives also contain
 the optional deep-interception library; on Linux that library targets the Ubuntu
 22.04 glibc baseline while the shell binary remains static:
 
+> **Private-release note:** while this repository remains private, GitHub only
+> serves release assets to authenticated collaborators. The anonymous `curl`
+> installation below becomes usable if the repository is later made public; the
+> private `v0.2.0` release is intended for authenticated staging and verification.
+
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSLo install.sh \
   https://github.com/FusionbaseHQ/agsh/releases/latest/download/install.sh
@@ -192,17 +197,17 @@ less install.sh
 sh install.sh
 ```
 
-The installer is itself a checksummed, attested release asset. GitHub CLI users
-can verify its provenance with the command in
-[`docs/internal/RELEASING.md`](docs/internal/RELEASING.md). Pin the payload with
-`AGSH_VERSION=v0.2.0`, change the target directory with `AGSH_INSTALL_DIR`, and
-set `AGSH_REQUIRE_ATTESTATION=1` to require the downloaded binary archive's
-release-workflow attestation from that exact version tag (this requires a recent
-GitHub CLI with `--source-ref` support). A checksum fetched from the same release
-detects corruption but is not independent proof of origin. License notices are
-retained under `~/.local/share/doc/agsh` (`AGSH_DOC_DIR` overrides this location).
-Each release also provides a checksummed and attested corresponding-source
-archive with the tagged project source and locked vendored Rust dependencies.
+The installer and every archive are covered by `checksums.txt`. Immutable GitHub
+Releases automatically receive a release attestation binding the tag, commit,
+and exact assets; GitHub CLI 2.97.0 or newer can verify the downloaded archive,
+and `AGSH_REQUIRE_ATTESTATION=1` makes that check mandatory. This is release-integrity
+verification, not an Actions build-provenance attestation: the latter is
+unavailable for private repositories on GitHub Free. A checksum fetched from the
+same release detects corruption but is not independent proof of origin. License
+notices are retained under `~/.local/share/doc/agsh` (`AGSH_DOC_DIR` overrides
+this location). Each release also provides a checksummed corresponding-source
+archive with the tagged project source and locked vendored Rust dependencies. See
+[`docs/internal/RELEASING.md`](docs/internal/RELEASING.md) for verification.
 
 **From source** (the repository-pinned [Rust toolchain](https://rustup.rs)):
 
