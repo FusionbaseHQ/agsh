@@ -767,7 +767,8 @@ fn capture_pipe<R: Read + std::os::fd::AsFd + Send + 'static>(
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if exited {
-                        return Ok(PipeCapture::incomplete(output));
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -1328,7 +1329,8 @@ mod tests {
 
         assert_eq!(outcome.exit_code, 1);
         assert!(outcome.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&outcome.stderr).contains("store rejected"));
+        let stderr = String::from_utf8_lossy(&outcome.stderr);
+        assert!(stderr.contains("store rejected"), "stderr={stderr:?}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1363,6 +1365,69 @@ mod tests {
 
         assert!(error.kind() == std::io::ErrorKind::TimedOut, "{error}");
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_pipe_drains_after_transient_post_exit_would_block() {
+        use std::os::fd::{AsFd, BorrowedFd};
+        use std::os::unix::net::UnixStream;
+
+        struct PausedWouldBlockReader {
+            stream: UnixStream,
+            observed: std::sync::mpsc::Sender<()>,
+            resume: std::sync::mpsc::Receiver<()>,
+            paused: bool,
+        }
+
+        impl std::io::Read for PausedWouldBlockReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let result = self.stream.read(buffer);
+                if !self.paused
+                    && matches!(
+                        &result,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                    )
+                {
+                    self.paused = true;
+                    self.observed.send(()).unwrap();
+                    self.resume
+                        .recv_timeout(Duration::from_secs(1))
+                        .expect("resume the capture reader");
+                }
+                result
+            }
+        }
+
+        impl AsFd for PausedWouldBlockReader {
+            fn as_fd(&self) -> BorrowedFd<'_> {
+                self.stream.as_fd()
+            }
+        }
+
+        let (stream, mut writer) = UnixStream::pair().unwrap();
+        let (observed_send, observed_receive) = std::sync::mpsc::channel();
+        let (resume_send, resume_receive) = std::sync::mpsc::channel();
+        let reader = PausedWouldBlockReader {
+            stream,
+            observed: observed_send,
+            resume: resume_receive,
+            paused: false,
+        };
+        let abort = Arc::new(AtomicBool::new(false));
+        let direct_child_exited = Arc::new(AtomicBool::new(true));
+        let handle = capture_pipe(reader, 1024, abort, direct_child_exited).unwrap();
+
+        observed_receive
+            .recv_timeout(Duration::from_secs(1))
+            .expect("capture reader must observe the empty retained descriptor");
+        writer.write_all(b"captured").unwrap();
+        drop(writer);
+        resume_send.send(()).unwrap();
+
+        let output = join_capture(handle).unwrap();
+        assert_eq!(output.bytes, b"captured");
+        assert_eq!(output.completeness, CaptureCompleteness::Complete);
     }
 
     #[cfg(unix)]

@@ -108,6 +108,8 @@ release-integrity work required to ship them.
 - Bound `read`, builtin `printf`, PTY capture, Git snapshots, trace inspection,
   session journals, and background-state decoding; trace persistence failure no
   longer changes command status or exposes an elided preview as exact output.
+- Honor the bounded post-exit drain window for Git helper captures, preserving
+  real diagnostics when a transient inherited descriptor delays EOF.
 - Anchor relative trace directories across `cd`, route synthesized diagnostics
   through live compound descriptors, and mark retained-descriptor cutoffs
   incomplete in both general and Git-helper capture.
