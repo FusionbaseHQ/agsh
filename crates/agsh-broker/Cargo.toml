@@ -12,7 +12,7 @@ readme.workspace = true
 publish.workspace = true
 
 [dependencies]
-nix = { version = "0.25.1", default-features = false, features = ["socket"] }
+nix = { version = "0.31.3", default-features = false, features = ["socket"] }
 rustix = { version = "1.1.4", features = ["event", "process", "termios", "pty", "fs", "stdio"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

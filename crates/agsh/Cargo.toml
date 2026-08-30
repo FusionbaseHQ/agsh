@@ -23,7 +23,7 @@ agsh-output = { path = "../agsh-output" }
 agsh-policy = { path = "../agsh-policy" }
 agsh-signal = { path = "../agsh-signal" }
 agsh-tty = { path = "../agsh-tty" }
-nix = { version = "0.25.1", default-features = false, features = ["process"] }
+nix = { version = "0.31.3", default-features = false, features = ["process"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
