@@ -15,7 +15,7 @@ publish.workspace = true
 agsh-style = { version = "0.2.0", path = "../agsh-style" }
 serde_json = "1"
 csv = "1"
-base64 = "0.22"
+base64 = "0.23"
 rustix = { version = "1.1.4", features = ["termios"] }
 image = { version = "0.25", default-features = false, features = [
     "jpeg",
