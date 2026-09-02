@@ -19,9 +19,9 @@ disclosure timeline with you.
 
 ## Supported versions
 
-Security fixes are applied to `main` and, once public releases exist, to the
-latest GitHub release line. Older release lines and arbitrary forks are not
-maintained by this project.
+Security fixes are applied to `main` and the latest supported GitHub release
+line. Older release lines and arbitrary forks are not maintained by this
+project.
 
 ## Scope
 

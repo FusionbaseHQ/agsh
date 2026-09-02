@@ -15,15 +15,14 @@ installer, `checksums.txt`, and notes extracted from `CHANGELOG.md`.
 without Developer ID signing, notarizing, or publishing, even when the selected
 ref is a tag. Hardened helper-boundary tests still use temporary ad-hoc signatures.
 
-The `v0.2.0` workflow is deliberately restricted to a **private** repository.
-FusionbaseHQ currently uses GitHub Free, where Actions build-provenance artifact
-attestations are not available for private repositories. The workflow therefore
-does not claim build provenance it cannot provide. It does publish exact
-checksums and Apple-notarized macOS payloads. GitHub's separately generated
-immutable-release attestation binds the published tag, commit, and complete
-asset set after publication. The publisher uploads every asset to a draft,
-checks the tag binding and repository visibility again, and refuses to publish
-if either changed.
+`v0.2.0` was built and published while the repository was private, then exposed
+only after its immutable release and downloadable assets were independently
+verified. It therefore has no separate Actions build-provenance attestation. It
+does have exact checksums, Apple-notarized macOS payloads, and GitHub's
+immutable-release attestation binding the published tag, commit, and complete
+asset set. Future tag workflows require the repository to remain public. The
+publisher uploads every asset to a draft, checks the tag binding and live public
+visibility again, and refuses to publish if either changed.
 
 Each binary archive includes the AGPL license, project and rtk attribution,
 the rtk Apache-2.0 text, and the lockfile-derived Rust dependency license
@@ -79,13 +78,13 @@ GitHub releases.
 6. Optional: `gh workflow run release.yml --ref main` to dry-run the matrix.
 7. `git tag -a vX.Y.Z -m "agsh vX.Y.Z" && git push origin vX.Y.Z`.
 
-Before the private `v0.2.0` release:
+## Release prerequisites
 
 1. Require a green CI run on the release commit and push the annotated tag only
-   after the full release dry run passes. Private-repository rulesets are not
-   available on the current GitHub Free plan, so the workflow compensates by
-   requiring the tag commit to be reachable from `origin/main` and re-resolving
-   the annotated tag immediately before publication.
+   after the full release dry run passes. Protect `main` and release-tag creation
+   through repository rules. The workflow also requires the tag commit to be
+   reachable from `origin/main` and re-resolves the annotated tag immediately
+   before publication.
 2. Enable **release immutability** under repository Settings > General >
    Releases. With an authenticated maintainer token that has Administration-read
    permission, verify the required setting before pushing the first tag:
@@ -100,17 +99,16 @@ Before the private `v0.2.0` release:
    so the workflow cannot perform this preflight itself. After publication, the
    workflow reads the release API's `immutable` field and raises a configuration
    alarm if the release was not locked.
-3. Configure the Apple credentials as repository Actions secrets. GitHub Free
-   does not make environments or environment-scoped secrets available to private
-   repositories, so the workflow deliberately has no `environment:` dependency.
-   Repository-scoped signing credentials are available to eligible workflows;
-   tightly restrict write/admin access and review workflow changes. Migrate the
-   credentials to a protected signing environment before expanding access or
-   moving to a plan that supports private-repository environments.
-4. Keep the repository private. The tag validator, signing jobs, and publisher
-   are private-only for `v0.2.0` and fail if the event reports a public repository.
-   The publisher uploads to a draft first, then checks the tag and live private
-   visibility immediately before the one-call transition to a published release.
+3. Configure the Apple credentials as repository Actions secrets. GitHub does
+   not expose repository secrets to fork pull requests, and the signing path runs
+   only for an origin tag push without checking out or executing repository code.
+   Still, tightly restrict write/admin access and review workflow changes because
+   a writer can alter workflows. Migrate the credentials to a protected signing
+   environment before expanding maintainer access.
+4. Keep the repository public. The tag validator, signing jobs, and publisher
+   fail if the event or live repository state is not public. The publisher
+   uploads to a draft first, then checks the tag and live public visibility
+   immediately before the one-call transition to a published release.
    A failed final precondition can therefore leave an unpublished draft for
    maintainer inspection; never publish that draft manually.
 
@@ -199,7 +197,7 @@ gh secret set APPLE_API_KEY_P8 -R FusionbaseHQ/agsh \
 
 ## Release integrity
 
-Private `v0.2.0` release assets are protected in three layers:
+Release assets are protected in three layers:
 
 1. `checksums.txt` contains SHA-256 digests for every binary and source tarball
    and the installer.
@@ -207,22 +205,20 @@ Private `v0.2.0` release assets are protected in three layers:
    ID signatures and receive an `Accepted` Apple notary verdict before packaging.
 3. GitHub release immutability locks the published asset set and its tag, and
    automatically generates a release attestation binding the tag, commit, and
-   exact assets. The publisher re-resolves the annotated tag and checks private
+   exact assets. The publisher re-resolves the annotated tag and checks public
    visibility before creating the draft and again immediately before publishing
    it.
 
-[GitHub documents](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations)
-that Actions artifact attestations for private repositories require Enterprise
-Cloud. The current Free plan cannot provide that build-provenance layer, so the
-workflow does not request `id-token`/attestation permissions or imply provenance
-it cannot deliver. This is distinct from the automatic immutable-release
-attestation: GitHub CLI 2.97.0 or newer verifies that with `gh release verify` or
-`gh release verify-asset`. `AGSH_REQUIRE_ATTESTATION=1` makes the installer's
-asset-level release-attestation check mandatory. Manual dry runs do not Developer
-ID-sign, notarize, publish, or generate a release attestation.
+The workflow does not currently request or claim a separate Actions
+build-provenance attestation. This is distinct from the automatic
+immutable-release attestation: GitHub CLI 2.97.0 or newer verifies that with
+`gh release verify` or `gh release verify-asset`.
+`AGSH_REQUIRE_ATTESTATION=1` makes the installer's asset-level
+release-attestation check mandatory. Manual dry runs do not Developer ID-sign,
+notarize, publish, or generate a release attestation.
 
-The checksum manifest, installer, and tarballs share the same private GitHub
-release trust domain: checksums detect corruption, but not a compromised release
+The checksum manifest, installer, and tarballs share the same GitHub release
+trust domain: checksums detect corruption, but not a compromised release
 account that replaces both files before immutability takes effect. The workflow
 mitigates that window by accepting only a stable annotated tag that exactly
 matches the workspace/changelog version and a commit already reachable from

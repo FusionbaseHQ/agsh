@@ -33,25 +33,13 @@ fi
 grep -F -q 'does not match workspace version' "$TMP/stable.err"
 
 workflow="$ROOT/.github/workflows/release.yml"
-[ "$(grep -F -c 'if [ "${{ github.event.repository.private }}" != true ]; then' "$workflow")" -eq 1 ]
-grep -F -q -- 'private release workflow requires the repository to remain private' "$workflow"
+[ "$(grep -F -c 'if [ "${{ github.event.repository.private }}" != false ]; then' "$workflow")" -eq 1 ]
+grep -F -q -- 'public release workflow requires the repository to remain public' "$workflow"
 grep -F -q -- "if: github.event_name != 'push' || github.event.deleted == false" "$workflow"
-[ "$(grep -F -c "if: github.event_name == 'push' && github.event.deleted == false && startsWith(github.ref, 'refs/tags/v') && github.event.repository.private" "$workflow")" -eq 2 ]
-if grep -F -q -- '!github.event.repository.private' "$workflow"; then
-    printf '%s\n' 'release tests: private release path still contains a public-only job guard' >&2
-    exit 1
-fi
-if grep -F -q -- 'actions/attest@' "$workflow"; then
-    printf '%s\n' 'release tests: GitHub Free private release path still requests unavailable attestations' >&2
-    exit 1
-fi
-if grep -q '^[[:space:]]*environment:' "$workflow"; then
-    printf '%s\n' 'release tests: private Free-plan release still depends on unavailable release environments' >&2
-    exit 1
-fi
+[ "$(grep -F -c "if: github.event_name == 'push' && github.event.deleted == false && startsWith(github.ref, 'refs/tags/v') && github.event.repository.private == false" "$workflow")" -eq 2 ]
 [ "$(grep -c '^[[:space:]]*verify_release_tag_binding$' "$workflow")" -eq 3 ]
-[ "$(grep -c '^[[:space:]]*verify_repository_private$' "$workflow")" -eq 3 ]
-grep -F -q -- 'gh api "repos/$GITHUB_REPOSITORY" --jq .private' "$workflow"
+[ "$(grep -c '^[[:space:]]*verify_repository_public$' "$workflow")" -eq 3 ]
+grep -F -q -- 'gh api "repos/$GITHUB_REPOSITORY" --jq .visibility' "$workflow"
 grep -F -q -- 'test "$target_sha" = "$GITHUB_SHA"' "$workflow"
 grep -F -q -- '--draft' "$workflow"
 grep -F -q -- 'gh release edit "$GITHUB_REF_NAME" --draft=false --latest' "$workflow"
@@ -60,21 +48,21 @@ awk '
         previous_guard = NR
         next
     }
-    /^[[:space:]]*verify_repository_private$/ {
+    /^[[:space:]]*verify_repository_public$/ {
         if (previous_guard == NR - 1) {
-            private_guard = NR
+            public_guard = NR
         }
         next
     }
     /gh release edit "\$GITHUB_REF_NAME" --draft=false --latest/ {
-        if (private_guard != NR - 1) {
+        if (public_guard != NR - 1) {
             exit 1
         }
         found = 1
     }
     END { if (!found) exit 1 }
 ' "$workflow" || {
-    printf '%s\n' 'release tests: tag/private guards are not immediately before draft publication' >&2
+    printf '%s\n' 'release tests: tag/public guards are not immediately before draft publication' >&2
     exit 1
 }
 grep -F -q -- '"repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME"' "$workflow"
@@ -146,7 +134,7 @@ set -eu
 endpoint=$2
 case "$endpoint" in
 repos/FusionbaseHQ/agsh)
-    printf '%s\n' "$FAKE_GH_PRIVATE"
+    printf '%s\n' "$FAKE_GH_VISIBILITY"
     ;;
 */git/ref/tags/*)
     count=0
@@ -173,16 +161,16 @@ chmod 755 "$TMP/gh"
 
 run_guard() {
     mode=$1
-    private=${2:-true}
+    visibility=${2:-public}
     rm -f "$TMP/gh.count"
     PATH="$TMP:$PATH" \
         FAKE_GH_COUNT="$TMP/gh.count" \
         FAKE_GH_MODE="$mode" \
-        FAKE_GH_PRIVATE="$private" \
+        FAKE_GH_VISIBILITY="$visibility" \
         GITHUB_REPOSITORY=FusionbaseHQ/agsh \
         GITHUB_REF_NAME=v0.2.0 \
         GITHUB_SHA=expected-commit \
-        bash -c 'set -e; . "$1"; verify_repository_private; verify_release_tag_binding' _ "$guard"
+        bash -c 'set -e; . "$1"; verify_repository_public; verify_release_tag_binding' _ "$guard"
 }
 
 run_guard success
@@ -198,10 +186,10 @@ if run_guard moved >"$TMP/moved.out" 2>"$TMP/moved.err"; then
 fi
 grep -F -q 'changed while its target was being checked' "$TMP/moved.out"
 
-if run_guard success false >"$TMP/public.out" 2>"$TMP/public.err"; then
-    printf '%s\n' 'release tests: publication guard accepted a public repository' >&2
+if run_guard success private >"$TMP/private.out" 2>"$TMP/private.err"; then
+    printf '%s\n' 'release tests: publication guard accepted a private repository' >&2
     exit 1
 fi
-grep -F -q 'repository visibility changed from private' "$TMP/public.out"
+grep -F -q 'repository visibility changed from public' "$TMP/private.out"
 
 printf '%s\n' 'release tests: ok'

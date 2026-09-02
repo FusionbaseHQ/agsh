@@ -1,6 +1,6 @@
 name: Release
 
-# Tag-triggered private releases (v*), plus workflow_dispatch to dry-run the
+# Tag-triggered public releases (v*), plus workflow_dispatch to dry-run the
 # whole build matrix without Developer ID signing, notarization, or publication.
 on:
   push:
@@ -31,8 +31,8 @@ jobs:
       - name: Validate pins, version, tag, and changelog
         run: |
           if [ "$GITHUB_EVENT_NAME" = push ]; then
-            if [ "${{ github.event.repository.private }}" != true ]; then
-              echo "::error::private release workflow requires the repository to remain private"
+            if [ "${{ github.event.repository.private }}" != false ]; then
+              echo "::error::public release workflow requires the repository to remain public"
               exit 1
             fi
             case "$GITHUB_REF" in
@@ -544,12 +544,13 @@ jobs:
           if-no-files-found: error
 
   # This job never checks out or compiles repository code and never executes the
-  # downloaded payload. GitHub Free cannot protect Actions environments in a
-  # private repository, so the required Apple credentials are repository secrets.
+  # downloaded payload. Repository secrets are unavailable to fork pull requests;
+  # this credentialed path runs only for an origin tag push while the repository
+  # is public.
   sign-macos:
     name: sign (${{ matrix.target }})
     needs: build
-    if: github.event_name == 'push' && github.event.deleted == false && startsWith(github.ref, 'refs/tags/v') && github.event.repository.private
+    if: github.event_name == 'push' && github.event.deleted == false && startsWith(github.ref, 'refs/tags/v') && github.event.repository.private == false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:
@@ -709,13 +710,13 @@ jobs:
 
   # The publisher has no checkout and runs no Cargo/project code. It receives
   # only exact final artifacts after all non-publishing verification has passed.
-  # This GitHub Free repository cannot generate Actions build-provenance
-  # attestations while private, so this path is deliberately private-only and
-  # publishes checksummed artifacts after Apple signing/notarization instead.
+  # The published asset set is checksummed, Apple-signed/notarized where
+  # applicable, and locked by GitHub release immutability. This workflow does not
+  # claim a separate Actions build-provenance attestation.
   release:
     name: publish GitHub release
     needs: [build, source-package, source-verify, metadata, sign-macos]
-    if: github.event_name == 'push' && github.event.deleted == false && startsWith(github.ref, 'refs/tags/v') && github.event.repository.private
+    if: github.event_name == 'push' && github.event.deleted == false && startsWith(github.ref, 'refs/tags/v') && github.event.repository.private == false
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:
@@ -865,22 +866,22 @@ jobs:
             fi
           }
 
-          verify_repository_private() {
-            local repository_private
-            repository_private=$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)
-            if [ "$repository_private" != true ]; then
-              echo "::error::repository visibility changed from private before release publication"
+          verify_repository_public() {
+            local repository_visibility
+            repository_visibility=$(gh api "repos/$GITHUB_REPOSITORY" --jq .visibility)
+            if [ "$repository_visibility" != public ]; then
+              echo "::error::repository visibility changed from public before release publication"
               return 1
             fi
           }
           BASH
-      - name: Revalidate private release preconditions
+      - name: Revalidate public release preconditions
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/verify-release-tag-binding.sh"
-          verify_repository_private
+          verify_repository_public
           verify_release_tag_binding
       - name: Create draft and publish release
         env:
@@ -890,7 +891,7 @@ jobs:
           set -euo pipefail
           . "$RUNNER_TEMP/verify-release-tag-binding.sh"
           verify_release_tag_binding
-          verify_repository_private
+          verify_repository_public
           gh release create "$GITHUB_REF_NAME" \
             "dist/agsh-$GITHUB_REF_NAME-aarch64-apple-darwin.tar.gz" \
             "dist/agsh-$GITHUB_REF_NAME-x86_64-apple-darwin.tar.gz" \
@@ -904,7 +905,7 @@ jobs:
             --draft \
             --verify-tag
           verify_release_tag_binding
-          verify_repository_private
+          verify_repository_public
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest
           immutable=$(gh api \
             "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \

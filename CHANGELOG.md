@@ -10,6 +10,12 @@ of the unsupported private development milestone.
 
 ## [Unreleased]
 
+### Changed
+- Align the tagged-release gates and documentation with the repository's public
+  launch. Future publication remains fail-closed on an exact annotated tag,
+  public visibility, checksums, and Apple signing/notarization, and verifies
+  release immutability immediately after publication.
+
 ## [0.2.0] - 2026-08-26
 
 The first supported preview combines the session-resilience and developer-workflow
@@ -153,10 +159,10 @@ release-integrity work required to ship them.
   tree and locked vendored Rust dependencies; rebuild it with kernel-denied
   network access, require immutable stable release tags, and revalidate the
   annotated tag immediately before publication.
-- Support the initial immutable private release on GitHub Free with exact
-  checksums, its automatic GitHub release-integrity attestation, and Apple
-  Developer ID signing/notarization. Actions build-provenance attestations are
-  explicitly unavailable for private repositories on this plan.
+- Support the initial `v0.2.0` publication on a private GitHub Free repository
+  with exact checksums, its automatic GitHub release-integrity attestation, and
+  Apple Developer ID signing/notarization. A separate Actions build-provenance
+  attestation was unavailable in that initial private state.
 - Exercise offline installer packaging independently for Linux and Darwin in
   both CI and the release gate, including exact target archive, `.so`/`.dylib`,
   and platform-license membership.
@@ -261,9 +267,9 @@ commands without giving up shell-native storage.
 - The prompt now emits OSC 7 current-directory integration so compatible
   terminals track `cd` changes live.
 - Release gates now run the full behavioral suite before publishing artifacts;
-  private `v0.2.0` assets ship with checksums and an immutable-release
-  attestation, while Actions build-provenance attestations remain unavailable on
-  the current private Free-plan repository.
+  `v0.2.0` was initially published privately with checksums and an
+  immutable-release attestation, without a separate Actions build-provenance
+  attestation.
 
 ### Fixed
 - **PTY controller fd leak** — spawned jobs inherited their own PTY controller
